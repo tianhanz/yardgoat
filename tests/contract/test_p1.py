@@ -91,7 +91,7 @@ def test_file_pool_parked_card_becomes_a_question(tmp_path, env):
     (pool / "p1/parked").mkdir(parents=True)
     src = pool / "p1/pending/t-demo-r1.md"
     src.rename(pool / "p1/parked/t-demo-r1.md")
-    (pool / "p1/parked/t-demo-r1.md").write_text(src.name + "\n\n## 待天汉确认\nIs 2 cores enough?\n")
+    (pool / "p1/parked/t-demo-r1.md").write_text(src.name + "\n\n## 待确认\nIs 2 cores enough?\n")
     yg(env, "reconcile")
     st = json.loads(yg(env, "status", "t-demo", "--json")[1])
     assert st["status"] == "parked" and "2 cores" in st["question"]["text"]

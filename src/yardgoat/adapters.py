@@ -15,7 +15,7 @@ Built in:
                "adapters": {"file-pool": {"root": "~/fleet/tasks",
                                           "add_cmd": ["python3", "~/fleet/fleet.py", "add", "{text}",
                                                       "--pool", "{pool}", "--id", "{pool_task_id}", "--verify", "{verify}"],
-                                          "pools": {"cfd-ir": {"lane": "bx-opus", "host": "claude"}}}}
+                                          "pools": {"research": {"lane": "relay-opus", "host": "claude"}}}}
              Without add_cmd the card is written to <root>/<pool>/pending/ directly.
 
 More adapters can be loaded from local files listed in config "plugins"; each file defines
