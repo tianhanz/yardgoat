@@ -38,7 +38,7 @@ yardgoat reconcile                                          # (cron) resumes ans
 A task spec names the prompt file (`card`), the working directory, the expected `outputs`, the `executor`
 (`host`, plus optional `lane`/`acct` that your local launcher understands), the `verifier`, and a `budget`.
 Schemas: [task](src/yardgoat/schemas/task.schema.json) · [receipt](src/yardgoat/schemas/receipt.schema.json) · [event](src/yardgoat/schemas/event.schema.json).
-Invariants and store layout: [docs/design.md](docs/design.md).
+Invariants and store layout: [docs/design.md](docs/design.md) · What it is for: [docs/PRD.md](docs/PRD.md).
 
 ## Local wiring
 
