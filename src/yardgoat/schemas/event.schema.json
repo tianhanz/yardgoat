@@ -1,0 +1,36 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "Yardgoat event",
+ "type": "object",
+ "required": [
+  "at",
+  "task_id",
+  "kind",
+  "actor",
+  "dedupe_key"
+ ],
+ "properties": {
+  "at": {
+   "type": "string"
+  },
+  "task_id": {
+   "type": "string"
+  },
+  "kind": {
+   "enum": [
+    "task.accepted",
+    "task.owner_changed",
+    "run.dispatched",
+    "run.started",
+    "run.exited",
+    "run.verified"
+   ]
+  },
+  "actor": {
+   "type": "string"
+  },
+  "dedupe_key": {
+   "type": "string"
+  }
+ }
+}

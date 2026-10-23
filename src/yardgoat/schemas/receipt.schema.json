@@ -1,0 +1,98 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "Yardgoat receipt",
+ "type": "object",
+ "required": [
+  "task_id",
+  "run_id",
+  "attempt",
+  "exit_code",
+  "host",
+  "actual_model",
+  "artifacts",
+  "finished_at",
+  "status"
+ ],
+ "properties": {
+  "task_id": {
+   "type": "string"
+  },
+  "run_id": {
+   "type": "string"
+  },
+  "project": {
+   "type": "string"
+  },
+  "attempt": {
+   "type": "integer"
+  },
+  "exit_code": {
+   "type": "integer"
+  },
+  "timed_out": {
+   "type": "boolean"
+  },
+  "host": {
+   "type": "string"
+  },
+  "lane": {
+   "type": "string"
+  },
+  "account_alias": {
+   "type": "string"
+  },
+  "actual_model": {
+   "type": "string"
+  },
+  "model_source": {
+   "type": "string"
+  },
+  "cost_basis": {
+   "type": "string"
+  },
+  "artifacts": {
+   "type": "object",
+   "additionalProperties": {
+    "type": [
+     "string",
+     "null"
+    ]
+   }
+  },
+  "finished_at": {
+   "type": "string"
+  },
+  "status": {
+   "enum": [
+    "exited",
+    "passed",
+    "failed",
+    "verifier_error"
+   ]
+  },
+  "verifier": {
+   "type": "object",
+   "properties": {
+    "command": {
+     "type": "string"
+    },
+    "exit_code": {
+     "type": "integer"
+    },
+    "result": {
+     "enum": [
+      "PASS",
+      "FAIL",
+      "ERROR"
+     ]
+    },
+    "checked_at": {
+     "type": "string"
+    },
+    "checked_by": {
+     "type": "string"
+    }
+   }
+  }
+ }
+}

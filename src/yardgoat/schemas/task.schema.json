@@ -1,0 +1,122 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://github.com/tianhanz/yardgoat/schemas/task.schema.json",
+ "title": "Yardgoat task spec",
+ "type": "object",
+ "required": [
+  "task_id",
+  "project",
+  "goal",
+  "card",
+  "workdir",
+  "executor",
+  "verifier"
+ ],
+ "properties": {
+  "task_id": {
+   "type": "string",
+   "pattern": "^[a-z0-9][a-z0-9._-]{2,79}$",
+   "description": "Immutable once accepted."
+  },
+  "project": {
+   "type": "string"
+  },
+  "goal": {
+   "type": "string"
+  },
+  "card": {
+   "type": "string",
+   "description": "Prompt file given to the executor. Its bytes are frozen at submit."
+  },
+  "workdir": {
+   "type": "string"
+  },
+  "outputs": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   },
+   "description": "Paths relative to workdir; hashed into the receipt."
+  },
+  "executor": {
+   "type": "object",
+   "required": [
+    "host"
+   ],
+   "properties": {
+    "host": {
+     "enum": [
+      "codex",
+      "claude",
+      "kimi",
+      "shell"
+     ]
+    },
+    "lane": {
+     "type": "string"
+    },
+    "acct": {
+     "type": "string"
+    },
+    "sandbox": {
+     "type": "string"
+    },
+    "args": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "command": {
+     "type": "string",
+     "description": "host=shell only"
+    }
+   }
+  },
+  "verifier": {
+   "type": "object",
+   "required": [
+    "command"
+   ],
+   "properties": {
+    "command": {
+     "type": "string",
+     "description": "Exit 0 = PASS, 1 = FAIL, anything else = verifier error."
+    },
+    "cwd": {
+     "type": "string"
+    },
+    "freeze": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Files whose bytes are frozen at submit."
+    }
+   }
+  },
+  "budget": {
+   "type": "object",
+   "properties": {
+    "max_attempts": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "max_wall_min": {
+     "type": "integer",
+     "minimum": 1
+    }
+   }
+  },
+  "authority": {
+   "type": "string",
+   "description": "What the controller may do without asking a human."
+  },
+  "escalate_when": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  }
+ }
+}

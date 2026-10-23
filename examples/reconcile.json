@@ -1,0 +1,29 @@
+{
+  "task_id": "example-reconcile-01",
+  "project": "example",
+  "goal": "Tabulate two cost accounting methods per run, every number with a source.",
+  "card": "reconcile-card.md",
+  "workdir": "work",
+  "outputs": [
+    "out/table.csv",
+    "out/NOTES.md"
+  ],
+  "executor": {
+    "host": "codex"
+  },
+  "verifier": {
+    "command": "python3 -B ../verify.py",
+    "freeze": [
+      "verify.py"
+    ]
+  },
+  "budget": {
+    "max_attempts": 2,
+    "max_wall_min": 60
+  },
+  "authority": "Read the source records; write only under work/out. No git, no network calls besides the model.",
+  "escalate_when": [
+    "the verifier fails twice",
+    "a source file needed by the card is missing"
+  ]
+}
