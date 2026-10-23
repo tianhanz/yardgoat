@@ -10,6 +10,7 @@
   yardgoat inbox [--json]                                parked tasks and their questions
   yardgoat answer <task_id> --as <who> (--text T | --file F)   answer a parked task; reconcile resumes it
   yardgoat reconcile                                     poll adapter runs, mark lost runs, resume answered tasks
+  yardgoat archive <task_id> --as <controller> --reason R  close out a task that will not continue (kept, hidden from inbox)
   yardgoat events <task_id>                              print the event log
 
 Exit codes: 0 ok · 3 refused by policy (nothing changed) · 2 usage/spec error · 1 verifier FAIL.
@@ -92,7 +93,7 @@ def do_dispatch(td: TaskDir, who: str, actor_note: str = "", echo: bool = True) 
         st = box["state"]
         if st["owner"] != who:
             return refuse(f"owner is {st['owner']}, not {who}")
-        if st["status"] in ("verified", "exhausted"):
+        if st["status"] in ("verified", "exhausted", "archived"):
             return refuse(f"task is {st['status']}")
         if st["status"] == "parked":
             return refuse("task is parked waiting for an answer; use `yardgoat answer`")
@@ -316,6 +317,23 @@ def cmd_reconcile(a) -> int:
     return 0
 
 
+def cmd_archive(a) -> int:
+    td = TaskDir(a.task_id)
+    if not td.exists:
+        return refuse(f"unknown task {a.task_id}")
+    with td.locked() as box:
+        st = box["state"]
+        if st["owner"] != a.as_:
+            return refuse(f"owner is {st['owner']}, not {a.as_}")
+        if _active_run(st):
+            return refuse("a run is in flight")
+        st["archived"] = {"from_status": st["status"], "reason": a.reason, "by": a.as_, "at": now()}
+        st["status"] = "archived"
+    td.event("task.archived", a.as_, reason=a.reason)
+    print(json.dumps({"task_id": td.task_id, "result": "archived"}))
+    return 0
+
+
 def cmd_events(a) -> int:
     for ev in TaskDir(a.task_id).events():
         print(json.dumps(ev, ensure_ascii=False))
@@ -337,6 +355,8 @@ def main(argv=None) -> int:
     g = s.add_mutually_exclusive_group(required=True); g.add_argument("--text"); g.add_argument("--file")
     s = sub.add_parser("inbox"); s.add_argument("--json", action="store_true")
     sub.add_parser("reconcile")
+    s = sub.add_parser("archive"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
+    s.add_argument("--reason", required=True)
     s = sub.add_parser("events"); s.add_argument("task_id")
     s = sub.add_parser("_run"); s.add_argument("task_id"); s.add_argument("run_id")
     a = P.parse_args(argv)
@@ -344,7 +364,7 @@ def main(argv=None) -> int:
         return runner.run_and_receipt(TaskDir(a.task_id), a.run_id)
     return {"submit": cmd_submit, "dispatch": cmd_dispatch, "status": cmd_status, "takeover": cmd_takeover,
             "close": cmd_close, "park": cmd_park, "answer": cmd_answer, "inbox": cmd_inbox,
-            "reconcile": cmd_reconcile, "events": cmd_events}[a.cmd](a)
+            "reconcile": cmd_reconcile, "archive": cmd_archive, "events": cmd_events}[a.cmd](a)
 
 
 if __name__ == "__main__":

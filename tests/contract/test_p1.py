@@ -125,3 +125,15 @@ def test_launcher_failure_does_not_use_the_attempt_budget(tmp_path, env):
         st = wait_exit(env, "t-demo")
         assert st["runs"][-1]["state"] == "launch_failed" and st["status"] == "accepted"
         assert "unknown lane" in st["runs"][-1]["receipt"]["reason"]
+
+
+def test_archive_hides_a_dead_task_from_the_inbox_and_blocks_dispatch(tmp_path, env):
+    spec = make_task(tmp_path, worker="true", attempts=1)
+    yg(env, "submit", str(spec), "--as", "A")
+    yg(env, "dispatch", "t-demo", "--as", "A"); wait_exit(env, "t-demo")
+    yg(env, "close", "t-demo", "--as", "A")
+    assert json.loads(yg(env, "inbox", "--json")[1])[0]["status"] == "exhausted"
+    assert yg(env, "archive", "t-demo", "--as", "B", "--reason", "x")[0] == 3
+    assert yg(env, "archive", "t-demo", "--as", "A", "--reason", "resubmitted as t-demo-b")[0] == 0
+    assert json.loads(yg(env, "inbox", "--json")[1]) == []
+    assert yg(env, "dispatch", "t-demo", "--as", "A")[0] == 3

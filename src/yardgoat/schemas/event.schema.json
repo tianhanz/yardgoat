@@ -27,7 +27,8 @@
     "run.exited",
     "run.lost",
     "run.verified",
-    "run.launch_failed"
+    "run.launch_failed",
+    "task.archived"
    ]
   },
   "actor": {
