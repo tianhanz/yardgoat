@@ -3,7 +3,7 @@
 *The yard engine for heterogeneous coding agents.*
 调车机：把异构 coding agent 编组、发车、签回执。
 
-> **Status: pre-alpha (P0).** The task contract, the CLI and a direct runner exist and are covered by contract tests. Adapters for existing fleet queues are not written yet.
+> **Status: pre-alpha (P1).** Task contract, CLI, direct runner, a file-queue adapter, park/answer/resume and a reconciler exist and are covered by contract tests. Issue-driven adapters, MCP and budget gates are next.
 
 A **yard goat** is the small locomotive that assembles trains in a rail yard: it doesn't haul the long-distance freight, it sorts the cars and sends each one down the right track. Yardgoat does that for coding agents — you describe a task once, it starts the agent CLI you choose (Codex, Claude Code, Kimi, or a shell command), and it tracks the run until a frozen verifier says it is actually done.
 
@@ -25,6 +25,14 @@ yardgoat status example-reconcile-01                        # owner, runs, liven
 # controller-a goes away; controller-b only needs the task id
 yardgoat takeover example-reconcile-01 --as controller-b --from controller-a
 yardgoat close example-reconcile-01 --as controller-b       # runs the frozen verifier
+```
+
+When a worker needs a human, it writes `out/BLOCKED.md`; the task parks with that text as its question:
+
+```bash
+yardgoat inbox                                              # what is waiting for a human
+yardgoat answer example-reconcile-01 --as me --text "use the 2024 records"
+yardgoat reconcile                                          # (cron) resumes answered tasks, polls adapters
 ```
 
 A task spec names the prompt file (`card`), the working directory, the expected `outputs`, the `executor`
@@ -51,9 +59,9 @@ With `tmux_session` set, each run gets its own window (handy for watching); othe
 
 | Phase | Scope | Status |
 |---|---|---|
-| P0 | contract, file store, CLI, direct runner, contract tests | **here** |
-| P1 | adapters that submit into existing queues (file pools, issue-driven dispatchers, queue files) instead of running directly | planned |
-| P2 | host entry points (agent skill, MCP), budget and lane policy gates, a read-only status projection for dashboards | planned |
+| P0 | contract, file store, CLI, direct runner, contract tests | done |
+| P1 | lane allowlist, park/answer/resume, `file-pool` adapter, plugin adapters, reconciler, launch-failure accounting | **here** |
+| P2 | issue-driven and queue-file adapters, agent-host skill and MCP entry points, cost budget gates, dashboard projection | planned |
 | P3 | per-task evaluation data (actual model, rework, human interventions) — facts first, no rankings | planned |
 
 ## Development

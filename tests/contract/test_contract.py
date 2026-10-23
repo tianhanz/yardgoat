@@ -134,3 +134,22 @@ def test_receipt_carries_every_field_the_schema_requires(tmp_path, env):
     rec = wait_exit(env, "t-demo")["runs"][0]["receipt"]
     assert set(schema["required"]) <= set(rec)
     assert rec["status"] in schema["properties"]["status"]["enum"]
+
+
+def test_worker_environment_does_not_inherit_yardgoats_import_path(tmp_path, env):
+    """Regression (2026-10-23): the runner leaked its own sys.path as PYTHONPATH and broke every Python
+    the worker started. The worker must see the caller's PYTHONPATH (here: unset), nothing else."""
+    env.pop("PYTHONPATH", None)
+    env["YARDGOAT_TEST_SRC"] = SRC
+    spec = make_task(tmp_path, worker="python3 -c \"import os;open('out/result.txt','w').write(os.environ.get('PYTHONPATH','<unset>'))\"")
+    p = subprocess.run([sys.executable, "-c", f"import sys; sys.path.insert(0, {SRC!r}); from yardgoat.cli import main; sys.exit(main())",
+                        "submit", str(spec), "--as", "A"], env=env, capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    p = subprocess.run([sys.executable, "-c", f"import sys; sys.path.insert(0, {SRC!r}); from yardgoat.cli import main; sys.exit(main())",
+                        "dispatch", "t-demo", "--as", "A"], env=env, capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    end = time.time() + 20
+    out = tmp_path / "work/out/result.txt"
+    while time.time() < end and not out.exists():
+        time.sleep(0.2)
+    assert out.read_text() == "<unset>"

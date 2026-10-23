@@ -117,6 +117,33 @@
    "items": {
     "type": "string"
    }
+  },
+  "adapter": {
+   "type": "object",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "description": "direct (default), file-pool, or a plugin kind"
+    },
+    "pool": {
+     "type": "string"
+    },
+    "worker_verify": {
+     "type": "string",
+     "description": "command the pool worker runs before marking done"
+    }
+   }
+  },
+  "allowed_lanes": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   },
+   "description": "Enforced at dispatch: the executor lane must be listed."
+  },
+  "blocked_file": {
+   "type": "string",
+   "description": "Relative to workdir; if the worker writes it, the task is parked with its content as the question. Default out/BLOCKED.md."
   }
  }
 }

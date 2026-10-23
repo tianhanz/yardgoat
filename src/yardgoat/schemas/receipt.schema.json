@@ -27,7 +27,10 @@
    "type": "integer"
   },
   "exit_code": {
-   "type": "integer"
+   "type": [
+    "integer",
+    "null"
+   ]
   },
   "timed_out": {
    "type": "boolean"
@@ -65,9 +68,12 @@
   "status": {
    "enum": [
     "exited",
+    "blocked",
+    "lost",
     "passed",
     "failed",
-    "verifier_error"
+    "verifier_error",
+    "launch_failed"
    ]
   },
   "verifier": {
@@ -93,6 +99,21 @@
      "type": "string"
     }
    }
+  },
+  "adapter": {
+   "type": "string"
+  },
+  "worker": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "question": {
+   "type": "string"
+  },
+  "reason": {
+   "type": "string"
   }
  }
 }

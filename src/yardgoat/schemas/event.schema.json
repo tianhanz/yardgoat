@@ -20,10 +20,14 @@
    "enum": [
     "task.accepted",
     "task.owner_changed",
+    "task.parked",
+    "task.answered",
     "run.dispatched",
     "run.started",
     "run.exited",
-    "run.verified"
+    "run.lost",
+    "run.verified",
+    "run.launch_failed"
    ]
   },
   "actor": {

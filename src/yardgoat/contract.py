@@ -65,6 +65,12 @@ def normalize(spec: dict, base: Path) -> dict:
         raise SpecError("verifier.command is required")
     v["cwd"] = _abs(base, v.get("cwd", s["workdir"]))
     v["freeze"] = [_abs(base, f) for f in v.get("freeze", [])]
+    ad = s.setdefault("adapter", {"kind": "direct"})
+    ad.setdefault("kind", "direct")
+    if ad["kind"] == "file-pool" and not ad.get("pool"):
+        raise SpecError("adapter.pool is required for kind=file-pool")
+    if "allowed_lanes" in s and not isinstance(s["allowed_lanes"], list):
+        raise SpecError("allowed_lanes must be a list")
     b = s.setdefault("budget", {})
     b.setdefault("max_attempts", 2)
     b.setdefault("max_wall_min", 60)

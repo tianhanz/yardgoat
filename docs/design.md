@@ -1,4 +1,4 @@
-# Design (P0)
+# Design (P0 + P1)
 
 Yardgoat puts one dispatch contract in front of the agent fleets you already run. P0 is the smallest
 piece that makes the contract real: a file-backed task store, a CLI, and a direct runner.
@@ -26,14 +26,27 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 5. **Exited ≠ verified.** The runner only writes a receipt with `status: exited`. `close` runs the verifier: exit 0 → `passed`, exit 1 → `failed` (retry allowed within `budget.max_attempts`), anything else → `verifier_error` (a crashing verifier is not a failing deliverable).
 6. **Bounded attempts.** When the budget is spent the task becomes `exhausted` and needs a human.
 
+7. **Lane policy at the dispatch edge.** If a spec lists `allowed_lanes`, the executor lane must be in it; lanes in the local config's `forbidden_lanes` are refused on that machine regardless of the spec.
+8. **Asking is not failing.** A worker that writes `out/BLOCKED.md` (or a pool card that lands in `parked/`) parks the task with that text as the question. `answer` records a reply; `reconcile` resumes the task on the owner's behalf, and the answer is appended to the prompt. Parked runs do not use the attempt budget.
+9. **Infrastructure failures are not attempts.** When the local launcher exits with one of `launcher_failure_codes` before any agent started, the run is `launch_failed` and does not count.
+10. **The worker sees the caller's environment.** Yardgoat's own import path is never passed to workers.
+
+## Adapters
+
+`adapter.kind` picks how work is started and observed: `direct` (Yardgoat starts the agent CLI) or
+`file-pool` (Yardgoat writes a card into an existing file-queue fleet and watches it move through
+`pending/claimed/done/parked`; the fleet's own workers claim it). Adapters that need private hosts or
+paths are loaded from local files listed in the config's `plugins`. `yardgoat reconcile` (run it from
+cron) polls adapter runs, marks runs whose process vanished as `lost`, and resumes answered tasks —
+so accepted work keeps moving when no controller session is alive.
+
 ## Handover
 
 A controller that disappears mid-run loses nothing: the run keeps going, and a new controller needs only
 the task id. `yardgoat status <id>` shows owner, runs, liveness and receipts; `takeover` moves
 ownership; `close` verifies. The old owner can no longer dispatch or close.
 
-## Not in P0
+## Not yet
 
-Adapters that submit into existing queues (file pools, issue-driven dispatchers, queue files), host entry
-points (skill / MCP), policy and budget gates beyond attempt counts, leases for multi-host stores, and
-evaluation data. See the roadmap in the README.
+Issue-driven and queue-file adapters (beyond `file-pool`), an MCP entry point, cost/model-call budget
+gates, leases for multi-host stores, and evaluation data. See the roadmap in the README.
