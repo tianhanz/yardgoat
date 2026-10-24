@@ -349,11 +349,15 @@ Configure an explicit suitable name when an installation does not expose those n
 
 `YARDGOAT_STATION`, `YARDGOAT_MAILBOX`, `YARDGOAT_MAILBOX_HOME`, or an ancestor
 `yardgoat _station` / `python -m yardgoat.cli _station` invocation reject session
-identification, including administrator PID inventory. Changing the target store
+identification, including wrappers with global `--session` arguments before
+`_station`, and administrator PID inventory. Changing the target store
 does not remove the station restriction. Permission failures are unknown, including
 restricted proc mounts. A session list reports `alive`, `dead`, or `unknown`:
 boot/start-time mismatch, confirmed PID absence, or a zombie is dead; inability to
-read the evidence is unknown. Neither status automatically changes project control.
+read the evidence is unknown. An absent proc entry requires a readable proc root
+and an existence check (`kill(pid, 0)`, which sends no signal) reporting no such
+process before it counts as dead. Hidden entries for existing or inaccessible
+processes stay unknown. Neither status automatically changes project control.
 
 The endpoint comes from `TMUX` and `TMUX_PANE`. A bounded read-only tmux lookup
 checks whether the pane PID is the agent itself or an ancestor of it. Mismatch,
@@ -455,8 +459,11 @@ Every reconcile round writes `$YARDGOAT_HOME/reconcile-health.json` at start and
 under its own short lock: `last_started_at`, `last_finished_at`, `last_success_at`,
 and `errors: {count, first}` (up to five bounded summaries). Only a round with no
 action errors advances last_success_at. Adapter exceptions, failed command results,
-review/delivery/auto-close refusals, failed pool probes and notification failures
-are included. A fatal action exception records the end/error and exits 2; existing
+review/delivery/auto-close refusals, failed pool probes, caught station launch errors
+and notification failures are included. A context-local error collector also covers
+station launches reached through nested dispatch/review continuations; failed
+launches do not appear in `station_started`. The collector holds no lock and is
+removed at the end of each round. A fatal action exception records the end/error and exits 2; existing
 best-effort errors keep their original command exit behavior. SIGKILL leaves a
 start without its finish. Concurrent rounds merge fields under the health lock;
 the most recent completion supplies its error summary and does not erase a newer

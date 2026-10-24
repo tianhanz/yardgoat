@@ -22,6 +22,7 @@
    ]
   },
   "last_success_at": {
+   "description": "Most recent completion without action errors, including caught station launch failures",
    "type": [
     "string",
     "null"

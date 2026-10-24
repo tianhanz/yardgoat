@@ -1,10 +1,30 @@
 """Reconciler observability, never a controller lease or authorization input."""
 import math
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from .report import _timestamp
 from .statefile import locked_json
 from .store import home, now, read_json
+
+_round_errors = ContextVar("reconcile_errors", default=None)
+
+
+@contextmanager
+def observe_errors(errors):
+    """Include caught failures in nested dispatch/review paths in this round only."""
+    token = _round_errors.set(errors)
+    try:
+        yield
+    finally:
+        _round_errors.reset(token)
+
+
+def record_error(message):
+    errors = _round_errors.get()
+    if errors is not None:
+        errors.append(str(message))
 
 
 def read():

@@ -81,6 +81,7 @@
    "type": "string"
   },
   "liveness": {
+   "description": "dead requires confirmed boot/start-time mismatch, zombie state, or PID absence; hidden/unreadable proc entries are unknown",
    "enum": [
     "alive",
     "dead",

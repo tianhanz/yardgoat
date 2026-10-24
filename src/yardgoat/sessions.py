@@ -42,6 +42,18 @@ class ProcFS:
     def stat(self, pid):
         return parse_stat((self.root / str(pid) / "stat").read_text())
 
+    def absence_confirmed(self, pid):
+        # hidepid can report ENOENT for a live process. A readable proc root alone
+        # does not prove death; signal 0 checks existence without sending a signal.
+        self.stat(1)
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        return False
+
     def process(self, pid):
         before = self.stat(pid)
         path = self.root / str(pid)
@@ -97,7 +109,15 @@ def station_marker(process):
     # Match the actual wrapper invocation, not incidental prompt text containing _station.
     for i, arg in enumerate(argv[:-1]):
         if (arg == "yardgoat.cli" and i > 0 and argv[i - 1] == "-m") or Path(arg).name == "yardgoat":
-            if argv[i + 1] == "_station":
+            remaining = argv[i + 1:]
+            # Global caller assertions can precede the subcommand. Support the
+            # same unambiguous option abbreviations accepted by argparse.
+            while remaining:
+                option, equal, _ = remaining[0].partition("=")
+                if not option.startswith("--") or not "--session".startswith(option):
+                    break
+                remaining = remaining[1 if equal else 2:]
+            if remaining and remaining[0] == "_station":
                 return True
     return False
 
@@ -218,9 +238,7 @@ def liveness(rec, proc=None):
         try:
             stat = proc.stat(identity["pid"])
         except FileNotFoundError:
-            # An absent proc mount is not evidence of death.
-            proc.stat(1)
-            return "dead"
+            return "dead" if proc.absence_confirmed(identity["pid"]) else "unknown"
         if str(stat["start_ticks"]) != str(identity["start_ticks"]) or stat["state"] in ("Z", "X", "x"):
             return "dead"
         return "alive"

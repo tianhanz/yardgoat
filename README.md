@@ -116,6 +116,8 @@ generic interpreters are not recognized by default. The closest matching agent i
 the caller. Ambiguous or inaccessible process ancestry is unknown (exit 3), and
 pool stations cannot register. `--session ID` asserts the caller identity; it cannot
 select somebody else's identity. `project assign --session` instead names its target.
+Session lists distinguish `alive`, `dead` and `unknown`; a hidden or unreadable
+process entry cannot by itself establish death.
 Tmux endpoints and project roots are display/routing metadata, never permission.
 
 `project_admins` is separate from l3 `approvers` and fails closed when absent.
@@ -132,6 +134,8 @@ Schemas: [session](src/yardgoat/schemas/session.schema.json),
 Each `reconcile` records start/end, last error-free completion and an error summary
 in `reconcile-health.json`. JSON status includes `reconcile_health`; doctor alarms
 when a recorded completion is older than `reconcile_stale_min` (default 10 minutes).
+Caught station launch failures are included in the error summary and retain the
+previous error-free completion time.
 This record never grants or revokes project control.
 
 ## Approval and delivery

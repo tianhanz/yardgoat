@@ -410,6 +410,10 @@ class FakeProc:
     def boot_id(self):
         return "fixture-boot"
 
+    def absence_confirmed(self, pid):
+        self.stat(1)
+        return pid not in self.rows
+
 
 def test_proc_ambiguity_station_ancestor_and_no_outer_fallback():
     from yardgoat import sessions
@@ -531,3 +535,57 @@ def test_health_is_independent_of_control_and_error_summary_is_bounded(env, agen
     assert len(result["errors"]["first"]) == 5 and len(result["errors"]["first"][0]) == 1000
     assert result["last_success_at"] is None
     assert projects.recheck("demo", *ticket) == ticket
+
+
+def test_reconcile_station_launch_error_preserves_last_success(env, monkeypatch, capsys):
+    from yardgoat import cli, doctor, health, pool, runner
+    health.start()
+    previous = health.finish([])
+    previous["last_success_at"] = "2000-01-01T00:00:00+0000"
+    (Path(env["YARDGOAT_HOME"]) / "reconcile-health.json").write_text(json.dumps(previous))
+    cfg = {"pools": {"fixture": {"host": "shell", "command": "true", "max_stations": 1}}}
+    monkeypatch.setattr(runner, "config", lambda: cfg)
+    monkeypatch.setattr(pool, "queued_cards", lambda *a, **kw: [("", "fixture-card")])
+    monkeypatch.setattr(doctor, "ensure", lambda *a: {"ok": True})
+    def broken_launcher(*args, **kwargs):
+        raise RuntimeError("fixture launcher unavailable")
+    monkeypatch.setattr(runner, "launch_daemon", broken_launcher)
+    assert cli.cmd_reconcile(SimpleNamespace()) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["reconcile_health"]["last_success_at"] == previous["last_success_at"]
+    assert result["reconcile_health"]["errors"]["count"] == 1
+    assert "fixture launcher unavailable" in result["reconcile_health"]["errors"]["first"][0]
+    assert not any("station_started" in action for action in result["actions"])
+
+
+@pytest.mark.parametrize("prefix", [[], ["--session", "s-example"], ["--session=s-example"]])
+def test_station_wrapper_global_options_cannot_hide_boundary(prefix):
+    from yardgoat import sessions
+    proc = FakeProc()
+    proc.rows[11]["argv"] = ["python", "-m", "yardgoat.cli", *prefix, "_station", "fixture", "fixture-st-1"]
+    cfg = {"sessions": {"agents": [{"name": "fixture", "exe": "fake"}]}}
+    result = sessions.identify(cfg, pid=13, proc=proc, env={})
+    assert result["session_id"] is None and "station" in result["reason"]
+
+
+def test_hidden_proc_pid_is_unknown_not_dead(monkeypatch):
+    from yardgoat import sessions
+    proc = sessions.ProcFS()
+    monkeypatch.setattr(proc, "boot_id", lambda: "fixture-boot")
+    def visible_stat(pid):
+        if pid != 1:
+            raise FileNotFoundError("proc entry is hidden")
+        return FakeProc.row(1, 0, "init")
+    monkeypatch.setattr(proc, "stat", visible_stat)
+    rec = {"identity": {"boot_id": "fixture-boot", "pid": 12, "start_ticks": "120"}}
+    for exists in (True, False):
+        def signal_check(pid, signal):
+            assert (pid, signal) == (12, 0)
+            if not exists:
+                raise PermissionError("process belongs to another user")
+        monkeypatch.setattr(sessions.os, "kill", signal_check)
+        assert sessions.liveness(rec, proc) == "unknown"
+    def absent(pid, signal):
+        raise ProcessLookupError("no such process")
+    monkeypatch.setattr(sessions.os, "kill", absent)
+    assert sessions.liveness(rec, proc) == "dead"

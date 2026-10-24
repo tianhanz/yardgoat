@@ -27,7 +27,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import runner, scheduling
+from . import health, runner, scheduling
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 STATION_PROMPT = """你是 Yardgoat 任务池「{pool}」的工位，身份 {station}。按下面的循环干活，直到池子空了：
@@ -203,7 +203,11 @@ def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
                 from . import doctor
                 if not doctor.ensure(name, cfg, next_station(name, c)[1])["ok"]:
                     break
-                started.append(start_station(name, c, cfg)); want -= 1
+                station = start_station(name, c, cfg)
+                if (get_station(name, station) or {}).get("state") == "launch_failed":
+                    break
+                started.append(station)
+                want -= 1
     return started
 
 
@@ -224,6 +228,7 @@ def start_station(name: str, c: dict, cfg: dict) -> str:
         launched = runner.launch_daemon(me, cfg, str(home()), f"yg-{station}", linger=120)
         update_station(name, station, launcher_pid=launched["pid"])
     except (OSError, RuntimeError) as e:
+        health.record_error(f"pool {name}, station {station}: launch failed: {e}")
         update_station(name, station, state="launch_failed", reason=str(e))
         # back off: without this, every reconcile starts (and fails) one more station
         write_json(pool_dir(name) / "launch-backoff.json",

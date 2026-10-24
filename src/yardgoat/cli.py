@@ -1029,7 +1029,8 @@ def cmd_reconcile(a) -> int:
     health.start()
     rc = 0
     try:
-        result = _reconcile(a, errors)
+        with health.observe_errors(errors):
+            result = _reconcile(a, errors)
     except Exception as exc:
         errors.append(f"reconcile: {type(exc).__name__}: {exc}")
         result = {"reconciled_at": now(), "actions": [], "notified": [], "error": str(exc)}
