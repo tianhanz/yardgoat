@@ -1,7 +1,7 @@
 # Yardgoat
 
 *The yard engine for heterogeneous coding agents.*
-调车机：把异构 coding agent 编组、发车、签回执。
+车场山羊：把异构 coding agent 编组、发车、签回执。
 
 > **Status: pre-alpha (P1).** Task contract, CLI, direct runner, a file-queue adapter, park/answer/resume and a reconciler exist and are covered by contract tests. Issue-driven adapters, MCP and budget gates are next.
 
