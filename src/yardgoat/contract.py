@@ -79,9 +79,18 @@ def normalize(spec: dict, base: Path) -> dict:
         raise SpecError("budget.max_attempts must be an integer >= 1")
     if isinstance(mw, bool) or not isinstance(mw, (int, float)) or mw <= 0:
         raise SpecError("budget.max_wall_min must be a number > 0")
-    for k in ("outputs", "escalate_when", "allowed_lanes"):
+    for k in ("outputs", "escalate_when", "allowed_lanes", "scope"):
         if k in s and not (isinstance(s[k], list) and all(isinstance(x, str) for x in s[k])):
             raise SpecError(f"{k} must be a list of strings")
+    for p in s.get("scope", []):
+        if not p or Path(p).is_absolute() or ".." in Path(p).parts or p.startswith("~"):
+            raise SpecError("scope entries must be paths or globs relative to workdir")
+    s.setdefault("scope", [])
+    s.setdefault("risk", "l2")
+    if not isinstance(s["risk"], str) or s["risk"] not in ("l1", "l2", "l3"):
+        raise SpecError("risk must be l1, l2 or l3")
+    if "acceptance" in s and not isinstance(s["acceptance"], str):
+        raise SpecError("acceptance must be a string")
     if not isinstance(v["command"], str) or not all(isinstance(x, str) for x in v["freeze"]):
         raise SpecError("verifier.command must be a string and verifier.freeze a list of paths")
     for k in ("host", "lane", "acct", "command", "sandbox"):

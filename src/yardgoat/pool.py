@@ -19,7 +19,6 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -176,36 +175,31 @@ def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
                     break
                 if not resources_ok(cfg)[0]:
                     break
+                from . import doctor
+                if not doctor.ensure(name, cfg, next_station(name, c)[1])["ok"]:
+                    break
                 started.append(start_station(name, c, cfg)); want -= 1
     return started
 
 
-def start_station(name: str, c: dict, cfg: dict) -> str:
+def next_station(name: str, c: dict) -> tuple[str, str]:
     d = pool_dir(name)
     n = 1 + max([int(f.stem.rsplit("-", 1)[-1]) for f in (d / "stations").glob("*.json")] or [0])
     station = f"{name}-st-{n}"
     accts = c.get("accts") or ([c["acct"]] if c.get("acct") else [""])
     acct = accts[(n - 1) % len(accts)]          # spread stations over accounts (each account has its own rate limits)
+    return station, acct
+
+
+def start_station(name: str, c: dict, cfg: dict) -> str:
+    station, acct = next_station(name, c)
     update_station(name, station, station=station, pool=name, state="running", started_at=now(), tasks=[], current=None, acct=acct)
     me = [sys.executable, "-m", "yardgoat.cli", "_station", name, station]
-    pypath = str(Path(__file__).resolve().parents[1])
-    envs = {"YARDGOAT_HOME": str(home()), "PYTHONPATH": pypath, "YARDGOAT_ORIG_PYTHONPATH": os.environ.get("PYTHONPATH", "")}
-    if os.environ.get("YARDGOAT_CONFIG"):
-        envs["YARDGOAT_CONFIG"] = os.environ["YARDGOAT_CONFIG"]
-    session = cfg.get("tmux_session")
-    if session and shutil.which("tmux") and not os.environ.get("YARDGOAT_NO_TMUX"):
-        cmd = " ".join(f"{k}={shlex.quote(v)}" for k, v in envs.items()) + " " + shlex.join(me) + \
-              "; echo '[yardgoat] station finished; window closes in 120s'; sleep 120"
-        r = subprocess.run(["tmux", "new-window", "-d", "-P", "-F", "#{pane_pid}", "-t", session, "-n", f"yg-{station}", cmd],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            update_station(name, station, state="launch_failed", reason=r.stderr.strip())
-        else:
-            update_station(name, station, launcher_pid=int(r.stdout.strip()))
-    else:
-        p = subprocess.Popen(me, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True, env=dict(os.environ, **envs))
-        update_station(name, station, launcher_pid=p.pid)
+    try:
+        launched = runner.launch_daemon(me, cfg, str(home()), f"yg-{station}", linger=120)
+        update_station(name, station, launcher_pid=launched["pid"])
+    except (OSError, RuntimeError) as e:
+        update_station(name, station, state="launch_failed", reason=str(e))
     return station
 
 
@@ -217,7 +211,7 @@ def mailbox_dir(name: str, station: str, c: dict) -> Path:
     return d
 
 
-def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
+def station_argv(name: str, station: str, c: dict, cfg: dict, probe_argv: list[str] | None = None) -> list[str]:
     yg = shutil.which("yardgoat") or f"{sys.executable} -m yardgoat.cli"
     prompt = STATION_PROMPT.format(pool=name, station=station, yg=yg, max_tasks=int(c.get("max_tasks_per_station", 5)))
     pre = c.get("preamble") or (Path(os.path.expanduser(c["preamble_file"])).read_text(encoding="utf-8") if c.get("preamble_file") else "")
@@ -237,12 +231,36 @@ def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
         argv = ["kimi", "--prompt", prompt, *extra]
     else:  # shell: a scripted station, used by the contract tests
         argv = ["bash", "-c", c["command"], station]
+    if probe_argv is not None:
+        argv = probe_argv
     launcher = cfg.get("launcher") if host != "shell" else None
     if launcher:
         acct = (get_station(name, station) or {}).get("acct") or c.get("acct", "")
         fill = {"host": host, "lane": c.get("lane", ""), "acct": acct}
         argv = [a.format(**fill) for a in launcher] + argv
     return argv
+
+
+def station_script(name: str, station: str, c: dict, cfg: dict, mb: Path,
+                   probe_argv: list[str] | None = None) -> str:
+    root = os.path.expanduser(c.get("root", str(pool_dir(name) / "stations")))
+    return runner.shell_script(root, cfg, station_argv(name, station, c, cfg, probe_argv),
+                               {"YARDGOAT_STATION": station, "YARDGOAT_MAILBOX": str(mb)})
+
+
+def station_env() -> dict:
+    env = runner.worker_env()
+    env["PATH"] = os.path.dirname(shutil.which("yardgoat") or sys.executable) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def unfinished_outcome(name: str, station: str, cfg: dict) -> dict:
+    refusal = runner.provider_refusal(pool_dir(name) / "stations" / f"{station}.log", cfg)
+    c = pool_conf(cfg, name)
+    return {"state": "provider_refused" if refusal else "lost",
+            "reason": refusal or f"station {station} exited without finishing the card", "worker": station,
+            "host": c["host"], "lane": c.get("lane", ""),
+            "account_alias": (get_station(name, station) or {}).get("acct", "")}
 
 
 def run_station(name: str, station: str) -> int:
@@ -257,13 +275,8 @@ def run_station(name: str, station: str) -> int:
     d = pool_dir(name) / "stations"
     mb = mailbox_dir(name, station, c)
     update_station(name, station, pid=os.getpid(), mailbox=str(mb))
-    lines = ["set -u"] + [f"source {shlex.quote(os.path.expanduser(x))} || exit 3" for x in cfg.get("source", [])]
-    lines += [f"cd {shlex.quote(os.path.expanduser(c.get('root', str(d))))} || exit 3",
-              "export YARDGOAT_STATION=" + shlex.quote(station), "export YARDGOAT_MAILBOX=" + shlex.quote(str(mb)),
-              "exec " + shlex.join(station_argv(name, station, c, cfg))]
-    (d / f"{station}.sh").write_text("\n".join(lines) + "\n")
-    env = runner.worker_env()
-    env["PATH"] = os.path.dirname(shutil.which("yardgoat") or sys.executable) + os.pathsep + env.get("PATH", "")
+    (d / f"{station}.sh").write_text(station_script(name, station, c, cfg, mb))
+    env = station_env()
     timed_out = None
     with open(d / f"{station}.log", "wb") as log:
         p = subprocess.Popen(["bash", str(d / f"{station}.sh")], stdin=subprocess.DEVNULL, stdout=log,
@@ -287,8 +300,7 @@ def run_station(name: str, station: str) -> int:
                 "state": "exited", "exit_code": 124, "worker": station, "host": c.get("host", ""), "lane": c.get("lane", ""),
                 "actual_model": station_model(name, station), "model_source": "station-log", "cost_basis": "shared-station"})
         else:
-            runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], {
-                "state": "lost", "reason": f"station {station} exited without finishing the card", "worker": station})
+            runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], unfinished_outcome(name, station, cfg))
     rec = update_station(name, station, state="exited", exit_code=p.returncode, ended_at=now(), current=None,
                          model=runner.detect_model(d / f"{station}.log")[0], timed_out=bool(timed_out))
     return p.returncode or 0
