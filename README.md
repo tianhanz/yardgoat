@@ -58,6 +58,19 @@ A task spec names the prompt file (`card`), the working directory, the expected 
 Schemas: [task](src/yardgoat/schemas/task.schema.json) · [receipt](src/yardgoat/schemas/receipt.schema.json) · [event](src/yardgoat/schemas/event.schema.json).
 Invariants and store layout: [docs/design.md](docs/design.md) · What it is for: [docs/PRD.md](docs/PRD.md).
 
+`auto_close` defaults to `true`: after a run exits, `reconcile` runs its frozen verifier on behalf of
+the current owner, including the normal review, `on_pass` and dependency gates. The owner need not have
+an active session. A nonzero worker exit still goes to the verifier; a failed verification does not
+add automatic retries to ordinary tasks. Set `"auto_close": false` for manual `close`. Configured
+`review` retains its existing automatic verification policy, including execution and repairs.
+`quick --no-auto-close` selects manual close; `quick --auto-close` remains a supported spelling of
+the default. These two switches are mutually exclusive.
+
+**Upgrade:** the default also applies to already accepted tasks that omit `auto_close`. Existing
+exited runs will advance on the next reconcile, potentially running their frozen `on_pass` commands.
+Accepted specs, hashes and frozen files are not rewritten. See the
+[upgrade behavior](docs/design.md#automatic-verification-and-upgrades) before enabling reconciliation.
+
 ## Approval and delivery
 
 Tasks with `"risk": "l3"` need explicit approval before dispatch. They appear in `inbox` as `等审批`;
@@ -231,6 +244,30 @@ An optional machine-local `notify` setting runs your own command for pending dec
 them. The question argument is limited to 500 characters. Successful reminders are remembered across
 reconciles; a new status or full question gets a new reminder. Failures log to stderr and retry next time.
 Without `notify`, no hook runs. Reconcile still emits one JSON document, with a `notified` array.
+
+For independent routes, `notify` also accepts a list:
+
+```json
+{"notify": [
+  {"name": "owner", "recipient": "{owner}", "command": ["/path/to/owner-hook", "{owner}", "{task_id}", "{question}"]},
+  {"name": "operations", "command": ["/path/to/operations-hook", "{task_id}", "{status}"]}
+]}
+```
+
+Each route has its own optional `on` list. `name` defaults to `"default"`; names must be unique within
+the list, including omitted names. Invalid configuration rejects the entire list and logs a warning.
+`recipient` is a string template using the same placeholders as `command`; it identifies the destination
+for deduplication, while the command remains responsible for delivery. Missing `recipient` means an
+empty destination. Success is remembered by route name, status, full question hash and formatted
+recipient. After takeover, a route using `{owner}` sends the pending decision to the new owner; a
+route without a recipient does not resend. A failed or timed-out route does not prevent other routes
+from running; only that route retries on the next reconcile.
+
+A single-object configuration without `recipient` keeps the exact legacy key, even if it has a `name`.
+Existing successful reminders do not resend on upgrade. Switching it to a list opts into route keys
+and can send once under the new key. New-route `notified` entries include `name` and formatted
+`recipient`; legacy entries keep their original shape. Records remain under
+`$YARDGOAT_HOME/notified/<task_id>.json`.
 
 Check the actual launch chain without calling a model:
 

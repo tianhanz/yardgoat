@@ -147,7 +147,8 @@
   },
   "auto_close": {
    "type": "boolean",
-   "description": "reconcile runs the frozen verifier on the owner's behalf once a run exits"
+   "default": true,
+   "description": "Defaults to true, including previously accepted specs omitting this field. reconcile runs the frozen verifier as the current owner after exit. Explicit false keeps manual close; configured review retains its automatic verification policy."
   },
   "scope": {
    "type": "array",

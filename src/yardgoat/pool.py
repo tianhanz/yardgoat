@@ -11,8 +11,8 @@ A task opts in with `"adapter": {"kind": "pool", "pool": "codex"}`. Dispatch onl
 live stations, within max_stations and the machine-wide max_concurrent. A station is one agent CLI session
 whose prompt is a loop: `yardgoat claim` → do the card → `yardgoat finish` → claim again → EMPTY → exit.
 That reuses the warm session across cards instead of paying a cold start per card. Stations never receive
-typed messages; they pull. Verification stays with the task owner (`close`), or with reconcile when the
-spec says `"auto_close": true`.
+typed messages; they pull. Reconcile verifies on the current owner's behalf by default. Explicit
+`"auto_close": false` keeps manual `close`; configured review still enables automatic verification.
 """
 from __future__ import annotations
 

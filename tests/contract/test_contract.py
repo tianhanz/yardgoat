@@ -32,6 +32,8 @@ def make_task(tmp_path, task_id="t-demo", worker="echo done > out/result.txt", v
     (tmp_path / "card.md").write_text("write out/result.txt\n")
     (tmp_path / "verify.sh").write_text(verify + "\n")
     spec = {"task_id": task_id, "project": "demo", "goal": "g", "card": "card.md", "workdir": "work",
+            # Existing lifecycle fixtures choose manual close; M7 tests exercise the new omitted default.
+            "auto_close": False,
             "outputs": ["out/result.txt"], "executor": {"host": "shell", "command": worker},
             "verifier": {"command": f"bash {tmp_path / 'verify.sh'}", "freeze": ["verify.sh"]},
             "budget": {"max_attempts": attempts, "max_wall_min": 1}}

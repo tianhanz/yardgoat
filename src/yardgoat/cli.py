@@ -921,7 +921,7 @@ def cmd_reconcile(a) -> int:
                     if receipt:
                         report.append({"task_id": t, "run_id": last["run_id"], "observed": receipt["status"]})
                 continue
-            if last["state"] == "exited" and (spec.get("auto_close") or spec.get("review")) and st["status"] == "exited":
+            if last["state"] == "exited" and (spec.get("auto_close", True) or spec.get("review")) and st["status"] == "exited":
                 to_close.append((td, st["owner"]))  # verified after the schedule lock is released (review 3, F1)
                 continue
             if last["state"] == "running":
@@ -1074,8 +1074,8 @@ def cmd_quick(a) -> int:
             "authority": a.authority or "Only what the card says; anything else needs a human."}
     if a.depends_on:
         spec["depends_on"] = list(a.depends_on)
-    if a.auto_close:
-        spec["auto_close"] = True
+    if a.auto_close is not None:
+        spec["auto_close"] = a.auto_close
     if a.acceptance is not None:
         spec["acceptance"] = a.acceptance
     if yg_pool:
@@ -1331,7 +1331,11 @@ def main(argv=None) -> int:
     s.add_argument("--acceptance")
     s.add_argument("--attempts", type=int, default=2); s.add_argument("--wall", type=int, default=60)
     s.add_argument("--depends-on", action="append", help="task id that must be verified first (repeatable)")
-    s.add_argument("--auto-close", action="store_true", help="reconcile verifies on the owner's behalf when the run exits")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--auto-close", dest="auto_close", action="store_true", default=None,
+                   help="reconcile verifies on the owner's behalf when the run exits (default)")
+    g.add_argument("--no-auto-close", dest="auto_close", action="store_false",
+                   help="require manual close instead of default automatic verification")
     s.add_argument("--no-dispatch", action="store_true")
     s = sub.add_parser("claim"); s.add_argument("--pool", required=True); s.add_argument("--station", required=True)
     s = sub.add_parser("finish"); s.add_argument("task_id"); s.add_argument("--run", required=True); s.add_argument("--station", required=True)

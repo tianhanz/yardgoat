@@ -47,7 +47,8 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 13. **The accepted spec and frozen hashes have an authoritative copy** outside the task store
     (`$YARDGOAT_HOME/frozen/`); verification reads the spec from there, and any disagreement with `spec.json` or the
     hashes in `task.json` is treated as drift.
-14. **`auto_close`** in a spec lets `reconcile` run the frozen verifier on the owner's behalf once a run exits.
+14. **`auto_close` defaults to true.** `reconcile` runs the frozen verifier on the current owner's behalf once a
+    run exits. Explicit false keeps manual close; configured review retains its existing automatic policy.
 15. **Concurrency.** Every "check capacity, then start" decision (dispatch, reconcile, station scheduling) holds one
     machine-wide schedule lock; lock order is schedule → pool → task. Outcomes are committed exactly once, receipt and
     state together under the task lock; a late or duplicate outcome is ignored, and a receipt whose state never got
@@ -195,6 +196,30 @@ so accepted work keeps moving when no controller session is alive.
 A controller that disappears mid-run loses nothing: the run keeps going, and a new controller needs only
 the task id. `yardgoat status <id>` shows owner, runs, liveness and receipts; `takeover` moves
 ownership; `close` verifies. The old owner can no longer dispatch or close.
+
+### Automatic verification and upgrades
+
+An omitted `auto_close` is interpreted as true when reconciling, rather than inserted into an accepted
+spec. Exited runs use the existing `do_close` path outside the scheduling lock, attributed to the
+current task owner. The owner's interactive session is not required. `do_close` rechecks ownership,
+task state and run state under the task lock, so two reconcilers observing the same exit execute the
+verifier only once. Frozen-file drift still refuses verification. Worker exit codes do not bypass
+the verifier: exit 0 and nonzero exits receive the same frozen acceptance check.
+
+PASS continues through normal engineering review, frozen `on_pass` and downstream dependency release.
+FAIL and verifier ERROR retain their existing states and attempt accounting. Ordinary failed tasks
+are not automatically dispatched again, and verifier errors still need explicit close after repair.
+Review-enabled tasks retain their existing review retry/repair policy, including automatic verification
+even with `auto_close: false`; this upgrade does not alter that loop or l3 approval/write-set gates.
+
+**M7 upgrade behavior:** already accepted tasks lacking `auto_close` now advance automatically after
+exit on the next reconcile. This includes their already authorized frozen review and delivery steps.
+No accepted card, spec, content hash or frozen material is migrated or rewritten. Existing explicit
+false values keep ordinary tasks manual. To keep new ordinary tasks manual, submit that explicit
+value or use `quick --no-auto-close`. `quick --auto-close` stays compatible and means true; omitting
+both flags uses the default without injecting it into the spec. Supplying both is a usage error.
+Changing an existing immutable spec still requires a new task ID; this default is not a migration
+mechanism for adding or changing permissions.
 
 ## Approval and post-PASS commands
 
@@ -452,13 +477,33 @@ Token counts are never converted to prices, and shared-station costs are never a
 
 `notify.notify_pending` runs after reconciliation/auto-close and outside the scheduler/task locks. It
 also recognizes a last run's `verify_error` when legacy task state remains `exited`, and ignores closed
-tasks. Local configuration supplies only an argv template; there is no built-in destination or transport.
+tasks. Local configuration supplies one notification object or a list of objects; there is no built-in
+destination or transport. Validate every route before sending any: each requires a nonempty string argv
+list, an optional list of status strings (`on`), an optional nonempty string `name` (default `default`),
+and an optional string `recipient` template. Duplicate names, including duplicate defaults, invalidate
+the entire configuration and produce a warning. Empty lists disable notifications.
 The placeholders are `{task_id}`, `{status}`, `{owner}`, `{question}` (first 500 characters), and `{hint}`.
-Commands run without a shell, with closed stdin, captured output and a 30-second timeout. Errors only
-log to stderr, leaving other reconciliation actions and its single JSON output intact.
+Both command and recipient use these placeholders. Missing recipient is an empty string; formatting
+uses the current owner read under the notification lock. A literal recipient stays unchanged after
+takeover, while `{owner}` resolves to the new owner. The recipient is a deduplication identity, not an
+implicit argument or transport: the command must still address its own destination. Commands run without
+a shell, with closed stdin, captured output and a 30-second timeout. Errors only log to stderr, leaving
+other reconciliation actions and its single JSON output intact. Each route has independent status
+selection and retry: a command/formatting error or timeout does not prevent the remaining routes.
 
-`$YARDGOAT_HOME/notified/<task_id>.json` remembers every successful `(task_id, status, SHA-256 of the
-full question)` tuple. A separate per-task lock prevents concurrent reconcilers from sending the same
-tuple; returning to an already delivered tuple does not resend it. Only exit 0 records success, written
-atomically. Failed commands or bookkeeping writes retry on the next reconcile; a crash between external
-delivery and its local record can therefore redeliver, so hooks may also deduplicate on their side.
+`$YARDGOAT_HOME/notified/<task_id>.json` retains its `sent` map. For a list, or a single object containing
+`recipient`, keys are `v2:` followed by a compact JSON array of `[name, status, question_hash, recipient]`.
+The hash uses the full question, not its 500-character command argument. JSON framing prevents ambiguous
+keys when names or recipients contain delimiters. Successful records add name and formatted recipient;
+the corresponding `notified` result includes them too. A route with no recipient records an empty
+string, so owner takeover alone does not change its key.
+
+**Notification compatibility:** a single object without `recipient` uses exactly the pre-M7
+`status:question_hash` key and record/result shape, even if it has an optional name. Existing records
+are used in place with no migration and do not resend. Opting into a list or adding recipient creates
+a new key space and can deliver once again. A separate per-task lock serializes each route's read,
+command and successful record update across reconcilers. Returning to an already delivered tuple does
+not resend it. Only exit 0 records success, written atomically; successful routes are skipped while
+failed routes retry on the next reconcile. Failed bookkeeping or a crash between external delivery
+and its local record can redeliver, so hooks may also deduplicate on their side. This is not an
+exactly-once external delivery guarantee.
