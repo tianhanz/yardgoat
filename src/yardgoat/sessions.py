@@ -277,33 +277,152 @@ def record(sid):
 
 
 def liveness(rec, proc=None):
+    """Keep the original string API; recovery uses the same evidence with its reason."""
+    return liveness_with_reason(rec, proc)[0]
+
+
+def liveness_with_reason(rec, proc=None):
     proc = proc or ProcFS()
     try:
         identity = rec["identity"]
         if proc.boot_id() != identity["boot_id"]:
-            return "dead"
+            return "dead", "boot_changed"
         try:
             stat = proc.stat(identity["pid"])
         except FileNotFoundError:
-            return "dead" if proc.absence_confirmed(identity["pid"]) else "unknown"
-        if str(stat["start_ticks"]) != str(identity["start_ticks"]) or stat["state"] in ("Z", "X", "x"):
-            return "dead"
-        return "alive"
-    except (OSError, ValueError, KeyError, IndexError):
-        return "unknown"
+            return ("dead", "absence_confirmed") if proc.absence_confirmed(identity["pid"]) else ("unknown", None)
+        if str(stat["start_ticks"]) != str(identity["start_ticks"]):
+            return "dead", "start_ticks_mismatch"
+        if stat["state"] in ("Z", "X", "x"):
+            return "dead", "zombie"
+        return "alive", None
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return "unknown", None
 
 
-def register(caller, label=None, *, administrator=None, reason=None):
+def _check_process(proc, before, uid):
+    fresh = proc.stat(before["pid"])
+    if (any(fresh[k] != before[k] for k in ("pid", "ppid", "comm", "start_ticks"))
+            or fresh["state"] in ("Z", "X", "x") or proc.uid(before["pid"]) != uid):
+        raise Refused("process identity or parent changed during supervisor inspection")
+
+
+def _agent_stat(proc, rec, supervisor_pid=None):
+    identity = rec["identity"]
+    current = proc.stat(identity["pid"])
+    if (proc.boot_id() != identity["boot_id"] or current["pid"] != identity["pid"]
+            or str(current["start_ticks"]) != str(identity["start_ticks"])
+            or current["state"] in ("Z", "X", "x") or proc.uid(identity["pid"]) != os.getuid()):
+        raise Refused("session agent identity changed or is no longer alive with the same uid")
+    if supervisor_pid is not None and current["ppid"] != supervisor_pid:
+        raise Refused("session agent no longer has its bound supervisor as direct parent")
+    return current
+
+
+def supervisor_identity(caller, cfg, proc=None):
+    """Capture only the live agent's direct parent, never an outer launcher."""
+    proc = proc or ProcFS()
+    try:
+        agent = _agent_stat(proc, caller)
+        parent_pid = agent["ppid"]
+        if parent_pid <= 1:
+            raise Refused("agent has no bindable supervisor before the system root")
+        uid = proc.uid(parent_pid)
+        if uid != os.getuid():
+            raise Refused("supervisor belongs to a different uid")
+        parent = proc.process(parent_pid)
+        if parent["state"] in ("Z", "X", "x"):
+            raise Refused("supervisor is not alive")
+        if station_marker(parent):
+            raise Refused("station process cannot be a supervisor")
+        if matches(parent, rules(cfg)):
+            raise Refused("agent process cannot be a supervisor")
+        _check_process(proc, parent, uid)
+        _check_process(proc, agent, os.getuid())
+        _agent_stat(proc, caller, parent_pid)
+        return {"boot_id": caller["identity"]["boot_id"], "pid": parent_pid,
+                "start_ticks": str(parent["start_ticks"]), "uid": uid}
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+        raise Refused(f"cannot bind supervisor: {exc}") from None
+
+
+def supervised_session(cfg, sid, *, pid=None, proc=None, env=None):
+    """Authorize only a transfer begin/tokenless abort, without identifying an agent.
+
+    Walk from the CLI's parent through PID 1, retaining the station boundary even
+    above the bound supervisor. An agent below the supervisor cannot delegate
+    its authority back out of its own subtree. All evidence is checked again.
+    This returns supervisor evidence, deliberately not an identify() caller object.
+    """
+    proc = proc or ProcFS()
+    env = os.environ if env is None else env
+    try:
+        if any(env.get(k) for k in STATION_KEYS):
+            raise Refused("station environment cannot act as a supervisor")
+        rec = record(sid)
+        if rec is None:
+            raise Refused("supervised session is not registered")
+        if liveness(rec, proc) != "alive":
+            raise Refused("supervised session is not confirmed alive")
+        supervisor = rec.get("supervisor")
+        if not supervisor:
+            raise Refused("session has no bound supervisor")
+        boot, uid = proc.boot_id(), os.getuid()
+        if supervisor["boot_id"] != boot or supervisor["uid"] != uid:
+            raise Refused("supervisor boot identity or uid does not match")
+        agent = _agent_stat(proc, rec, supervisor["pid"])
+        agents = rules(cfg)
+        current = int(os.getppid() if pid is None else pid)
+        seen, chain, found = set(), [], False
+        while current != 1:
+            if current <= 0 or current in seen or len(seen) >= 1024:
+                raise Refused("broken or cyclic supervisor process chain")
+            seen.add(current)
+            owner = proc.uid(current)
+            process = proc.process(current) if owner == uid else proc.stat(current)
+            chain.append((process, owner))
+            if process["state"] in ("Z", "X", "x"):
+                raise Refused("supervisor process chain is not alive")
+            if owner == uid and station_marker(process):
+                raise Refused(f"station process in supervisor ancestry: pid {current}")
+            if not found and owner == uid and matches(process, agents):
+                raise Refused("agent process between caller and bound supervisor")
+            if current == supervisor["pid"]:
+                if owner != uid or str(process["start_ticks"]) != str(supervisor["start_ticks"]):
+                    raise Refused("bound supervisor identity changed (uid or start_ticks)")
+                found = True
+            current = process["ppid"]
+        proc.stat(1)
+        if not found:
+            raise Refused("bound direct supervisor is not in caller ancestry")
+        for process, owner in chain:
+            _check_process(proc, process, owner)
+        _check_process(proc, agent, uid)
+        _agent_stat(proc, rec, supervisor["pid"])
+        if proc.boot_id() != boot:
+            raise Refused("boot changed during supervisor inspection")
+        return dict(supervisor)
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+        raise Refused(f"supervisor refused: {exc}") from None
+
+
+def register(caller, label=None, *, administrator=None, reason=None,
+             bind_supervisor=False, cfg=None, proc=None):
     sid = require(caller)
-    if liveness(caller) != "alive":
+    if liveness(caller, proc) != "alive":
         raise Refused("agent is no longer confirmed alive")
     path = home() / "sessions" / f"{sid}.json"
     with locked_json(path) as box:
         rec = box["state"]
+        supervisor = supervisor_identity(caller, cfg or {}, proc) if bind_supervisor else None
+        if rec and supervisor and rec.get("supervisor") not in (None, supervisor):
+            raise Refused("session is already bound to a different supervisor; rebinding is forbidden")
         if rec is None:
             rec = {k: caller[k] for k in ("session_id", "identity", "evidence", "endpoint")}
             rec.update(label=label or "", registered_at=now(), registrations=[])
             box["state"] = rec
+        if supervisor:
+            rec["supervisor"] = supervisor
         if label is not None:
             rec["label"] = label
         rec["endpoint"] = caller["endpoint"]

@@ -80,7 +80,8 @@
       "claim",
       "handoff",
       "transfer",
-      "assign"
+      "assign",
+      "reclaim"
      ]
     }
    }
@@ -196,12 +197,51 @@
            "claim",
            "handoff",
            "transfer",
-           "assign"
+           "assign",
+           "reclaim"
           ]
          }
         }
        }
       }
+     },
+     "via": {
+      "enum": [
+       "session",
+       "supervisor"
+      ],
+      "default": "session"
+     },
+     "supervisor": {
+      "type": "object",
+      "required": [
+       "boot_id",
+       "pid",
+       "start_ticks",
+       "uid"
+      ],
+      "properties": {
+       "boot_id": {
+        "type": "string",
+        "minLength": 1
+       },
+       "pid": {
+        "type": "integer",
+        "minimum": 2
+       },
+       "start_ticks": {
+        "type": "string",
+        "pattern": "^[0-9]+$"
+       },
+       "uid": {
+        "type": "integer",
+        "minimum": 0
+       }
+      }
+     },
+     "begin_result": {
+      "type": "object",
+      "description": "Original pending begin response, without any plaintext token"
      }
     }
    }
@@ -240,7 +280,8 @@
        "project.assigned",
        "project.transfer_begun",
        "project.transfer_committed",
-       "project.transfer_aborted"
+       "project.transfer_aborted",
+       "project.reclaimed"
       ]
      },
      "old_controller": {
@@ -279,7 +320,8 @@
          "claim",
          "handoff",
          "transfer",
-         "assign"
+         "assign",
+         "reclaim"
         ]
        }
       }
@@ -320,7 +362,8 @@
          "claim",
          "handoff",
          "transfer",
-         "assign"
+         "assign",
+         "reclaim"
         ]
        }
       }
@@ -348,9 +391,75 @@
      },
      "transfer_id": {
       "type": "string"
+     },
+     "via": {
+      "enum": [
+       "session",
+       "supervisor"
+      ]
+     },
+     "supervisor": {
+      "type": "object",
+      "required": [
+       "boot_id",
+       "pid",
+       "start_ticks",
+       "uid"
+      ],
+      "properties": {
+       "boot_id": {
+        "type": "string",
+        "minLength": 1
+       },
+       "pid": {
+        "type": "integer",
+        "minimum": 2
+       },
+       "start_ticks": {
+        "type": "string",
+        "pattern": "^[0-9]+$"
+       },
+       "uid": {
+        "type": "integer",
+        "minimum": 0
+       }
+      }
+     },
+     "old_session": {
+      "type": "string",
+      "pattern": "^s-[0-9a-f]{64}$"
+     },
+     "dead_reason": {
+      "enum": [
+       "boot_changed",
+       "start_ticks_mismatch",
+       "absence_confirmed",
+       "zombie"
+      ]
      }
     }
    }
+  },
+  "reclaim": {
+   "enum": [
+    "none",
+    "dead"
+   ],
+   "default": "none"
+  },
+  "reclaim_effective": {
+   "enum": [
+    "none",
+    "dead"
+   ],
+   "description": "Read-only projection including local reclaim_dead configuration"
+  },
+  "active_transfer": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "description": "Read-only current transfer summary: transfer_id, from, via, and optional supervisor"
   }
  }
 }

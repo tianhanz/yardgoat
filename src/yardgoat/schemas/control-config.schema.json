@@ -80,6 +80,14 @@
     }
    ],
    "description": "Route names must be unique. Controller fields require a live controller for project-owned cards. Only endpoint requires a verified socket and pane_id; label/session routes work outside tmux. Endpoint is compact JSON; controller fields are empty for legacy cards."
+  },
+  "reclaim_dead": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+   },
+   "description": "Projects allowed to reclaim a controller confirmed dead by local proc evidence"
   }
  },
  "$defs": {

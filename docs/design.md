@@ -460,10 +460,11 @@ Claim requires an identified, registered caller, open policy and epoch 0. Every
 claim/handoff/assign compares `--expect-epoch` under the project lock. Handoff also
 requires the current controller and a registered, confirmed-alive target. Success
 advances epoch exactly once. A dead controller never reopens claim; an administrator
-uses assign to initialize or recover control. Assign also cancels a pending transfer
+uses assign to initialize or recover control, or an opted-in project can use the
+restricted reclaim path below. Assign also cancels a pending transfer
 and records the previous state and recovery reason.
 
-Transfer begin requires the current controller and expected epoch. It saves a random
+Legacy transfer begin requires the current controller and expected epoch. It saves a random
 transfer ID and only the SHA-256 of a 256-bit token, returning the token once to the
 caller. Tokens carry a fixed `yg-` prefix before the random URL-safe payload to
 prevent argparse from treating a leading `-` as an option in `--token TOKEN`.
@@ -490,6 +491,95 @@ the process died before its one-time token reached the caller, the token cannot 
 reprinted: the old controller can abort without it and begin again, or an admin can
 assign if that controller also exited. This deliberate recovery path avoids storing
 plaintext/recoverable tokens. The store does not provide distributed leases.
+
+### Supervisor binding, repeatable begin and restricted reclaim
+
+`session register --bind-supervisor` optionally saves `supervisor` with the agent's
+**direct parent** `(boot_id, pid, start_ticks, uid)`. The parent must be a live
+same-user process before PID 1, without an agent match or station marker. An
+administrator registering an exact PID binds that target agent's direct parent.
+Binding the same identity again is idempotent; a different parent cannot replace
+an existing binding. Registering without the flag preserves any binding. Ordinary
+registration without the flag retains its previous behavior.
+
+A supervisor can invoke `project transfer begin ... --for-session S`, or
+`project transfer abort ... --for-session S` **without a token**. The registered
+session must still be confirmed alive and remain the current project controller.
+Inspection starts at the CLI's parent without calling nearest-agent identification:
+its ancestry must contain the exact bound supervisor identity and UID, with no
+agent between that process and the CLI. Helpers below the supervisor are allowed;
+an unrelated sibling or the agent's grandparent cannot substitute for the direct
+parent. The agent's current `/proc` parent must still be the supervisor, and both
+identities and ancestry are rechecked. Missing, unreadable or changing evidence
+refuses the call. Current and ancestral station markers still refuse delegation,
+including markers above the supervisor. This is a conservative snapshot check,
+not a lease guaranteeing the processes cannot exit immediately afterwards.
+
+Only begin and tokenless abort use this delegation. Other commands retain ordinary
+agent identification; the supervisor is unknown there. `--for-session` on other
+commands or combined with an abort token is a usage error. If a caller also supplies
+the existing `--session` assertion, it must equal `--for-session`; the complete
+supervisor check still runs. Transfer history keeps `actor: S` and adds top-level
+`via: "supervisor"` and the supervisor identity. The transfer record retains the
+same provenance. Normal begin history has no supervisor provenance. This narrow
+grant lets a parent initiate or cancel handover while its agent is idle; it grants
+no authority to run project work, choose a successor, or seize a live controller.
+Like existing session identity, it is a cooperative boundary within one OS user.
+
+For a repeatable begin, the caller generates `t-` plus 32 lowercase hexadecimal
+digits and a secret of at least 32 characters that does not start with `-`, then
+calls `project transfer begin ID --expect-epoch N --transfer T --token-file F`.
+The two new begin options are required together. The token is the UTF-8 file with
+leading/trailing whitespace removed. The opened inode must be an ordinary file
+owned by the current UID, with permissions no wider than 0600. Links, special files,
+foreign ownership and wider permissions are refused. Yardgoat reads the file,
+stores only SHA-256, and never returns or persists its plaintext. Keep the file
+available until handover is completed. Commit and abort also accept `--token-file`,
+mutually exclusive with the compatible `--token` option. The latter exposes the
+secret in the process list. Without both new begin options, server-generated ID
+and one-time plaintext-token output remain compatible.
+
+Identity checks precede replay checks. Under the project lock, the original
+session, epoch and token digest must match the saved transfer. The three replay
+outcomes are:
+
+- Still pending and still the current transfer: return the original begin response
+  without changing state or appending another `project.transfer_begun` event.
+- Committed: return the saved `result: "committed"`, even after later control changes.
+- Aborted: return the saved `result: "aborted"`, even after a later transfer.
+
+An ordinary original session need not remain controller to read its terminal result,
+but must still be registered and alive. Supervisor replay retains **all** delegation
+checks, including current control. Mismatched session/epoch/digest, cancelled
+transfers, and a new transfer ID while another transfer is pending are refused.
+Terminal-result replay does not reassign control. Existing commit replay rules
+still reject a transfer made stale by later control changes.
+
+`project add ID --reclaim dead` opts a project into reclaim; the default is `none`.
+For immutable existing projects, local config `"reclaim_dead": ["example"]` also
+opts in without rewriting their records. Missing policy on an old record means
+`none`. `project reclaim ID --expect-epoch N` requires all five conditions:
+
+1. The project record or local config allows reclaim of a dead controller.
+2. The caller is an identified, registered, confirmed-alive session, never a station.
+3. A current controller exists, its session record exists, and `liveness` confirms
+   it is `dead`. A missing record or unreadable/hidden evidence is `unknown`, which
+   never counts as dead.
+4. The project is normal with no pending transfer. During transfer, use the token
+   to continue handover or abort it first.
+5. The expected epoch matches under the project lock.
+
+Success assigns the caller, increments epoch once, and records `how: "reclaim"`.
+`project.reclaimed` history includes top-level `old_session` and `dead_reason`:
+`boot_changed`, `start_ticks_mismatch`, `absence_confirmed` or `zombie`. Reasons
+come from the same proc checks as the original string-valued `liveness` API.
+An absent proc entry alone still does not prove death. Claim remains limited to
+never-controlled epoch-zero projects, and reclaim does not run automatically.
+
+Project show/list expose the stored `reclaim` policy, `reclaim_effective` including
+local configuration, and `active_transfer` with its originating session and `via`.
+Session list includes any supervisor binding with PID and start ticks. These views
+do not migrate or rewrite state.
 
 ### Locks and library interface
 

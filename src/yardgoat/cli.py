@@ -1459,10 +1459,16 @@ def main(argv=None) -> int:
     s = sub.add_parser("events"); s.add_argument("task_id")
     s = sub.add_parser("_run"); s.add_argument("task_id"); s.add_argument("run_id")
     a = P.parse_args(argv)
+    control_cli.validate_args(a, P)
     if getattr(a, "caller_session", None) is not None and a.cmd != "whoami":
-        identity = control_cli.caller(a, runner.config())
-        if identity["session_id"] is None:
-            return refuse(identity["reason"])
+        if getattr(a, "for_session", None) is not None:
+            if a.caller_session != a.for_session:
+                return refuse("--session does not match --for-session")
+            # The delegated path performs its full mechanical checks in begin/abort.
+        else:
+            identity = control_cli.caller(a, runner.config())
+            if identity["session_id"] is None:
+                return refuse(identity["reason"])
     if hasattr(a, "handler"):
         return a.handler(a)
     if a.cmd == "_run":
