@@ -32,7 +32,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import adapters, contract, doctor, pool, runner
+from . import adapters, contract, doctor, pool, runner, scheduling
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 REFUSED = 3
@@ -57,12 +57,17 @@ def cmd_submit(a) -> int:
         return 2
     h = contract.content_hash(spec, frozen)
     td = TaskDir(spec["task_id"])
-    with td.locked() as box:
+    with pool.schedule_lock(), td.locked() as box:
         if box["state"] is not None:
             if box["state"]["content_hash"] == h:
                 print(json.dumps({"task_id": td.task_id, "result": "already-accepted", "status": box["state"]["status"]}))
                 return 0
             return refuse(f"{td.task_id} already exists with different content (task ids are immutable)")
+        try:
+            scheduling.validate_dependencies(spec)
+        except contract.SpecError as e:
+            print(f"spec error: {e}", file=sys.stderr)
+            return 2
         write_json(td.path / "spec.json", spec)
         (home() / "frozen").mkdir(parents=True, exist_ok=True)   # authoritative copy, outside what stations may write
         write_json(home() / "frozen" / f"{td.task_id}.json", {"content_hash": h, "frozen": frozen, "spec": spec})
@@ -94,13 +99,13 @@ def frozen_of(td: TaskDir, st: dict) -> dict:
 
 
 DIRECT_MODES = ("tmux", "process")
-IN_FLIGHT = ("queued", "running", "submit_unknown")
+IN_FLIGHT = ("waiting_deps", "queued", "running", "submit_unknown")
 
 
 def _alive(run: dict) -> bool:
     """Is this run still in flight? Only direct runs are judged by local processes (their process group)."""
     mode = run.get("mode")
-    if run["state"] in ("queued", "submit_unknown"):
+    if run["state"] in ("waiting_deps", "queued", "submit_unknown"):
         return True
     if run["state"] != "running":
         return False
@@ -212,6 +217,16 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
             st["runs"].append(run)
             st["status"] = "queued"
             st["question"] = None
+            waiting, _ = scheduling.dependencies(spec)
+            if waiting:
+                _wait_for_dependencies(td, st, run, waiting, who)
+            else:
+                _queue_gate(td, st, run, spec, who)
+        if run["state"] in ("waiting_deps", "blocked_deps"):
+            if echo:
+                print(json.dumps({"task_id": td.task_id, "result": st["status"], "run_id": run_id,
+                                  "waiting_for": run["waiting_for"], "reason": run["reason"]}, ensure_ascii=False))
+            return 0
         cap = cfg.get("max_concurrent")
         if adapter_kind(spec) == "pool":
             td.event("run.queued", who, run_id=run_id, pool=spec["adapter"]["pool"], note=actor_note)
@@ -245,6 +260,47 @@ def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
     return lane_problem(spec, cfg)
 
 
+def _wait_for_dependencies(td: TaskDir, st: dict, run: dict, waiting: list[str], actor: str) -> None:
+    changed = run["state"] != "waiting_deps" or run.get("waiting_for") != waiting
+    run.update(state="waiting_deps", waiting_for=waiting, reason="等待上游 verified：" + ", ".join(waiting))
+    run.pop("scope_conflicts", None)
+    st["status"] = "waiting_deps"
+    if changed:
+        td.event("run.waiting_deps", actor, run_id=run["run_id"], waiting_for=waiting)
+
+
+def _queue_gate(td: TaskDir, st: dict, run: dict, spec: dict, actor: str) -> bool:
+    """Refresh dependencies and exclusions under schedule → task locks; never spend an attempt."""
+    waiting, stopped = scheduling.dependencies(spec)
+    if stopped:
+        reason = "；".join(f"上游 {tid} 已终止" for tid in stopped)
+        run.update(state="blocked_deps", waiting_for=waiting, reason=reason)
+        run.pop("scope_conflicts", None)
+        st["status"] = "parked"
+        st["question"] = {"run_id": run["run_id"], "text": reason, "at": now(), "reason": "upstream_terminated"}
+        td.event("task.parked", actor, run_id=run["run_id"], reason=reason)
+        return False
+    if waiting:
+        _wait_for_dependencies(td, st, run, waiting, actor)
+        return False
+    if run["state"] == "waiting_deps":
+        run.update(state="queued", queued_at=now())
+        st["status"] = "queued"
+        td.event("run.queued", actor, run_id=run["run_id"], reason="dependencies verified")
+    if run.pop("waiting_for", None) is not None:
+        run.pop("reason", None)
+    conflicts = scheduling.scope_conflicts(td.task_id, spec)
+    if conflicts:
+        reason = "；".join(f"撞了 {c['task_id']} 的 {c['path']}，它完成后放行" for c in conflicts)
+        if run.get("scope_conflicts") != conflicts:
+            td.event("run.scope_blocked", actor, run_id=run["run_id"], conflicts=conflicts, reason=reason)
+        run.update(scope_conflicts=conflicts, reason=reason)
+        return False
+    if run.pop("scope_conflicts", None) is not None:
+        run.pop("reason", None)
+    return True
+
+
 def start_queued(td: TaskDir, actor: str, actor_note: str = "", echo: bool = True) -> int:
     """Launch the task's queued run. Caller holds the schedule lock (capacity was checked under it)."""
     cfg = runner.config()
@@ -254,11 +310,16 @@ def start_queued(td: TaskDir, actor: str, actor_note: str = "", echo: bool = Tru
         if not run or run["state"] != "queued":
             return refuse("no queued run")
         spec = td.spec()
+        if not _queue_gate(td, st, run, spec, actor):
+            if echo:
+                print(json.dumps({"task_id": td.task_id, "result": st["status"], "run_id": run["run_id"],
+                                  "reason": run["reason"]}, ensure_ascii=False))
+            return 0
         problem = _launch_problem(td, st, spec, cfg)
         if problem:
             run["state"] = "launch_failed"; run["reason"] = problem; st["status"] = "accepted"
             return refuse(problem)
-        run.update(state="running", started_at=now())
+        run.update(state="running", started_at=now(), write_set=scheduling.write_set(spec))
         st["status"] = "running"
         ad = adapters.get(adapter_kind(spec), cfg)
         try:
@@ -337,6 +398,8 @@ def cmd_status(a) -> int:
             rec = r["receipt"]
             tail = f" exit={rec['exit_code']} model={rec['actual_model'] or '?'}" if rec else ""
             print(f"  {r['run_id']}: {r['state']} alive={r['alive']} by={r['dispatched_by']}{tail}")
+            if r.get("reason"):
+                print(f"    {r['reason']}")
         if o["drift"]:
             print(f"  DRIFT: {o['drift']}")
     for item in unlisted_pools:
@@ -522,7 +585,25 @@ def cmd_reconcile(a) -> int:
             elif st["status"] == "answered":
                 rc = do_dispatch_locked(td, st["owner"], "resumed by reconcile after an answer")
                 report.append({"task_id": t, "resumed": rc == 0})
-        # queued direct runs, oldest first, while there is capacity
+        # Poll all workers before releasing dependency waits or scope reservations. A verifier
+        # runs outside this lock; its downstream tasks become eligible on the following tick.
+        # Release dependency waits before sorting the queue, so their new queued_at participates
+        # in the same FIFO ordering as cards that were already eligible.
+        for t in list_tasks():
+            td = TaskDir(t)
+            st = td.state()
+            if not st["runs"] or st["runs"][-1]["state"] != "waiting_deps":
+                continue
+            with td.locked() as box:
+                st = box["state"]
+                run = st["runs"][-1]
+                if run["state"] != "waiting_deps":
+                    continue
+                _queue_gate(td, st, run, td.spec(), "reconciler")
+                if run["state"] == "queued":
+                    report.append({"task_id": t, "dependencies_ready": True})
+                else:
+                    report.append({"task_id": t, "state": st["status"], "reason": run["reason"]})
         cap = cfg.get("max_concurrent")
         queued = []
         for t in list_tasks():
@@ -531,12 +612,25 @@ def cmd_reconcile(a) -> int:
                 queued.append((st["runs"][-1].get("queued_at", ""), t))
         for _, t in sorted(queued):
             td = TaskDir(t)
+            with td.locked() as box:
+                st = box["state"]
+                run = st["runs"][-1]
+                if run["state"] != "queued":
+                    continue  # a concurrent cancel won
+                ready = _queue_gate(td, st, run, td.spec(), "reconciler")
+                if not ready:
+                    report.append({"task_id": t, "state": st["status"], "reason": run["reason"]})
+                    continue
             if adapter_kind(td.spec()) == "pool":
                 continue  # stations claim pool cards themselves
             if adapter_kind(td.spec()) == "direct" and ((cap is not None and machine_load(cfg) >= int(cap)) or not pool.resources_ok(cfg)[0]):
                 continue
             rc = start_queued(td, "reconciler", actor_note="started from the queue", echo=False)
-            report.append({"task_id": t, "started_from_queue": rc == 0})
+            run = td.state()["runs"][-1]
+            action = {"task_id": t, "started_from_queue": rc == 0 and bool(run.get("started_at"))}
+            if run["state"] in ("queued", "waiting_deps", "blocked_deps") and run.get("reason"):
+                action["reason"] = run["reason"]
+            report.append(action)
         for name in pool.schedule(cfg, direct_slots_in_use):
             report.append({"station_started": name})
     for td, owner in to_close:   # do_close re-checks state and run under the task lock
@@ -635,7 +729,7 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
     """Give the oldest queued card of a pool to a live station. One card at a time per station."""
     cfg = runner.config()
     c = pool.pool_conf(cfg, pool_name)
-    with pool.pool_lock(pool_name):
+    with pool.schedule_lock(), pool.pool_lock(pool_name):
         with pool.station_lock(pool_name, station):
             rec = pool.get_station(pool_name, station)
             if not rec or rec.get("state") != "running" or not pool.station_alive(rec):
@@ -652,13 +746,16 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                 if run["state"] != "queued":
                     continue
                 spec = td.spec()
+                if not _queue_gate(td, st, run, spec, station):
+                    continue
                 problem = _launch_problem(td, st, spec, cfg)
                 if problem:
                     run.update(state="launch_failed", reason=problem); st["status"] = "accepted"
                     continue
                 rd = td.run_dir(run["run_id"]); rd.mkdir(parents=True, exist_ok=True)
                 (rd / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
-                run.update(state="running", station=station, started_at=now(), claimed_epoch=time.time())
+                run.update(state="running", station=station, started_at=now(), claimed_epoch=time.time(),
+                           write_set=scheduling.write_set(spec))
                 st["status"] = "running"
                 out = {"result": "CLAIMED", "task_id": t, "run_id": run["run_id"], "workdir": spec["workdir"],
                        "prompt": str(rd / "prompt.md"), "blocked_file": spec.get("blocked_file", "out/BLOCKED.md"),
@@ -751,8 +848,8 @@ def cmd_cancel(a) -> int:
         if st["owner"] != a.as_:
             return refuse(f"owner is {st['owner']}, not {a.as_}")
         run = st["runs"][-1] if st["runs"] else None
-        if not run or run["state"] != "queued":
-            return refuse("only a queued run can be cancelled (stopping a running worker is not supported yet)")
+        if not run or run["state"] not in ("queued", "waiting_deps"):
+            return refuse("only a queued or waiting_deps run can be cancelled (stopping a running worker is not supported yet)")
         run["state"] = "cancelled"; st["status"] = "accepted"
     td.event("run.cancelled", a.as_, run_id=run["run_id"])
     print(json.dumps({"task_id": td.task_id, "result": "cancelled", "run_id": run["run_id"]}))
