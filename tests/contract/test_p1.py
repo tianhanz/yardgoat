@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+import subprocess
 
 from test_contract import SRC, env, make_task, wait_exit, yg  # noqa: F401  (fixtures)
 
@@ -137,3 +138,58 @@ def test_archive_hides_a_dead_task_from_the_inbox_and_blocks_dispatch(tmp_path, 
     assert yg(env, "archive", "t-demo", "--as", "A", "--reason", "resubmitted as t-demo-b")[0] == 0
     assert json.loads(yg(env, "inbox", "--json")[1]) == []
     assert yg(env, "dispatch", "t-demo", "--as", "A")[0] == 3
+
+
+def test_cap_queues_beyond_the_limit_and_reconcile_starts_it_when_a_slot_frees(tmp_path, env):
+    Path(env["YARDGOAT_CONFIG"]).write_text(json.dumps({"max_concurrent": 1}))
+    a = make_task(tmp_path / "a", task_id="t-aaa", worker="sleep 2; echo done > out/result.txt")
+    b = make_task(tmp_path / "b", task_id="t-bbb")
+    yg(env, "submit", str(a), "--as", "A"); yg(env, "submit", str(b), "--as", "A")
+    assert json.loads(yg(env, "dispatch", "t-aaa", "--as", "A")[1])["result"] == "dispatched"
+    assert json.loads(yg(env, "dispatch", "t-bbb", "--as", "A")[1])["result"] == "queued"
+    rc, out, _ = yg(env, "dispatch", "t-bbb", "--as", "A")
+    assert rc == 3 and json.loads(out)["result"] == "already-queued"          # queued counts as in flight
+    assert json.loads(yg(env, "reconcile")[1])["actions"] == []               # slot still taken
+    wait_exit(env, "t-aaa")
+    acts = json.loads(yg(env, "reconcile")[1])["actions"]
+    assert {"task_id": "t-bbb", "started_from_queue": True} in acts
+    st = wait_exit(env, "t-bbb")
+    assert len(st["runs"]) == 1 and st["runs"][0]["state"] == "exited"
+
+
+def test_cancel_a_queued_run_does_not_use_the_budget(tmp_path, env):
+    Path(env["YARDGOAT_CONFIG"]).write_text(json.dumps({"max_concurrent": 0}))
+    spec = make_task(tmp_path, attempts=1)
+    yg(env, "submit", str(spec), "--as", "A")
+    assert json.loads(yg(env, "dispatch", "t-demo", "--as", "A")[1])["result"] == "queued"
+    assert yg(env, "cancel", "t-demo", "--as", "B")[0] == 3
+    assert yg(env, "cancel", "t-demo", "--as", "A")[0] == 0
+    Path(env["YARDGOAT_CONFIG"]).write_text(json.dumps({}))
+    assert json.loads(yg(env, "dispatch", "t-demo", "--as", "A")[1])["result"] == "dispatched"
+
+
+def test_quick_writes_card_verify_and_spec_then_dispatches(tmp_path, env):
+    wd = tmp_path / "wd"; wd.mkdir()
+    rc, out, err = yg(env, "quick", "Write hello into out/h.txt", "--verify", "grep -q hello out/h.txt", "--as", "A",
+                      "--id", "q-hello", "--host", "shell", "--workdir", str(wd))
+    assert rc == 2 and "executor.command" in err      # host=shell needs a command; quick is for agent hosts
+    rc, out, err = yg(env, "quick", "Write hello into out/h.txt", "--verify", "grep -q hello out/h.txt", "--as", "A",
+                      "--id", "q-hello2", "--host", "codex", "--lane", "cheap", "--workdir", str(wd), "--no-dispatch")
+    assert rc == 0, err
+    card = Path(env["YARDGOAT_HOME"]) / "cards/q-hello2"
+    assert "grep -q hello out/h.txt" in (card / "verify.sh").read_text()
+    assert "out/BLOCKED.md" in (card / "CARD.md").read_text()
+    spec = json.loads((card / "spec.json").read_text())
+    assert spec["allowed_lanes"] == ["cheap"] and spec["workdir"] == str(wd)
+    (wd / "out").mkdir(); (wd / "out/h.txt").write_text("hello\n")
+    assert subprocess.run(spec["verifier"]["command"], shell=True, cwd=str(wd)).returncode == 0
+
+
+def test_quick_into_a_file_pool(tmp_path, env):
+    pool = tmp_path / "pool"
+    Path(env["YARDGOAT_CONFIG"]).write_text(json.dumps({"adapters": {"file-pool": {"root": str(pool),
+        "pools": {"p1": {"lane": "cheap", "host": "claude", "workdir": str(tmp_path)}}}}}))
+    rc, out, err = yg(env, "quick", "do the thing", "--verify", "true", "--as", "A", "--id", "q-pool", "--pool", "p1")
+    assert rc == 0, err
+    card = pool / "p1/pending/q-pool-r1.md"
+    assert card.exists() and "verify: true" in card.read_text()

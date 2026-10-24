@@ -35,6 +35,13 @@ yardgoat answer example-reconcile-01 --as me --text "use the 2024 records"
 yardgoat reconcile                                          # (cron) resumes answered tasks, polls adapters
 ```
 
+For one-off work there is a one-liner that writes the card, a frozen verifier and the spec for you:
+
+```bash
+yardgoat quick "Write the 200 smallest primes to out/primes.txt" --verify "test $(wc -l < out/primes.txt) -eq 200" --as me
+yardgoat quick "Fix the flaky test in tests/test_io.py" --verify "pytest -q tests/test_io.py" --pool research --as me
+```
+
 A task spec names the prompt file (`card`), the working directory, the expected `outputs`, the `executor`
 (`host`, plus optional `lane`/`acct` that your local launcher understands), the `verifier`, and a `budget`.
 Schemas: [task](src/yardgoat/schemas/task.schema.json) · [receipt](src/yardgoat/schemas/receipt.schema.json) · [event](src/yardgoat/schemas/event.schema.json).
@@ -60,7 +67,7 @@ With `tmux_session` set, each run gets its own window (handy for watching); othe
 | Phase | Scope | Status |
 |---|---|---|
 | P0 | contract, file store, CLI, direct runner, contract tests | done |
-| P1 | lane allowlist, park/answer/resume, `file-pool` adapter, plugin adapters, reconciler, launch-failure accounting | **here** |
+| P1 | lane allowlist, park/answer/resume, `file-pool` adapter, plugin adapters, reconciler, launch-failure accounting, `quick`, queue-first dispatch with a concurrency cap | **here** |
 | P2 | issue-driven and queue-file adapters, agent-host skill and MCP entry points, cost budget gates, dashboard projection | planned |
 | P3 | per-task evaluation data (actual model, rework, human interventions) — facts first, no rankings | planned |
 

@@ -30,6 +30,10 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 8. **Asking is not failing.** A worker that writes `out/BLOCKED.md` (or a pool card that lands in `parked/`) parks the task with that text as the question. `answer` records a reply; `reconcile` resumes the task on the owner's behalf, and the answer is appended to the prompt. Parked runs do not use the attempt budget.
 9. **Infrastructure failures are not attempts.** When the local launcher exits with one of `launcher_failure_codes` before any agent started, the run is `launch_failed` and does not count.
 10. **The worker sees the caller's environment.** Yardgoat's own import path is never passed to workers.
+11. **Queue first, then start.** Every dispatch is accepted as a queued run. Direct runs start immediately only while
+    fewer than `max_concurrent` direct runs are alive (local config); otherwise they wait and `reconcile` starts them
+    oldest first, re-checking drift and lane policy at launch. A queued run counts as in flight (no duplicates) but
+    not as an attempt; `cancel` removes it. Adapter runs are capped by the fleet they go to.
 
 ## Adapters
 
