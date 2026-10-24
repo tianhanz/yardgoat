@@ -277,8 +277,11 @@ def station_log(name: str, station: str) -> Path:
 
 
 def log_offset(name: str, station: str) -> int:
-    path = station_log(name, station)
-    return path.stat().st_size if path.exists() else 0
+    return log_position(name, station)["size"]
+
+
+def log_position(name: str, station: str) -> dict:
+    return runner.log_position(station_log(name, station))
 
 
 def _account_backoff(c: dict, acct: str) -> Path:
@@ -314,21 +317,28 @@ def provider_backoff(name: str, cfg: dict, acct: str | None = None) -> dict | No
 def idle_outcome(name: str, station: dict, cfg: dict) -> dict:
     log = station_log(name, station["station"])
     # After a completed card, only the following idle interval belongs to the station itself.
-    offset = station.get("idle_log_offset", 0 if not station.get("tasks") else log_offset(name, station["station"]))
-    evidence = station.get("execution", {})
+    offset = station.get("idle_log_offset", 0 if not station.get("tasks") else log_position(name, station["station"]))
+    evidence = station.get("execution", {}) if not station.get("execution_ref") else {}
     return runner.classify_outcome(log, cfg, start=offset, default="lost", **evidence)
 
 
 def unfinished_outcome(name: str, station: str, cfg: dict, run: dict | None = None,
-                       default: str = "lost", blocked_path: Path | None = None) -> dict:
+                       default: str = "lost", blocked_path: Path | None = None, task_id: str | None = None) -> dict:
     srec = get_station(name, station) or {}
     cur = srec.get("current") or {}
     if run is None and cur:
+        task_id = cur["task_id"]
         run = next((r for r in TaskDir(cur["task_id"]).state()["runs"] if r["run_id"] == cur["run_id"]), None)
     run = run or {}
     # Legacy records without a claim boundary cannot safely attribute a shared log to a card.
-    start = run.get("log_start", log_offset(name, station))
+    start = run.get("log_start", log_position(name, station))
     evidence = run.get("execution", {})
+    task_id = task_id or run.get("task_id")
+    if not evidence and task_id and run.get("run_id") \
+            and srec.get("execution_ref") == {"task_id": task_id, "run_id": run["run_id"]}:
+        evidence = srec.get("execution", {})  # wrapper may have died before its task write
+    if default == "exited":
+        evidence = {"exit_code": 0, "timed_out": False, **evidence}
     out = runner.classify_outcome(station_log(name, station), cfg, start=start,
                                   end=run.get("log_end"), default=default, blocked_path=blocked_path,
                                   blocked_before=run.get("blocked_before"), **evidence)
@@ -339,11 +349,19 @@ def unfinished_outcome(name: str, station: str, cfg: dict, run: dict | None = No
 
 
 def record_execution(name: str, station: str, cur: dict | None, **evidence) -> None:
-    update_station(name, station, execution=evidence)
+    reference = {"task_id": cur["task_id"], "run_id": cur["run_id"]} if cur else None
+    with station_lock(name, station):
+        rec = get_station(name, station) or {}
+        if rec.get("execution_ref") == reference and rec.get("execution", {}).get("timed_out") is True:
+            evidence = {**evidence, **rec["execution"]}
+        rec.update(execution=evidence, execution_ref=reference)
+        write_json(station_file(name, station), rec)
     if cur:
         with TaskDir(cur["task_id"]).locked() as box:
             run = next(r for r in box["state"]["runs"] if r["run_id"] == cur["run_id"])
-            run.update(execution=evidence, log_end=log_offset(name, station))
+            if run.get("execution", {}).get("timed_out") is True:
+                evidence = {**evidence, **run["execution"]}
+            run.update(execution=evidence, log_end=log_position(name, station))
 
 
 def run_station(name: str, station: str) -> int:
@@ -381,8 +399,8 @@ def run_station(name: str, station: str) -> int:
     timed_out = bool(timed_out) or previous.get("timed_out") is True
     record_execution(name, station, cur, exit_code=124 if timed_out else p.returncode, timed_out=timed_out)
     if cur:
-        outcome = unfinished_outcome(name, station, cfg)
-        runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], outcome)
+        runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], lambda fresh: unfinished_outcome(
+            name, station, cfg, fresh, task_id=cur["task_id"]))
     else:
         srec = get_station(name, station)
         outcome = idle_outcome(name, srec, cfg)

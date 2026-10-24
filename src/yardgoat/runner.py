@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .store import TaskDir, now, read_json, sha256_file, write_json
@@ -215,11 +216,29 @@ PROVIDER_REFUSAL_PATTERNS = [r"flagged for possible", r"usage limit", r"You've r
 PROVIDER_REFUSAL_HINT = "换措辞或换通道后重发"
 
 
-def log_segment(log: Path, start: int = 0, end: int | None = None, tail: bool = True) -> str:
+def log_position(log: Path) -> dict:
+    """A byte boundary tied to one file, so rotation cannot reuse another file's offset."""
+    try:
+        st = log.stat()
+        return {"device": st.st_dev, "inode": st.st_ino, "size": st.st_size}
+    except FileNotFoundError:
+        return {"device": None, "inode": None, "size": 0}
+
+
+def log_segment(log: Path, start: int | dict = 0, end: int | dict | None = None, tail: bool = True) -> str:
     """Read complete lines within one run's byte interval, bounded to 20 KB."""
     try:
         with log.open("rb") as f:
-            end = min(os.fstat(f.fileno()).st_size, end) if end is not None else os.fstat(f.fileno()).st_size
+            st = os.fstat(f.fileno())
+            if isinstance(start, dict):
+                same_file = (start["device"], start["inode"]) == (st.st_dev, st.st_ino)
+                start = start["size"] if same_file else 0
+            if start > st.st_size:  # copy-truncate, including legacy numeric boundaries
+                start = 0
+            if isinstance(end, dict):
+                same_file = (end["device"], end["inode"]) == (st.st_dev, st.st_ino)
+                end = end["size"] if same_file and end["size"] <= st.st_size else None
+            end = min(st.st_size, end) if end is not None else st.st_size
             offset = max(start, end - 20000) if tail else start
             if offset >= end:
                 return ""
@@ -234,7 +253,7 @@ def log_segment(log: Path, start: int = 0, end: int | None = None, tail: bool = 
         return ""
 
 
-def provider_refusal(log: Path, cfg: dict, start: int = 0, end: int | None = None) -> str | None:
+def provider_refusal(log: Path, cfg: dict, start: int | dict = 0, end: int | dict | None = None) -> str | None:
     """Only host error envelopes are evidence; prose and nested tool output are not.
 
     A later successful terminal event clears an intermediate refusal, including hosts that exit 0.
@@ -266,12 +285,13 @@ def provider_refusal(log: Path, cfg: dict, start: int = 0, end: int | None = Non
         code = error.get("code", error.get("type")) if isinstance(error, dict) else None
         matched = isinstance(code, str) and code in codes
         matched |= any(re.search(p, text, re.I) for p in patterns)
-        refusal = (text or str(code))[:2000] if matched else None
+        if matched:
+            refusal = (text or str(code))[:2000]
     return refusal
 
 
 def classify_outcome(log: Path, cfg: dict, *, exit_code: int | None = None, timed_out: bool = False,
-                     start: int = 0, end: int | None = None, default: str = "lost",
+                     start: int | dict = 0, end: int | dict | None = None, default: str = "lost",
                      elapsed: float | None = None, blocked_path: Path | None = None,
                      blocked_before: list[int] | None = None) -> dict:
     """One precedence for finish and recovery: launch failure > actual timeout > refusal > other."""
@@ -316,11 +336,12 @@ STATUS_OF = {"exited": "exited", "blocked": "blocked", "lost": "lost", "launch_f
 STATE_OF = {v: k for k, v in STATUS_OF.items()}
 
 
-def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay: bool = False):
+def record_outcome(td: TaskDir, run_id: str, outcome: dict | Callable[[dict], dict] | None = None, replay: bool = False):
     """Commit a run's outcome: receipt + run/task state, together, under the task lock, exactly once.
 
     A run that is no longer `running` is left alone (late or duplicate results are ignored). With replay=True the
-    outcome is taken from a receipt already on disk — recovery when a writer died between receipt and state."""
+    outcome is taken from a receipt already on disk — recovery when a writer died between receipt and state.
+    A callable outcome classifies the freshly loaded run under this same commit lock."""
     spec = td.spec()
     rd = td.run_dir(run_id)
     rd.mkdir(parents=True, exist_ok=True)
@@ -340,6 +361,8 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay
             receipt = read_json(rd / "receipt.json")
             state = STATE_OF.get(receipt.get("status"), "exited")
         else:
+            if callable(outcome):
+                outcome = outcome(run)
             ex = spec["executor"]
             artifacts = {}
             for o in spec["outputs"]:
