@@ -120,7 +120,8 @@ def handoff(project_id, caller, target, epoch):
 
 def begin(project_id, caller, epoch):
     sid = sessions.require_registered(caller)
-    token = secrets.token_urlsafe(32)
+    # A random leading '-' would be parsed as an option after `--token`.
+    token = "yg-" + secrets.token_urlsafe(32)
     transfer_id = "t-" + secrets.token_hex(16)
     with locked(project_id) as state:
         expect(state, epoch)

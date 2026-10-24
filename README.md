@@ -113,8 +113,10 @@ Optional local configuration:
 When supplied, `sessions.agents` completely replaces the default exact names
 `claude`, `codex`, `kimi`. Each rule supports exact `exe`, `comm` or `argv0` names;
 generic interpreters are not recognized by default. The closest matching agent is
-the caller. Ambiguous or inaccessible process ancestry is unknown (exit 3), and
-pool stations cannot register. `--session ID` asserts the caller identity; it cannot
+the caller. Other users' ancestors are skipped using their public UID and parent
+metadata; their environments are not read. Ambiguous or unreadable required
+evidence (including same-user ancestry) is unknown (exit 3), and pool stations
+cannot register. `--session ID` asserts the caller identity; it cannot
 select somebody else's identity. `project assign --session` instead names its target.
 Session lists distinguish `alive`, `dead` and `unknown`; a hidden or unreadable
 process entry cannot by itself establish death.
@@ -124,7 +126,9 @@ Tmux endpoints and project roots are display/routing metadata, never permission.
 Administrator `--as` is a cooperative identity, not OS-user authentication. Claims
 work only for open projects at epoch 0; controller death requires admin recovery.
 Epoch comparisons fence stale calls even after A→B→A. Transfer commit is replayable;
-tokens are stored only as hashes. If a begin committed but its token output was lost,
+tokens are stored only as hashes. New tokens have a `yg-` prefix so they work as
+separate `--token TOKEN` arguments. For an older token beginning with `-`, use
+`--token="$TOKEN"` with commit or abort. If a begin committed but its token output was lost,
 the current controller can abort and begin again, or an administrator can assign.
 Details and library APIs: [design](docs/design.md#会话与项目主控-sessions-and-project-control).
 Schemas: [session](src/yardgoat/schemas/session.schema.json),

@@ -308,6 +308,38 @@ def test_transfer_commit_token_idempotence_and_stale_replay(env, agents):
     agents[1].call(*base, "--token", token, rc=3)
 
 
+@pytest.mark.parametrize("action", ["commit", "abort"])
+def test_new_transfer_token_is_safe_as_separate_cli_argument(env, agents, monkeypatch, action):
+    from yardgoat import projects
+    ids = controlled(env, agents)
+    caller = agents[0].call("whoami", "--json")
+    monkeypatch.setattr(projects.secrets, "token_urlsafe", lambda _: "-fixture-random-token")
+    start = projects.begin("demo", caller, 1)
+    assert not start["token"].startswith("-")
+    target = ("--to", ids[1]) if action == "commit" else ()
+    result = call(env, "project", "transfer", action, "demo", "--transfer", start["transfer_id"],
+                  "--token", start["token"], *target)
+    assert result["result"] == ("committed" if action == "commit" else "aborted")
+    assert result["controller"]["epoch"] == (2 if action == "commit" else 1)
+
+
+@pytest.mark.parametrize("action", ["commit", "abort"])
+def test_legacy_dash_token_works_as_equal_cli_argument(env, agents, action):
+    import hashlib
+    from yardgoat import projects
+    ids = controlled(env, agents)
+    start = agents[0].call("project", "transfer", "begin", "demo", "--expect-epoch", "1")
+    # Reproduce the persisted hash of a token issued by a pre-prefix version.
+    token = "-legacy-fixture-token"
+    with projects.locked("demo") as state:
+        state["transfers"][start["transfer_id"]]["token_hash"] = hashlib.sha256(token.encode()).hexdigest()
+    target = ("--to", ids[1]) if action == "commit" else ()
+    result = call(env, "project", "transfer", action, "demo", "--transfer", start["transfer_id"],
+                  "--token=" + token, *target)
+    assert result["result"] == ("committed" if action == "commit" else "aborted")
+    assert result["controller"]["epoch"] == (2 if action == "commit" else 1)
+
+
 def test_transfer_abort_both_paths_and_admin_cancels(env, agents):
     ids = controlled(env, agents)
     begin = lambda: agents[0].call("project", "transfer", "begin", "demo", "--expect-epoch", "1")
@@ -403,6 +435,10 @@ class FakeProc:
             raise FileNotFoundError(f"missing {pid}")
         return {k: self.rows[pid][k] for k in ("pid", "comm", "state", "ppid", "start_ticks")}
 
+    def uid(self, pid):
+        self.stat(pid)
+        return os.getuid()
+
     def process(self, pid):
         self.stat(pid)
         return dict(self.rows[pid])
@@ -413,6 +449,104 @@ class FakeProc:
     def absence_confirmed(self, pid):
         self.stat(1)
         return pid not in self.rows
+
+
+@pytest.fixture
+def mixed_uid_proc(tmp_path, monkeypatch):
+    from yardgoat import sessions
+    root = tmp_path / "proc"
+    boot = root / "sys/kernel/random/boot_id"
+    boot.parent.mkdir(parents=True)
+    boot.write_text("fixture-boot\n")
+    # caller -> inner agent -> foreign process -> outer agent -> init
+    for pid, ppid, name in ((1, 0, "init"), (11, 1, "fake"), (10, 11, "fake"),
+                            (12, 10, "fake"), (13, 12, "python")):
+        path = root / str(pid)
+        path.mkdir()
+        fields = ["S", str(ppid), "999", *("0" for _ in range(16)), str(pid * 10), "0"]
+        (path / "stat").write_text(f"{pid} ({name}) " + " ".join(fields))
+        uid = os.getuid() + 1 if pid == 10 else os.getuid()
+        (path / "status").write_text("Name:\t" + name + "\nUid:\t" + "\t".join([str(uid)] * 4) + "\n")
+        (path / "cmdline").write_bytes(name.encode() + b"\0")
+        (path / "environ").write_bytes(b"")
+        (path / "exe").symlink_to("/fixture/" + name)
+    denied = root / "10/environ"
+    denied.chmod(0)
+    reads = []
+    read_bytes = Path.read_bytes
+
+    def inspect(path):
+        reads.append(path)
+        # Deterministic even if the suite is run by a privileged user.
+        if path == denied:
+            raise PermissionError(13, "Permission denied", str(path))
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", inspect)
+    cfg = {"sessions": {"agents": [{"name": "fixture", "exe": "fake"}]}}
+    return SimpleNamespace(root=root, proc=sessions.ProcFS(root), cfg=cfg, reads=reads)
+
+
+def test_foreign_unreadable_ancestor_keeps_nearest_agent(mixed_uid_proc):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc, env={})
+    assert result["status"] == "identified", result
+    assert result["identity"]["pid"] == 12
+    assert result["session_id"] == sessions.session_id(
+        {"boot_id": "fixture-boot", "pid": 12, "start_ticks": "120"})
+    assert not any(path.parent == fixture.root / "10" for path in fixture.reads)
+    assert fixture.root / "11/environ" in fixture.reads
+
+
+@pytest.mark.parametrize("marker", ["environment", "argv"])
+def test_foreign_ancestor_does_not_hide_same_user_station(mixed_uid_proc, marker):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    if marker == "environment":
+        (fixture.root / "11/environ").write_bytes(b"YARDGOAT_STATION=fixture\0")
+    else:
+        (fixture.root / "11/cmdline").write_bytes(b"python\0-m\0yardgoat.cli\0_station\0fixture\0")
+    result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc, env={})
+    assert result["status"] == "unknown" and result["session_id"] is None
+    assert "station" in result["reason"] and "11" in result["reason"]
+    assert not any(path.parent == fixture.root / "10" for path in fixture.reads)
+
+
+def test_same_user_unreadable_ancestor_is_unknown(mixed_uid_proc):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    (fixture.root / "10/status").write_text("Uid:\t" + "\t".join([str(os.getuid())] * 4) + "\n")
+    result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc, env={})
+    assert result["status"] == "unknown" and result["session_id"] is None
+    assert "Permission denied" in result["reason"] and "10/environ" in result["reason"]
+
+
+@pytest.mark.parametrize("key", ["YARDGOAT_STATION", "YARDGOAT_MAILBOX", "YARDGOAT_MAILBOX_HOME"])
+def test_current_station_environment_checked_before_proc(mixed_uid_proc, monkeypatch, key):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    monkeypatch.setenv(key, "fixture")
+
+    def unexpected():
+        pytest.fail("station environment must be checked before reading proc")
+
+    monkeypatch.setattr(fixture.proc, "boot_id", unexpected)
+    result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc)
+    assert result["status"] == "unknown" and "station environment" in result["reason"]
+    assert fixture.reads == []
+
+
+def test_foreign_agent_is_skipped_and_exact_pid_is_refused(mixed_uid_proc):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    result = sessions.identify(fixture.cfg, pid=10, proc=fixture.proc, env={})
+    assert result["status"] == "identified", result
+    assert result["identity"]["pid"] == 11
+    result = sessions.identify(fixture.cfg, pid=10, proc=fixture.proc, env={}, exact=True)
+    assert result["status"] == "unknown" and result["session_id"] is None
+    assert "10" in result["reason"]
+    assert not any(path.parent == fixture.root / "10" for path in fixture.reads)
 
 
 def test_proc_ambiguity_station_ancestor_and_no_outer_fallback():

@@ -339,7 +339,13 @@ The first matching agent is the caller, including nested agent invocations. Insp
 continues up to PID 1 to reject station ancestors, without substituting an outer agent.
 PID 1 is the root boundary and only its stat is required. An unreadable, vanished,
 cyclic, reparented or ambiguous chain returns unknown and a reason, never a guessed
-identity. Ancestry and boot identity are checked again before returning.
+identity. Each ancestor's real UID comes from `/proc/<pid>/status` and is compared
+with the caller's `getuid()`. Other users' processes cannot be this user's agents
+or stations: only their public stat/status are read, skipping environ, cmdline and
+exe while continuing through their parents. Same-user ancestors above them are
+still inspected for station markers. An unreadable same-user process or unreadable
+UID evidence remains unknown with the read error. Ancestry, UIDs and boot identity
+are checked again before returning.
 
 `sessions.agents` is an array of rules such as `{"name":"custom","exe":"custom-cli"}`.
 `exe` and `argv0` match exact basenames; `comm` matches an exact process name. Selectors
@@ -349,12 +355,15 @@ an empty array recognizes nobody. The default rules match only explicit `claude`
 `codex` and `kimi` names. Generic `node` and `python` interpreters are not defaults.
 Configure an explicit suitable name when an installation does not expose those names.
 
-`YARDGOAT_STATION`, `YARDGOAT_MAILBOX`, `YARDGOAT_MAILBOX_HOME`, or an ancestor
+The current process's inherited `YARDGOAT_STATION`, `YARDGOAT_MAILBOX`, and
+`YARDGOAT_MAILBOX_HOME` are checked before any proc reads. Those keys on a same-user
+ancestor, or a same-user ancestor's
 `yardgoat _station` / `python -m yardgoat.cli _station` invocation reject session
 identification, including wrappers with global `--session` arguments before
 `_station`, and administrator PID inventory. Changing the target store
-does not remove the station restriction. Permission failures are unknown, including
-restricted proc mounts. A session list reports `alive`, `dead`, or `unknown`:
+does not remove the station restriction. Permission failures for required evidence
+are unknown, including restricted proc mounts. A session list reports `alive`,
+`dead`, or `unknown`:
 boot/start-time mismatch, confirmed PID absence, or a zombie is dead; inability to
 read the evidence is unknown. An absent proc entry requires a readable proc root
 and an existence check (`kill(pid, 0)`, which sends no signal) reporting no such
@@ -412,8 +421,12 @@ and records the previous state and recovery reason.
 
 Transfer begin requires the current controller and expected epoch. It saves a random
 transfer ID and only the SHA-256 of a 256-bit token, returning the token once to the
-caller. The project is `transferring`; claim, handoff, another begin and control
-authorization are refused. The old controller's epoch is retained until commit.
+caller. Tokens carry a fixed `yg-` prefix before the random URL-safe payload to
+prevent argparse from treating a leading `-` as an option in `--token TOKEN`.
+Existing hashes remain valid; older tokens beginning with `-` can be passed as
+`--token="$TOKEN"` for commit or abort. The project is `transferring`; claim,
+handoff, another begin and control authorization are refused. The old controller's
+epoch is retained until commit.
 Commit authenticates the token and moves to a live registered target (default: the
 identified caller), incrementing epoch once. An explicit `--to` permits a token
 holder to finish for that target. The saved result makes duplicate commit return
