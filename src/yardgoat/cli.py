@@ -896,6 +896,9 @@ def cmd_reconcile(a) -> int:
             spec = td.spec()
             last = st["runs"][-1] if st["runs"] else None
             if not last:
+                if st["status"] == "answered":   # parked before its first run (e.g. migrated in with a question)
+                    rc = do_dispatch_locked(td, st["owner"], "resumed by reconcile after an answer")
+                    report.append({"task_id": t, "resumed": rc == 0})
                 continue
             if _receipt_waiting(td, last):                   # writer died between receipt and state
                 if runner.record_outcome(td, last["run_id"], replay=True):

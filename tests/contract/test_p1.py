@@ -199,3 +199,16 @@ def test_quick_into_a_file_pool(tmp_path, env):
     assert rc == 0, err
     card = pool / "p1/pending/q-pool-r1.md"
     assert card.exists() and "verify: true" in card.read_text()
+
+
+def test_answer_resumes_a_task_parked_before_its_first_run(tmp_path, env):
+    """A card migrated in with an open question has no runs; answering it must still get it dispatched."""
+    spec = make_task(tmp_path, attempts=1)
+    yg(env, "submit", str(spec), "--as", "A")
+    assert yg(env, "park", "t-demo", "--as", "A", "--question", "Which variant?")[0] == 0
+    assert yg(env, "answer", "t-demo", "--as", "human", "--text", "the first")[0] == 0
+    out = json.loads(yg(env, "reconcile")[1])
+    assert {"task_id": "t-demo", "resumed": True} in out["actions"]
+    wait_exit(env, "t-demo")
+    rc, o, _ = yg(env, "close", "t-demo", "--as", "A")
+    assert rc == 0 and json.loads(o)["verdict"] == "PASS"
