@@ -70,7 +70,8 @@ def pool_lock(name: str):
 def workdir_problem(spec: dict, cfg: dict) -> str | None:
     c = pool_conf(cfg, spec["adapter"]["pool"])
     root = c.get("root")
-    if root and not os.path.realpath(spec["workdir"]).startswith(os.path.realpath(os.path.expanduser(root)) + os.sep):
+    r, w = os.path.realpath(os.path.expanduser(root)) if root else "", os.path.realpath(spec["workdir"])
+    if root and w != r and not w.startswith(r + os.sep):
         return f"pool {spec['adapter']['pool']!r} only runs tasks whose workdir is under {root}"
     return None
 
@@ -146,6 +147,18 @@ def schedule_lock():
         yield
 
 
+def resources_ok(cfg: dict) -> tuple[bool, str]:
+    """Machine guard for starting one more worker: free memory and load (local config min_free_gb / max_load)."""
+    mf, ml = cfg.get("min_free_gb"), cfg.get("max_load")
+    if mf is not None:
+        avail = next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemAvailable")) / 1048576
+        if avail < float(mf):
+            return False, f"only {avail:.1f} GB memory available (min_free_gb={mf})"
+    if ml is not None and os.getloadavg()[0] > float(ml):
+        return False, f"1-minute load {os.getloadavg()[0]:.1f} > max_load={ml}"
+    return True, ""
+
+
 def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
     """Start stations where queued cards outnumber live stations. Caller holds schedule_lock()."""
     direct_in_use = direct_in_use_fn() if callable(direct_in_use_fn) else direct_in_use_fn
@@ -159,6 +172,8 @@ def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
             while want > 0:
                 if cap is not None and direct_in_use + all_live_stations(cfg) >= int(cap):
                     break
+                if not resources_ok(cfg)[0]:
+                    break
                 started.append(start_station(name, c, cfg)); want -= 1
     return started
 
@@ -167,7 +182,9 @@ def start_station(name: str, c: dict, cfg: dict) -> str:
     d = pool_dir(name)
     n = 1 + max([int(f.stem.rsplit("-", 1)[-1]) for f in (d / "stations").glob("*.json")] or [0])
     station = f"{name}-st-{n}"
-    update_station(name, station, station=station, pool=name, state="running", started_at=now(), tasks=[], current=None)
+    accts = c.get("accts") or ([c["acct"]] if c.get("acct") else [""])
+    acct = accts[(n - 1) % len(accts)]          # spread stations over accounts (each account has its own rate limits)
+    update_station(name, station, station=station, pool=name, state="running", started_at=now(), tasks=[], current=None, acct=acct)
     me = [sys.executable, "-m", "yardgoat.cli", "_station", name, station]
     pypath = str(Path(__file__).resolve().parents[1])
     envs = {"YARDGOAT_HOME": str(home()), "PYTHONPATH": pypath, "YARDGOAT_ORIG_PYTHONPATH": os.environ.get("PYTHONPATH", "")}
@@ -201,6 +218,9 @@ def mailbox_dir(name: str, station: str, c: dict) -> Path:
 def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
     yg = shutil.which("yardgoat") or f"{sys.executable} -m yardgoat.cli"
     prompt = STATION_PROMPT.format(pool=name, station=station, yg=yg, max_tasks=int(c.get("max_tasks_per_station", 5)))
+    pre = c.get("preamble") or (Path(os.path.expanduser(c["preamble_file"])).read_text(encoding="utf-8") if c.get("preamble_file") else "")
+    if pre:  # project rules a station reads once per session, then reuses for every card
+        prompt = pre.strip() + "\n\n---\n\n" + prompt
     host = c["host"]
     sd = pool_dir(name) / "stations"
     extra = list(cfg.get("host_args", {}).get(host, [])) + list(c.get("args", []))
@@ -217,7 +237,8 @@ def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
         argv = ["bash", "-c", c["command"], station]
     launcher = cfg.get("launcher") if host != "shell" else None
     if launcher:
-        fill = {"host": host, "lane": c.get("lane", ""), "acct": c.get("acct", "")}
+        acct = (get_station(name, station) or {}).get("acct") or c.get("acct", "")
+        fill = {"host": host, "lane": c.get("lane", ""), "acct": acct}
         argv = [a.format(**fill) for a in launcher] + argv
     return argv
 

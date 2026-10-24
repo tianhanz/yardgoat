@@ -213,8 +213,8 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
                 print(json.dumps({"task_id": td.task_id, "result": "queued", "run_id": run_id, "pool": spec["adapter"]["pool"],
                                   "stations_started": started}))
             return 0
-        if adapter_kind(spec) == "direct" and cap is not None and machine_load(cfg) >= int(cap):
-            td.event("run.queued", who, run_id=run_id, cap=cap, note=actor_note)
+        if adapter_kind(spec) == "direct" and ((cap is not None and machine_load(cfg) >= int(cap)) or not pool.resources_ok(cfg)[0]):
+            td.event("run.queued", who, run_id=run_id, cap=cap, note=actor_note, reason=pool.resources_ok(cfg)[1])
             if echo:
                 print(json.dumps({"task_id": td.task_id, "result": "queued", "run_id": run_id,
                                   "note": f"{cap} runs already in flight; reconcile starts it when a slot frees"}))
@@ -508,7 +508,7 @@ def cmd_reconcile(a) -> int:
             td = TaskDir(t)
             if adapter_kind(td.spec()) == "pool":
                 continue  # stations claim pool cards themselves
-            if adapter_kind(td.spec()) == "direct" and cap is not None and machine_load(cfg) >= int(cap):
+            if adapter_kind(td.spec()) == "direct" and ((cap is not None and machine_load(cfg) >= int(cap)) or not pool.resources_ok(cfg)[0]):
                 continue
             rc = start_queued(td, "reconciler", actor_note="started from the queue", echo=False)
             report.append({"task_id": t, "started_from_queue": rc == 0})
@@ -655,6 +655,7 @@ def finish_card(task_id: str, run_id: str, station: str, late: bool = False) -> 
     spec = td.spec()
     c = pool.pool_conf(runner.config(), run["pool"])
     out = {"state": "exited", "exit_code": 0, "host": c.get("host", ""), "lane": c.get("lane", ""), "worker": station,
+           "account_alias": (pool.get_station(run["pool"], station) or {}).get("acct", ""),
            "actual_model": pool.station_model(run["pool"], station), "model_source": "station-log",
            "cost_basis": "shared-station"}
     bf = Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")

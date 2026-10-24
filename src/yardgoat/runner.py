@@ -220,7 +220,7 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay
                 "adapter": spec.get("adapter", {}).get("kind", "direct"),
                 "exit_code": outcome.get("exit_code"), "timed_out": outcome.get("exit_code") == 124,
                 "host": outcome.get("host", ex["host"]), "lane": outcome.get("lane", ex.get("lane", "")),
-                "account_alias": ex.get("acct", ""), "worker": outcome.get("worker"),
+                "account_alias": outcome.get("account_alias") or ex.get("acct", ""), "worker": outcome.get("worker"),
                 "actual_model": outcome.get("actual_model", ""), "model_source": outcome.get("model_source", "none"),
                 "cost_basis": outcome.get("cost_basis", "unknown"), "artifacts": artifacts, "finished_at": now(),
                 "status": STATUS_OF[state],

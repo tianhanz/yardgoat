@@ -139,8 +139,9 @@ def test_F10_receipt_without_committed_state_is_replayed(tmp_path, env):
     yg(env, "submit", str(spec), "--as", "A"); yg(env, "dispatch", "t-demo", "--as", "A"); wait_exit(env, "t-demo")
     tj = task_json(env, "t-demo"); st = json.loads(tj.read_text())
     st["runs"][0]["state"] = "running"; st["status"] = "running"; tj.write_text(json.dumps(st))  # crash before state write
-    acts = json.loads(yg(env, "reconcile")[1])["actions"]
-    assert {"task_id": "t-demo", "run_id": "r1", "replayed_receipt": True} in acts
+    yg(env, "reconcile")
+    st = json.loads(yg(env, "status", "t-demo", "--json")[1])
+    assert st["runs"][0]["state"] == "exited"          # committed from the receipt on disk
     assert yg(env, "close", "t-demo", "--as", "A")[0] == 0
 
 
