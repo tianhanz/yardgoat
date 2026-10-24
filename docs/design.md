@@ -198,21 +198,27 @@ so accepted work keeps moving when no controller session is alive.
 Direct/file-pool launch and pool claim capture the same prompt composition in
 `tasks/<id>/runs/<run>/prompt.md`: the frozen card, all recorded human answers and engineering
 review feedback in order, then an optional `上一次尝试的验收结果` section. The section names
-the latest judged attempt and its FAIL or ERROR verdict, followed by at most the last 4000
+the latest judged attempt when its verdict is FAIL, followed by at most the last 4000
 characters of Yardgoat's own `runs/<previous>/verify.out`. Longer output is explicitly marked
 as truncated, with the full log's path. Workspace files and worker logs are never sources.
+Empty or whitespace-only output is replaced with a fixed explanation that the verifier returned
+a nonzero exit code without output, rather than an empty code block; the log path is still shown.
 Only the latest recorded judgment is included, regardless of how many runs preceded it.
-Queued and cancelled entries are not attempts. PASS, no recorded judgment, or missing verifier
+Queued and cancelled entries are not attempts. PASS, ERROR, no recorded judgment, or missing verifier
 output add no section. A preceding launch failure or provider refusal also suppresses feedback,
 even when an older failure is recorded. Answering a parked question retains the latest judgment.
 Manual retries and configured review's automatic retries share this behavior. Existing retry
-gates remain unchanged: a verifier ERROR still needs its environment fixed and `close` retried.
+gates remain unchanged: a verifier ERROR blocks dispatch and pool claim until its environment is
+fixed and `close` is retried on the same run. If that returns FAIL, the next attempt includes the
+new FAIL output, not the earlier ERROR output. A verifier timeout writes its duration and any
+captured output (or an explicit no-output explanation) to `verify.out` before recording ERROR.
 
 The run also captures `goal.md`, containing only the frozen card and ordered answers. Review
-children quote this snapshot and the current card/answers without retry diagnostics; the full
-execution prompt remains recorded at its original path. For runs predating this snapshot,
-review uses their original `prompt.md`. Neither prompt file changes the accepted card, spec,
-verifier files or frozen hashes. File-pool adapters transport the captured `prompt.md`.
+children quote this snapshot with its `goal.md` path and the current card/answers without retry
+diagnostics; the full execution prompt remains recorded at its original path. For runs predating
+this snapshot, review quotes their original `prompt.md` with that file's path. Neither prompt file
+changes the accepted card, spec, verifier files or frozen hashes. File-pool adapters transport the
+captured `prompt.md`.
 
 ## Handover
 

@@ -610,8 +610,16 @@ def _do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -
                                capture_output=True, text=True, timeout=1800, env=env)
             rc = p.returncode
             (rd / "verify.out").write_text(p.stdout + ("\n--- stderr ---\n" + p.stderr if p.stderr else ""))
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             rc = 124
+            # TimeoutExpired may carry bytes even when subprocess.run uses text=True.
+            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
+            stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
+            output = stdout + ("\n--- stderr ---\n" + stderr if stderr else "")
+            reason = f"Verifier timed out after {exc.timeout} seconds and was terminated."
+            if not output.strip():
+                reason += " No output was received."
+            (rd / "verify.out").write_text(reason + "\n" + output, encoding="utf-8")
         except OSError as exc:
             rc = 127
             (rd / "verify.out").write_text(f"Verifier could not start: {exc}\n")

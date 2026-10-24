@@ -66,9 +66,10 @@ add automatic retries to ordinary tasks. Set `"auto_close": false` for manual `c
 `quick --no-auto-close` selects manual close; `quick --auto-close` remains a supported spelling of
 the default. These two switches are mutually exclusive.
 
-Retry prompts append the latest attempt with a FAIL/ERROR judgment and the last 4000 characters
+Retry prompts append the latest FAIL judgment and the last 4000 characters
 of its verifier output, with truncation and log location indicated; engineering-review goal
-context omits these diagnostics.
+context omits these diagnostics. ERROR blocks retries until the verifier environment is fixed
+and `close` is retried; if that returns FAIL, the next prompt includes that FAIL output.
 
 **Upgrade:** the default also applies to already accepted tasks that omit `auto_close`. Existing
 exited runs will advance on the next reconcile, potentially running their frozen `on_pass` commands.

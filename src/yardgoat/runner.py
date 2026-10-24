@@ -37,7 +37,7 @@ VERIFICATION_TAIL_CHARS = 4000
 
 
 def verification_feedback(td: TaskDir) -> str:
-    """The latest recorded verdict/log, except after an infrastructure failure."""
+    """The latest FAIL verdict/log, except after an infrastructure failure."""
     # The run being prepared is already queued (or running in build_argv's fallback).
     # Cancelled queue entries never attempted the card. Infrastructure failures do,
     # however, stop this lookup even when task.verdict still names an older failure.
@@ -46,7 +46,7 @@ def verification_feedback(td: TaskDir) -> str:
                      if r["state"] not in ("queued", "waiting_deps", "running", "cancelled")), None)
     verdict = state.get("verdict") or {}
     if not previous or previous["state"] in ("launch_failed", "provider_refused") \
-            or verdict.get("verdict") not in ("FAIL", "ERROR"):
+            or verdict.get("verdict") != "FAIL":
         return ""
     rd = td.run_dir(verdict["run_id"])
     output = rd / "verify.out"
@@ -64,10 +64,13 @@ def verification_feedback(td: TaskDir) -> str:
     truncated = len(tail) > VERIFICATION_TAIL_CHARS
     tail = tail[-VERIFICATION_TAIL_CHARS:]
     note = f"已截断，仅保留末尾 {VERIFICATION_TAIL_CHARS} 字符。\n" if truncated else ""
+    header = (f"\n\n## 上一次尝试的验收结果\n\n运行：{verdict['run_id']}\n判定：{verdict['verdict']}\n"
+              f"验收输出：{output}\n{note}\n")
+    if not tail.strip():
+        return header + "验收程序没有输出，只返回了非零退出码；完整日志见上面的路径。\n"
     # A fence longer than any run of backticks preserves arbitrary diagnostic text.
     fence = "`" * max(3, 1 + max((len(m) for m in re.findall(r"`+", tail)), default=0))
-    return (f"\n\n## 上一次尝试的验收结果\n\n运行：{verdict['run_id']}\n判定：{verdict['verdict']}\n"
-            f"验收输出：{output}\n{note}\n{fence}text\n{tail}\n{fence}\n")
+    return header + f"{fence}text\n{tail}\n{fence}\n"
 
 
 def prompt_text(td: TaskDir, spec: dict, *, include_verification: bool = True) -> str:

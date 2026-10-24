@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import subprocess
 
 import pytest
 
@@ -92,16 +93,75 @@ def test_long_output_keeps_last_4000_characters_and_names_full_log(rig, tmp_path
     assert "DISCARDED_PREFIX" not in text
 
 
-def test_error_feedback_is_rendered_without_relaxing_existing_retry_gate(rig, tmp_path):
-    submit(rig, tmp_path, "echo verifier-environment-error >&2; exit 2")
+def test_error_blocks_dispatch_and_claim_until_environment_fixed_and_reclosed(rig, tmp_path, capsys):
+    wd = submit(rig, tmp_path, "if ! test -f out/verifier-ready; then "
+                "echo verifier-environment-error >&2; exit 2; fi\necho checked-failure; exit 1")
     finish(rig, claim(rig), "ERROR")
     td = TaskDir("parent")
-    # ERROR still requires re-close; rendering feedback must not change that policy.
-    rig.call("dispatch", "parent", "--as", "owner", rc=3)
-    text = runner.prompt_text(td, td.spec())
-    assert HEADING in text and "ERROR" in text and "r1" in text
-    assert "verifier-environment-error" in text
+    assert cli.main(["dispatch", "parent", "--as", "owner"]) == 3
+    assert "fix its environment and run `yardgoat close` again" in capsys.readouterr().err
+    rc, result = cli.claim_card("work", "work-st-1")
+    assert rc == 0 and result["result"] == "EMPTY"
     assert td.state()["runs"][-1]["state"] == "verify_error"
+    assert len(td.state()["runs"]) == 1 and not td.run_dir("r2").exists()
+    assert HEADING not in prompt("r1")
+    assert "verifier-environment-error" in (td.run_dir("r1") / "verify.out").read_text()
+
+    # Repair the environment without changing the frozen verifier, then re-close r1.
+    (wd / "out/verifier-ready").touch()
+    assert rig.call("close", "parent", "--as", "owner", rc=1)["verdict"] == "FAIL"
+    second = claim(rig)
+    assert second["run_id"] == "r2"
+    text = prompt("r2")
+    assert HEADING in text and "判定：FAIL" in text and "运行：r1" in text
+    assert "checked-failure" in text and "verifier-environment-error" not in text
+    assert "判定：ERROR" not in text
+
+
+@pytest.mark.parametrize("stdout,stderr", [(None, None), (b"partial stdout\n", b"partial stderr\n")])
+def test_verifier_timeout_records_diagnostic_before_error_verdict(rig, tmp_path, monkeypatch, stdout, stderr):
+    submit(rig, tmp_path)
+    result = claim(rig)
+    assert cli.finish_card("parent", result["run_id"], "work-st-1")[0] == 0
+    td = TaskDir("parent")
+
+    def timeout(command, **kwargs):
+        assert command == td.spec()["verifier"]["command"]
+        assert kwargs["timeout"] == 1800
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=stdout, stderr=stderr)
+
+    # Exercise close's real error-recording path without waiting thirty minutes.
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.subprocess, "run", timeout)
+        assert rig.call("close", "parent", "--as", "owner", rc=2)["verdict"] == "ERROR"
+    rd = td.run_dir(result["run_id"])
+    log = (rd / "verify.out").read_text(encoding="utf-8")
+    assert "timed out" in log and "1800" in log
+    if stdout is None:
+        assert "No output was received" in log
+    else:
+        assert stdout.decode() in log and stderr.decode() in log
+    receipt = json.loads((rd / "receipt.json").read_text())
+    assert receipt["verifier"]["result"] == "ERROR" and receipt["verifier"]["exit_code"] == 124
+    assert receipt["status"] == "verifier_error"
+    assert td.state()["runs"][-1]["state"] == "verify_error"
+    assert td.state()["verdict"]["verdict"] == "ERROR"
+    rig.call("dispatch", "parent", "--as", "owner", rc=3)
+
+
+@pytest.mark.parametrize("script", ["exit 1", "printf ' \\t\\n'; exit 1"])
+def test_empty_verifier_output_has_explanation_instead_of_empty_code_block(rig, tmp_path, script):
+    submit(rig, tmp_path, script)
+    finish(rig, claim(rig))
+    claim(rig)
+    text = prompt("r2")
+    assert HEADING in text
+    feedback = text.split(HEADING, 1)[1]
+    log = TaskDir("parent").run_dir("r1") / "verify.out"
+    assert not log.read_text().strip()
+    assert "运行：r1" in feedback and "判定：FAIL" in feedback and str(log) in feedback
+    assert "验收程序没有输出，只返回了非零退出码；完整日志见上面的路径" in feedback
+    assert "```" not in feedback
 
 
 def test_pass_after_failure_does_not_reuse_old_feedback_for_review_repair(rig, tmp_path):
@@ -209,10 +269,29 @@ def test_review_automatic_retry_gets_feedback_but_child_goal_context_excludes_it
     finish(rig, second, "PASS")
     child = TaskDir("parent-review-1")
     card = Path(child.spec()["card"]).read_text()
-    assert "write out/result.txt" in card and str(Path(second["prompt"])) in card
+    goal = TaskDir("parent").run_dir("r2") / "goal.md"
+    assert "write out/result.txt" in card and f"({goal})" in card
+    assert goal.read_text() in card and str(Path(second["prompt"])) not in card
     assert HEADING not in card and "RETRY_FAILURE_CONTEXT" not in card
     assert HEADING in execution and "RETRY_FAILURE_CONTEXT" in execution
     assert prompt("r2") == execution  # review never rewrites execution evidence
+
+
+def test_review_legacy_run_without_goal_quotes_prompt_with_matching_provenance(rig, tmp_path):
+    submit(rig, tmp_path, "exit 0", review={"pool": "audit", "path": "src"})
+    first = claim(rig)
+    rd = TaskDir("parent").run_dir(first["run_id"])
+    (rd / "goal.md").unlink()
+    execution_prompt = rd / "prompt.md"
+    legacy_context = execution_prompt.read_text() + "\nLegacy captured execution context.\n"
+    execution_prompt.write_text(legacy_context)
+    finish(rig, first, "PASS")
+    child = TaskDir("parent-review-1")
+    card = Path(child.spec()["card"]).read_text()
+    assert f"## Executed goal and answers: parent/r1 ({execution_prompt})" in card
+    assert legacy_context in card and str(rd / "goal.md") not in card
+    assert execution_prompt.read_text() == legacy_context
+    assert not (rd / "goal.md").exists()
 
 
 def test_file_pool_transports_same_retry_prompt_as_saved_run(rig, tmp_path):
