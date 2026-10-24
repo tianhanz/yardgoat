@@ -103,7 +103,8 @@ def _group_name(by, state, spec, receipts):
     receipt = next((receipts[r["run_id"]] for r in reversed(runs) if r["run_id"] in receipts), {})
     executor = spec.get("executor", {})
     if by == "pool":
-        value = run.get("pool") or spec.get("adapter", {}).get("pool")
+        adapter = spec.get("adapter") or {}
+        value = run.get("pool") or adapter.get("pool") or adapter.get("kind") or "direct"  # cards without a pool run through their adapter
     elif by == "project":
         value = spec.get("project") or receipt.get("project")
     elif by == "model":

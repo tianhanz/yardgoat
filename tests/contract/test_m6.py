@@ -335,3 +335,13 @@ def test_review_F2_absurd_cost_makes_that_field_unknown_not_the_report_fail():
     assert report._cost("usd=1e9999999999999999999999999 tokens=12")[1] == 12
     assert report._cost("tokens=" + "9" * 5000)[2] is True
     assert report._cost("usd=0.5 tokens=10")[:2] == (report.Decimal("0.5"), 10)
+
+
+@pytest.mark.parametrize("adapter,expected", [({"kind": "direct"}, "direct"), ({}, "direct"),
+                                               ({"kind": "file-pool"}, "file-pool")])
+def test_report_cards_without_a_pool_group_under_their_adapter(env, adapter, expected):
+    td = seed(env, "t-nopool", ["verified"], ["usd=0"])
+    spec = json.loads((td / "spec.json").read_text())
+    spec["adapter"] = adapter
+    put_json(td / "spec.json", spec)
+    assert [g["name"] for g in report(env, "--by", "pool")["groups"]] == [expected]
