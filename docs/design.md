@@ -193,6 +193,27 @@ paths are loaded from local files listed in the config's `plugins`. `yardgoat re
 cron) polls adapter runs, marks runs whose process vanished as `lost`, and resumes answered tasks —
 so accepted work keeps moving when no controller session is alive.
 
+## Run prompts and retry feedback
+
+Direct/file-pool launch and pool claim capture the same prompt composition in
+`tasks/<id>/runs/<run>/prompt.md`: the frozen card, all recorded human answers and engineering
+review feedback in order, then an optional `上一次尝试的验收结果` section. The section names
+the latest judged attempt and its FAIL or ERROR verdict, followed by at most the last 4000
+characters of Yardgoat's own `runs/<previous>/verify.out`. Longer output is explicitly marked
+as truncated, with the full log's path. Workspace files and worker logs are never sources.
+Only the latest recorded judgment is included, regardless of how many runs preceded it.
+Queued and cancelled entries are not attempts. PASS, no recorded judgment, or missing verifier
+output add no section. A preceding launch failure or provider refusal also suppresses feedback,
+even when an older failure is recorded. Answering a parked question retains the latest judgment.
+Manual retries and configured review's automatic retries share this behavior. Existing retry
+gates remain unchanged: a verifier ERROR still needs its environment fixed and `close` retried.
+
+The run also captures `goal.md`, containing only the frozen card and ordered answers. Review
+children quote this snapshot and the current card/answers without retry diagnostics; the full
+execution prompt remains recorded at its original path. For runs predating this snapshot,
+review uses their original `prompt.md`. Neither prompt file changes the accepted card, spec,
+verifier files or frozen hashes. File-pool adapters transport the captured `prompt.md`.
+
 ## Handover
 
 A controller that disappears mid-run loses nothing: the run keeps going, and a new controller needs only
@@ -608,9 +629,10 @@ also advances the parent immediately after releasing the child lock. Restoring f
 answering the parent replays the pending round; verifier errors can be retried with child close
 after the environment is fixed. A launch refusal can retry the same round after a parent answer.
 
-Run prompts are captured at dispatch/claim. The frozen review card embeds the exact corresponding
-execution prompt with its run/path provenance, all answers in recorded order, and the earlier
-rounds' validated findings. It asks the reviewer to confirm each previous fix. This material is
+Run prompts are captured at launch/claim. The frozen review card embeds the corresponding
+execution goal/answers snapshot with its run/path provenance (excluding retry verifier logs),
+all answers in recorded order, and the earlier rounds' validated findings. It asks the reviewer
+to confirm each previous fix. This material is
 read-only review context and grants no authority to execute the original task's changes.
 
 Round records, deterministic child/follow-up IDs and numbered `review-NNN` answer keys make repeated

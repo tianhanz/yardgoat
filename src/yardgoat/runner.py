@@ -33,15 +33,59 @@ def config() -> dict:
     return read_json(p) if p.exists() else {}
 
 
-def prompt_text(td: TaskDir, spec: dict) -> str:
-    """The frozen card, plus every human answer given while the task was parked (in order)."""
+VERIFICATION_TAIL_CHARS = 4000
+
+
+def verification_feedback(td: TaskDir) -> str:
+    """The latest recorded verdict/log, except after an infrastructure failure."""
+    # The run being prepared is already queued (or running in build_argv's fallback).
+    # Cancelled queue entries never attempted the card. Infrastructure failures do,
+    # however, stop this lookup even when task.verdict still names an older failure.
+    state = td.state()
+    previous = next((r for r in reversed(state["runs"])
+                     if r["state"] not in ("queued", "waiting_deps", "running", "cancelled")), None)
+    verdict = state.get("verdict") or {}
+    if not previous or previous["state"] in ("launch_failed", "provider_refused") \
+            or verdict.get("verdict") not in ("FAIL", "ERROR"):
+        return ""
+    rd = td.run_dir(verdict["run_id"])
+    output = rd / "verify.out"
+    try:
+        if output.is_symlink():
+            return ""
+        # UTF-8 needs at most four bytes per character. Read one extra character
+        # to detect truncation without loading an arbitrarily large verifier log.
+        with output.open("rb") as log:
+            size = log.seek(0, os.SEEK_END)
+            log.seek(max(0, size - 4 * (VERIFICATION_TAIL_CHARS + 1)))
+            tail = log.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""  # no recorded output: do not substitute worker/workdir files
+    truncated = len(tail) > VERIFICATION_TAIL_CHARS
+    tail = tail[-VERIFICATION_TAIL_CHARS:]
+    note = f"已截断，仅保留末尾 {VERIFICATION_TAIL_CHARS} 字符。\n" if truncated else ""
+    # A fence longer than any run of backticks preserves arbitrary diagnostic text.
+    fence = "`" * max(3, 1 + max((len(m) for m in re.findall(r"`+", tail)), default=0))
+    return (f"\n\n## 上一次尝试的验收结果\n\n运行：{verdict['run_id']}\n判定：{verdict['verdict']}\n"
+            f"验收输出：{output}\n{note}\n{fence}text\n{tail}\n{fence}\n")
+
+
+def prompt_text(td: TaskDir, spec: dict, *, include_verification: bool = True) -> str:
+    """The frozen card, ordered answers, and optional feedback for the next attempt."""
     text = Path(spec["card"]).read_text(encoding="utf-8")
     answers = sorted((td.path / "answers").glob("*.md")) if (td.path / "answers").exists() else []
     if answers:
         text += "\n\n## Answers and engineering review feedback\n"
         for a in answers:
             text += f"\n### {a.stem}\n{a.read_text(encoding='utf-8').strip()}\n"
-    return text
+    return text + (verification_feedback(td) if include_verification else "")
+
+
+def write_prompt(td: TaskDir, spec: dict, run_dir: Path) -> None:
+    """Capture both execution context and the goal/answers used by engineering review."""
+    goal = prompt_text(td, spec, include_verification=False)
+    (run_dir / "goal.md").write_text(goal, encoding="utf-8")
+    (run_dir / "prompt.md").write_text(goal + verification_feedback(td), encoding="utf-8")
 
 
 def build_argv(td: TaskDir, spec: dict, run_dir: Path, cfg: dict, probe_argv: list[str] | None = None) -> list[str]:

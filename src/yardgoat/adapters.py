@@ -67,7 +67,8 @@ class FilePool:
         c = self._conf(cfg)
         pool = spec["adapter"]["pool"]
         ptid = f"{td.task_id}-{run_id}"
-        text = runner.prompt_text(td, spec)
+        prompt = td.run_dir(run_id) / "prompt.md"
+        text = prompt.read_text(encoding="utf-8") if prompt.exists() else runner.prompt_text(td, spec)
         verify = spec["adapter"].get("worker_verify", "")
         if c.get("add_cmd"):
             fill = {"text": text, "pool": pool, "pool_task_id": ptid, "verify": verify}

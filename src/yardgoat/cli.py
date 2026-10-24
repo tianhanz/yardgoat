@@ -408,7 +408,7 @@ def start_queued(td: TaskDir, actor: str, actor_note: str = "", echo: bool = Tru
             return refuse(problem)
         run.update(state="running", started_at=now(), write_set=scheduling.write_set(spec))
         run["channel"] = review.execution_channel(spec, cfg)
-        (td.run_dir(run["run_id"]) / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
+        runner.write_prompt(td, spec, td.run_dir(run["run_id"]))
         review.reserve(st, run, spec)
         if st.get("approval"):
             run["approval"] = dict(st["approval"])
@@ -1179,7 +1179,7 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                                         restart_reason=problem, restart_requested_at=now())
                     return 0, {"result": "EMPTY", "reason": problem}
                 rd = td.run_dir(run["run_id"]); rd.mkdir(parents=True, exist_ok=True)
-                (rd / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
+                runner.write_prompt(td, spec, rd)
                 run.update(state="running", station=station, task_id=t, started_at=now(), claimed_epoch=time.time(),
                            channel=rec.get("channel", pool.channel(c)),
                            log_start=pool.log_position(pool_name, station),

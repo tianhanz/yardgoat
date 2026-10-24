@@ -66,6 +66,10 @@ add automatic retries to ordinary tasks. Set `"auto_close": false` for manual `c
 `quick --no-auto-close` selects manual close; `quick --auto-close` remains a supported spelling of
 the default. These two switches are mutually exclusive.
 
+Retry prompts append the latest attempt with a FAIL/ERROR judgment and the last 4000 characters
+of its verifier output, with truncation and log location indicated; engineering-review goal
+context omits these diagnostics.
+
 **Upgrade:** the default also applies to already accepted tasks that omit `auto_close`. Existing
 exited runs will advance on the next reconcile, potentially running their frozen `on_pass` commands.
 Accepted specs, hashes and frozen files are not rewritten. See the
@@ -232,8 +236,8 @@ authoritative record and events, without rewriting the accepted spec or hash. Re
 replays that same confirmation, never refreezes changed config. It does not dispatch, answer
 or spend a round: use normal dispatch/reconcile afterwards, or answer first if already parked.
 
-Reviewers receive a snapshot, the execution run's actual prompt, all recorded answers and
-previous rounds' findings, and must confirm whether those findings were fixed.
+Reviewers receive a snapshot, the original card, the answers captured for the execution run,
+all later answers and previous rounds' findings, and must confirm whether those findings were fixed.
 They write `out/findings.json` and `out/REVIEW.md`; `out/BLOCKED.md` is allowed for a concrete
 question. These are the only writable review files. Findings use
 `id`, `severity`, `file`, `line`, `title`, `scenario`, `fix`; file paths are relative to
