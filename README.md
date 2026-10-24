@@ -72,6 +72,32 @@ How a lane or account is chosen is your machine's business, not the task's. Put 
 
 With `tmux_session` set, each run gets its own window (handy for watching); otherwise runs are detached background processes.
 
+## Reports and pending reminders
+
+```bash
+yardgoat report --since 2026-10-01 --by pool
+yardgoat report --by model --json
+```
+
+Reports group tasks by `pool` (default), `lane`, `model`, `account`, `project`, or `host`, sorted by name.
+They show first-attempt PASS rate, attempts, recorded run wall time, human interventions, abnormal
+outcomes, and explicit `usd=` / `tokens=` receipt totals. Unknown costs stay unknown; nothing is estimated.
+Groups with fewer than five tasks show only their count and `数据不足` (insufficient data); JSON sets
+`insufficient: true` and metric fields to `null`. `--since` includes tasks accepted on or after that date.
+See [accounting definitions](docs/design.md#reports-and-pending-reminders) for denominators and attribution.
+
+An optional machine-local `notify` setting runs your own command for pending decisions:
+
+```json
+{"notify": {"command": ["/path/to/local-hook", "{task_id}", "{status}", "{owner}", "{question}", "{hint}"]}}
+```
+
+`reconcile` invokes the argv directly, with a 30-second timeout. The default `on` statuses are `parked`,
+`exhausted`, `submit_unknown`, `verify_error`, and `provider_refused`; set `notify.on` to a list to override
+them. The question argument is limited to 500 characters. Successful reminders are remembered across
+reconciles; a new status or full question gets a new reminder. Failures log to stderr and retry next time.
+Without `notify`, no hook runs. Reconcile still emits one JSON document, with a `notified` array.
+
 ## Roadmap
 
 | Phase | Scope | Status |

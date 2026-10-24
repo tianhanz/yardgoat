@@ -76,4 +76,44 @@ ownership; `close` verifies. The old owner can no longer dispatch or close.
 ## Not yet
 
 Issue-driven and queue-file adapters (beyond `file-pool`), an MCP entry point, cost/model-call budget
-gates, leases for multi-host stores, and evaluation data. See the roadmap in the README.
+gates, leases for multi-host stores, and richer evaluation data. See the roadmap in the README.
+
+## Reports and pending reminders
+
+`report` reads task state, accepted specs, receipts and events without changing them. It groups each task
+once, using its pool/project and latest available receipt's observed lane/model/account/host; absent
+lane/account/host fields fall back to the run and requested executor. An unobserved model is `(unknown)`.
+All of that task's runs contribute to its group, even if a retry used a different executor. `--since`
+filters the inclusive acceptance date as recorded (not the latest activity date). Groups sort by name,
+never by performance. Below five tasks, all metrics are null and the table shows count plus `数据不足`.
+
+Attempts use the dispatch budget's counted states: `exited`, `failed`, `verified`, `lost`, `verify_error`.
+Queued/running, cancelled, blocked, launch failures and provider refusals do not count. First-pass rate
+is tasks whose first counted attempt's first recorded verification is PASS divided by all selected
+tasks, including unfinished ones. Events preserve an earlier ERROR when a later verification replaces
+the receipt. Average attempts uses the same task denominator; average wall seconds uses completed runs
+with valid start/end timestamps, excluding queue time and invalid/missing intervals (no samples → null).
+Human intervention counts use `task.answered`, `task.owner_changed`, `task.archived`, `run.cancelled`,
+excluding runner/reconciler actors and stations identified by records, run/receipt metadata, claim
+events or the standard `*-st-N` name. Other event kinds are not interventions.
+
+Abnormal outcomes are deduplicated per run and status across state/receipt/events: `lost`,
+`launch_failed`, `submit_unknown`, `verify_error` (including receipt `verifier_error`), `provider_refused`;
+unknown status strings enter `other`. Known lifecycle states such as `failed` are not unknown outcomes.
+Cost fields sum independently across receipts; USD uses decimal arithmetic and tokens use integers.
+A task counts once as unknown if any run lacks parseable cost data (including a missing receipt), or
+if it has no receipts. Partially parseable receipts retain known amounts and still flag the task unknown.
+Token counts are never converted to prices, and shared-station costs are never apportioned.
+
+`notify.notify_pending` runs after reconciliation/auto-close and outside the scheduler/task locks. It
+also recognizes a last run's `verify_error` when legacy task state remains `exited`, and ignores closed
+tasks. Local configuration supplies only an argv template; there is no built-in destination or transport.
+The placeholders are `{task_id}`, `{status}`, `{owner}`, `{question}` (first 500 characters), and `{hint}`.
+Commands run without a shell, with closed stdin, captured output and a 30-second timeout. Errors only
+log to stderr, leaving other reconciliation actions and its single JSON output intact.
+
+`$YARDGOAT_HOME/notified/<task_id>.json` remembers every successful `(task_id, status, SHA-256 of the
+full question)` tuple. A separate per-task lock prevents concurrent reconcilers from sending the same
+tuple; returning to an already delivered tuple does not resend it. Only exit 0 records success, written
+atomically. Failed commands or bookkeeping writes retry on the next reconcile; a crash between external
+delivery and its local record can therefore redeliver, so hooks may also deduplicate on their side.

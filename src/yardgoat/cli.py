@@ -32,7 +32,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import adapters, contract, pool, runner
+from . import adapters, contract, notify, pool, report, runner
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 REFUSED = 3
@@ -518,7 +518,8 @@ def cmd_reconcile(a) -> int:
         rc, verdict = do_close(td, owner, actor_note="auto_close by reconcile")
         if verdict:
             report.append({"task_id": td.task_id, "run_id": td.state()["verdict"]["run_id"], "auto_closed": verdict})
-    print(json.dumps({"reconciled_at": now(), "actions": report}, ensure_ascii=False))
+    notified = notify.notify_pending(cfg)
+    print(json.dumps({"reconciled_at": now(), "actions": report, "notified": notified}, ensure_ascii=False))
     return 0
 
 
@@ -738,6 +739,7 @@ def cmd_events(a) -> int:
 def main(argv=None) -> int:
     P = argparse.ArgumentParser(prog="yardgoat", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = P.add_subparsers(dest="cmd", required=True)
+    report.register(sub)
     s = sub.add_parser("submit"); s.add_argument("spec"); s.add_argument("--as", dest="as_", required=True)
     s = sub.add_parser("dispatch"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s = sub.add_parser("status"); s.add_argument("task_id", nargs="?"); s.add_argument("--json", action="store_true")
@@ -767,6 +769,8 @@ def main(argv=None) -> int:
     s = sub.add_parser("events"); s.add_argument("task_id")
     s = sub.add_parser("_run"); s.add_argument("task_id"); s.add_argument("run_id")
     a = P.parse_args(argv)
+    if hasattr(a, "handler"):
+        return a.handler(a)
     if a.cmd == "_run":
         return runner.run_and_receipt(TaskDir(a.task_id), a.run_id)
     if a.cmd == "_station":
