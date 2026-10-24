@@ -178,7 +178,8 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
         elif last and last["state"] == "running" and not _alive(last):
             spec = td.spec()
             if adapter_kind(spec) == "pool":
-                outcome = pool.unfinished_outcome(last["pool"], last.get("station", ""), cfg, last)
+                outcome = lambda fresh: pool.unfinished_outcome(
+                    fresh["pool"], fresh.get("station", ""), cfg, fresh, task_id=td.task_id)
             else:
                 outcome = adapters.get(adapter_kind(spec), cfg).poll(td, last, spec, cfg)
             if outcome:
@@ -367,12 +368,23 @@ def _status_obj(td: TaskDir) -> dict:
         rr["receipt"] = json.loads(rec.read_text()) if rec.exists() else None
         runs.append(rr)
     ad = td.spec().get("adapter", {})
-    health = doctor.pool_report(ad["pool"]) if ad.get("kind") == "pool" else None
-    backoff = pool.provider_backoff(ad["pool"], runner.config()) if ad.get("kind") == "pool" else None
+    name = ad.get("pool") if ad.get("kind") == "pool" else None
+    cfg = runner.config()
+    missing_pool = bool(name and not pool.pools(cfg).get(name))
+    health = doctor.pool_report(name) if name and not missing_pool else None
+    backoff = pool.provider_backoff(name, cfg) if name and not missing_pool else None
+    problem = f"池子已不在配置中：{name}" if missing_pool else doctor.failure_message(name or "", health)
+    if backoff:
+        backoff = {**backoff, "pool": name}
     return {"task_id": td.task_id, "status": st["status"], "owner": st["owner"], "owner_history": st["owner_history"],
             "pool_backoff": backoff,
-            "pool_doctor": health, "pool_problem": doctor.failure_message(ad.get("pool", ""), health),
+            "pool_doctor": health, "pool_problem": problem,
             "verdict": st["verdict"], "question": st.get("question"), "runs": runs, "drift": contract.drift(frozen_of(td, st))}
+
+
+def _backoff_text(record: dict) -> str:
+    return (f"pool={record['pool']} {record['status']} account={record.get('account_alias') or '-'} "
+            f"until={record['until']}: {record['reason']}")
 
 
 def cmd_status(a) -> int:
@@ -398,8 +410,7 @@ def cmd_status(a) -> int:
         if o["pool_problem"]:
             print(f"  {o['pool_problem']}")
         if o["pool_backoff"]:
-            b = o["pool_backoff"]
-            print(f"  provider_refused account={b['account_alias']} until={b['until']}: {b['reason']}")
+            print(f"  {_backoff_text(o['pool_backoff'])}")
         if o["question"]:
             print(f"  QUESTION: {o['question']['text'][:200]}")
         for r in o["runs"]:
@@ -411,7 +422,7 @@ def cmd_status(a) -> int:
         if o["drift"]:
             print(f"  DRIFT: {o['drift']}")
     for item in unlisted_pools:
-        print(item["reason"])
+        print(_backoff_text(item) if "until" in item else item["reason"])
     return 0
 
 
@@ -530,13 +541,22 @@ def cmd_answer(a) -> int:
 
 def cmd_inbox(a) -> int:
     items = []
+    cfg = runner.config()
+    missing_pools = set()
     for t in list_tasks():
-        st = TaskDir(t).state()
+        td = TaskDir(t)
+        st = td.state()
+        ad = td.spec().get("adapter", {})
+        if ad.get("kind") == "pool" and not pool.pools(cfg).get(ad["pool"]):
+            missing_pools.add(ad["pool"])
         if st["status"] in ("parked", "exhausted", "submit_unknown", "provider_refused") or (st["runs"] and st["runs"][-1]["state"] == "verify_error"):
             items.append({"task_id": t, "status": st["status"], "owner": st["owner"],
                           "question": (st.get("question") or {}).get("text")})
-    for name in pool.pools(runner.config()):
-        backoff = pool.provider_backoff(name, runner.config())
+    for name in sorted(missing_pools):
+        items.append({"pool": name, "task_id": None, "owner": None, "status": "pool_unconfigured",
+                      "question": f"池子已不在配置中：{name}"})
+    for name in pool.pools(cfg):
+        backoff = pool.provider_backoff(name, cfg)
         if backoff:
             items.append({**backoff, "pool": name, "task_id": None, "owner": None, "question": backoff["reason"]})
         message = doctor.failure_message(name, doctor.pool_report(name))
@@ -546,7 +566,10 @@ def cmd_inbox(a) -> int:
         print(json.dumps(items, ensure_ascii=False, indent=1))
     else:
         for i in items:
-            print(f"{i['task_id'] or i.get('pool')} [{i['status']}] owner={i['owner']}\n  {i['question'] or '(no question recorded)'}")
+            if "until" in i:
+                print(_backoff_text(i))
+            else:
+                print(f"{i['task_id'] or i.get('pool')} [{i['status']}] owner={i['owner']}\n  {i['question'] or '(no question recorded)'}")
     return 0
 
 
@@ -579,9 +602,10 @@ def cmd_reconcile(a) -> int:
                 continue
             if last["state"] == "running" and adapter_kind(spec) == "pool":
                 if not _alive(last):
-                    outcome = pool.unfinished_outcome(last["pool"], last.get("station", ""), cfg, last)
-                    if runner.record_outcome(td, last["run_id"], outcome):
-                        report.append({"task_id": t, "run_id": last["run_id"], "observed": outcome["state"]})
+                    receipt = runner.record_outcome(td, last["run_id"], lambda fresh: pool.unfinished_outcome(
+                        fresh["pool"], fresh.get("station", ""), cfg, fresh, task_id=t))
+                    if receipt:
+                        report.append({"task_id": t, "run_id": last["run_id"], "observed": receipt["status"]})
                 continue
             if last["state"] == "exited" and spec.get("auto_close") and st["status"] == "exited":
                 to_close.append((td, st["owner"]))  # verified after the schedule lock is released (review 3, F1)
@@ -771,8 +795,8 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                     continue
                 rd = td.run_dir(run["run_id"]); rd.mkdir(parents=True, exist_ok=True)
                 (rd / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
-                run.update(state="running", station=station, started_at=now(), claimed_epoch=time.time(),
-                           log_start=pool.log_offset(pool_name, station),
+                run.update(state="running", station=station, task_id=t, started_at=now(), claimed_epoch=time.time(),
+                           log_start=pool.log_position(pool_name, station),
                            blocked_before=runner.file_fingerprint(Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")),
                            write_set=scheduling.write_set(spec))
                 st["status"] = "running"
@@ -784,6 +808,8 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                 rec = pool.get_station(pool_name, station)
                 rec.setdefault("tasks", []).append(f"{t}/{out['run_id']}")
                 rec["current"] = {"task_id": t, "run_id": out["run_id"], "deadline": deadline}
+                rec.pop("execution", None)
+                rec.pop("execution_ref", None)
                 write_json(pool.station_file(pool_name, station), rec)
             td.event("run.claimed", station, run_id=out["run_id"], pool=pool_name)
             return 0, out
@@ -802,29 +828,33 @@ def finish_card(task_id: str, run_id: str, station: str, late: bool = False) -> 
         return 3, {"result": "REFUSED", "reason": f"{run_id} is no longer running"}
     spec = td.spec()
     srec = pool.get_station(run["pool"], station) or {}
-    cur = srec.get("current") or {}
     if late:
         # A late finish invokes the actual timeout handler; 124 alone is never timeout evidence.
-        pool.record_execution(run["pool"], station, cur, exit_code=124, timed_out=True)
+        pool.record_execution(run["pool"], station, {"task_id": task_id, "run_id": run_id}, exit_code=124, timed_out=True)
         if srec.get("worker_pgid"):
             runner.kill_group(srec["worker_pgid"])
-    run = {**run, "log_end": pool.log_offset(run["pool"], station),
-           "execution": {"exit_code": 124 if late else 0, "timed_out": late}}
     bf = Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")
-    if "blocked_before" not in run and bf.is_file() and bf.stat().st_mtime < run.get("claimed_epoch", 0):
-        run["blocked_before"] = runner.file_fingerprint(bf)  # conservative legacy fallback
-    out = pool.unfinished_outcome(run["pool"], station, runner.config(), run, default="exited", blocked_path=bf)
-    rec = runner.record_outcome(td, run_id, out)   # checks, under the task lock, that the run is still running
+
+    def classify(fresh_run):
+        nonlocal run
+        run = fresh_run  # record_outcome re-reads execution and commits while holding the task lock
+        run.setdefault("log_end", pool.log_position(run["pool"], station))
+        if "blocked_before" not in run and bf.is_file() and bf.stat().st_mtime < run.get("claimed_epoch", 0):
+            run["blocked_before"] = runner.file_fingerprint(bf)  # conservative legacy fallback
+        return pool.unfinished_outcome(run["pool"], station, runner.config(), run,
+                                       default="exited", blocked_path=bf, task_id=task_id)
+
+    rec = runner.record_outcome(td, run_id, classify)
     with pool.station_lock(run["pool"], station):  # clear the station's hold only if it is *this* card (review 3, F2)
         srec = pool.get_station(run["pool"], station) or {}
         cur = srec.get("current") or {}
         if cur.get("task_id") == task_id and cur.get("run_id") == run_id:
             srec["current"] = None
-            srec["idle_log_offset"] = run["log_end"]
+            srec["idle_log_offset"] = run.get("log_end", pool.log_position(run["pool"], station))
             write_json(pool.station_file(run["pool"], station), srec)
     if rec is None:
         return 3, {"result": "REFUSED", "reason": f"{run_id} is no longer running (timed out, lost or already finished)"}
-    return 0, {"task_id": task_id, "run_id": run_id, "result": out["state"]}
+    return 0, {"task_id": task_id, "run_id": run_id, "result": runner.STATE_OF.get(rec["status"], "exited")}
 
 
 def _via_mailbox(op: dict) -> int:
