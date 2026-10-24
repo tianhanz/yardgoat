@@ -263,7 +263,8 @@ def station_script(name: str, station: str, c: dict, cfg: dict, mb: Path,
                    probe_argv: list[str] | None = None) -> str:
     root = os.path.expanduser(c.get("root", str(pool_dir(name) / "stations")))
     return runner.shell_script(root, cfg, station_argv(name, station, c, cfg, probe_argv),
-                               {"YARDGOAT_STATION": station, "YARDGOAT_MAILBOX": str(mb)})
+                               {"YARDGOAT_STATION": station, "YARDGOAT_MAILBOX": str(mb),
+                                "YARDGOAT_MAILBOX_HOME": str(home().resolve())})
 
 
 def station_env() -> dict:
@@ -420,6 +421,9 @@ def serve_mailbox(name: str, station: str, mb: Path, cli, respond_only: bool = F
             continue  # still being written; next tick
         if respond_only:
             out = (3, {"result": "REFUSED", "reason": "station is shutting down"})
+        elif r.get("home") and Path(r["home"]).resolve() != home().resolve():
+            # a nested command (e.g. a test suite run by the worker) pointed at another task store
+            out = (3, {"result": "REFUSED", "reason": f"request targets task store {r['home']}, this station serves {home()}"})
         elif time.time() > float(r.get("expires", 1e18)):
             out = (3, {"result": "REFUSED", "reason": "request expired before the station handled it"})
         elif r.get("op") == "claim":

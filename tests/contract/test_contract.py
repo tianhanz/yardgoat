@@ -15,6 +15,8 @@ SRC = str(Path(__file__).resolve().parents[2] / "src")
 def env(tmp_path):
     e = dict(os.environ, YARDGOAT_HOME=str(tmp_path / "home"), YARDGOAT_NO_TMUX="1",
              YARDGOAT_CONFIG=str(tmp_path / "no-config.json"), PYTHONPATH=SRC)
+    for k in ("YARDGOAT_MAILBOX", "YARDGOAT_MAILBOX_HOME", "YARDGOAT_STATION"):
+        e.pop(k, None)  # the suite may itself run inside a station; never talk to the real wrapper
     return e
 
 

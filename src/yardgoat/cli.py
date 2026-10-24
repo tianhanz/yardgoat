@@ -857,6 +857,18 @@ def finish_card(task_id: str, run_id: str, station: str, late: bool = False) -> 
     return 0, {"task_id": task_id, "run_id": run_id, "result": runner.STATE_OF.get(rec["status"], "exited")}
 
 
+def _station_mailbox() -> bool:
+    """True when this command runs inside a station AND targets the store that station serves.
+
+    A worker may run nested commands (a test suite, a demo) with their own YARDGOAT_HOME; those must
+    use their own store directly instead of handing requests to the real station wrapper.
+    Stations started before YARDGOAT_MAILBOX_HOME existed only set YARDGOAT_MAILBOX (legacy: mailbox)."""
+    if not os.environ.get("YARDGOAT_MAILBOX"):
+        return False
+    served = os.environ.get("YARDGOAT_MAILBOX_HOME")
+    return served is None or Path(served).resolve() == home().resolve()
+
+
 def _via_mailbox(op: dict) -> int:
     """Inside a station: hand the request to the station wrapper (outside any sandbox) and wait for its answer."""
     import uuid
@@ -864,7 +876,7 @@ def _via_mailbox(op: dict) -> int:
     rid = uuid.uuid4().hex[:12]
     tmp = mb / f".req-{rid}.tmp"
     end = time.time() + 300
-    tmp.write_text(json.dumps({**op, "expires": end - 5}, ensure_ascii=False))
+    tmp.write_text(json.dumps({**op, "home": str(home().resolve()), "expires": end - 5}, ensure_ascii=False))
     os.replace(tmp, mb / f"req-{rid}.json")
     resp = mb / f"resp-{rid}.json"
     while time.time() < end:
@@ -879,7 +891,7 @@ def _via_mailbox(op: dict) -> int:
 
 
 def cmd_claim(a) -> int:
-    if os.environ.get("YARDGOAT_MAILBOX"):
+    if _station_mailbox():
         return _via_mailbox({"op": "claim"})
     rc, out = claim_card(a.pool, a.station)
     print(json.dumps(out, ensure_ascii=False))
@@ -887,7 +899,7 @@ def cmd_claim(a) -> int:
 
 
 def cmd_finish(a) -> int:
-    if os.environ.get("YARDGOAT_MAILBOX"):
+    if _station_mailbox():
         return _via_mailbox({"op": "finish", "task_id": a.task_id, "run_id": a.run})
     rc, out = finish_card(a.task_id, a.run, a.station)
     print(json.dumps(out, ensure_ascii=False))
