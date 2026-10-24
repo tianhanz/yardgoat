@@ -9,6 +9,8 @@
   yardgoat park <task_id> --as <controller> --question Q  stop and ask a human (also automatic: worker writes out/BLOCKED.md)
   yardgoat inbox [--json]                                parked tasks and their questions
   yardgoat answer <task_id> --as <who> (--text T | --file F)   answer a parked task; reconcile resumes it
+  yardgoat approve <task_id> --as <who> [--note N]        approve the frozen card (required for risk l3)
+  yardgoat deliver <task_id> --as <controller>            retry unfinished on_pass steps after PASS
   yardgoat reconcile                                     poll adapter runs, mark lost runs, resume answered tasks
   yardgoat archive <task_id> --as <controller> --reason R  close out a task that will not continue (kept, hidden from inbox)
   yardgoat quick "<card text>" --verify CMD --as <who> [--pool P | --host H] [...]   one-line submit + dispatch
@@ -20,7 +22,7 @@
 Direct runs are capped by the local config "max_concurrent" (default unlimited). Beyond the cap a dispatch is
 accepted as "queued" and `reconcile` starts it when a slot frees up, oldest first.
 
-Exit codes: 0 ok · 3 refused by policy (nothing changed) · 2 usage/spec error · 1 verifier FAIL.
+Exit codes: 0 ok · 3 refused by policy · 2 usage/spec error · 1 verifier FAIL or delivery failure.
 """
 from __future__ import annotations
 
@@ -32,7 +34,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import adapters, contract, doctor, notify, pool, report, runner, scheduling
+from . import adapters, contract, delivery, doctor, notify, pool, report, runner, scheduling
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 REFUSED = 3
@@ -91,6 +93,8 @@ def frozen_of(td: TaskDir, st: dict) -> dict:
         return st["frozen"]
     auth = read_json(f)
     out = dict(auth["frozen"])
+    if auth.get("content_hash") != st.get("content_hash"):
+        out["<task.json content hash was altered>"] = ""
     if auth["frozen"] != st["frozen"]:
         out["<task.json frozen hashes were altered>"] = ""
     if "spec" in auth:
@@ -100,6 +104,51 @@ def frozen_of(td: TaskDir, st: dict) -> dict:
         except (OSError, ValueError):
             out["<spec.json is unreadable>"] = ""
     return out
+
+
+def checked_drift(td: TaskDir, st: dict) -> list[str]:
+    """Mutation paths call under the task lock: observed drift permanently revokes approval."""
+    changed = contract.drift(frozen_of(td, st))
+    approval = st.get("approval")
+    if changed and approval and not approval.get("invalidated_at"):
+        approval.update(invalidated_at=now(), drift=changed)
+        td.event("task.approval_invalidated", "yardgoat", approval=approval, reason="frozen content drift")
+    return changed
+
+
+def approver_allowed(who: str, cfg: dict) -> bool:
+    allowed = cfg.get("approvers")
+    return "approvers" not in cfg or (isinstance(allowed, list) and
+            all(isinstance(item, str) for item in allowed) and who in allowed)
+
+
+def approval_problem(td: TaskDir, st: dict, spec: dict, cfg: dict, changed: list[str]) -> str | None:
+    if spec.get("risk", "l2") != "l3":
+        return None
+    approval = st.get("approval") or {}
+    if (changed or not approval.get("by") or not approval.get("at") or approval.get("invalidated_at") or
+            approval.get("content_hash") != st["content_hash"] or not approver_allowed(approval.get("by"), cfg)):
+        return f"需要 approve：yardgoat approve {td.task_id} --as <approver>（等审批）"
+    return None
+
+
+def cmd_approve(a) -> int:
+    td = TaskDir(a.task_id)
+    if not td.exists:
+        return refuse(f"unknown task {a.task_id}")
+    if not a.as_.strip() or not approver_allowed(a.as_, runner.config()):
+        return refuse(f"{a.as_!r} is not in the configured approvers")
+    with td.locked() as box:
+        st = box["state"]
+        changed = checked_drift(td, st)
+        if changed:
+            return refuse(f"frozen files changed since submit: {changed}; approval requires the frozen card")
+        if st["status"] in ("archived", "exhausted"):
+            return refuse(f"task is {st['status']}")
+        st["approval"] = {"by": a.as_, "at": now(), "note": a.note or "", "content_hash": st["content_hash"]}
+        td.event("task.approved", a.as_, approval=st["approval"])
+    print(json.dumps({"task_id": td.task_id, "result": "approved", "approval": st["approval"]}, ensure_ascii=False))
+    return 0
 
 
 DIRECT_MODES = ("tmux", "process")
@@ -217,6 +266,8 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
             run_id = f"r{len(st['runs']) + 1}"
             td.run_dir(run_id).mkdir(parents=True, exist_ok=True)
             run = {"run_id": run_id, "state": "queued", "dispatched_by": who, "queued_at": now(), "mode": "queued"}
+            if st.get("approval"):
+                run["approval"] = dict(st["approval"])
             if adapter_kind(spec) == "pool":
                 run.update(mode="pool", pool=spec["adapter"]["pool"])
             st["runs"].append(run)
@@ -246,9 +297,12 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
 
 
 def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
-    d = contract.drift(frozen_of(td, st))
+    d = checked_drift(td, st)
     if d:
         return f"frozen files changed since submit: {d}"
+    problem = approval_problem(td, st, spec, cfg, d)
+    if problem:
+        return problem
     if not Path(spec["workdir"]).is_dir():
         return f"workdir does not exist: {spec['workdir']}"
     if adapter_kind(spec) == "pool":
@@ -321,6 +375,8 @@ def start_queued(td: TaskDir, actor: str, actor_note: str = "", echo: bool = Tru
             run["state"] = "launch_failed"; run["reason"] = problem; st["status"] = "accepted"
             return refuse(problem)
         run.update(state="running", started_at=now(), write_set=scheduling.write_set(spec))
+        if st.get("approval"):
+            run["approval"] = dict(st["approval"])
         st["status"] = "running"
         ad = adapters.get(adapter_kind(spec), cfg)
         try:
@@ -360,6 +416,8 @@ def cmd_dispatch(a) -> int:
 
 def _status_obj(td: TaskDir) -> dict:
     st = td.state()
+    changed = contract.drift(frozen_of(td, st))
+    needs_approval = approval_problem(td, st, td.spec(), runner.config(), changed)
     runs = []
     for r in st["runs"]:
         rr = dict(r)
@@ -377,9 +435,12 @@ def _status_obj(td: TaskDir) -> dict:
     if backoff:
         backoff = {**backoff, "pool": name}
     return {"task_id": td.task_id, "status": st["status"], "owner": st["owner"], "owner_history": st["owner_history"],
+            "approval": st.get("approval"), "approval_required": bool(needs_approval),
+            "delivery_failed": st.get("delivery_failed", False), "delivery_reason": st.get("delivery_reason"),
+            "on_pass": st.get("on_pass", []),
             "pool_backoff": backoff,
             "pool_doctor": health, "pool_problem": problem,
-            "verdict": st["verdict"], "question": st.get("question"), "runs": runs, "drift": contract.drift(frozen_of(td, st))}
+            "verdict": st["verdict"], "question": st.get("question"), "runs": runs, "drift": changed}
 
 
 def _backoff_text(record: dict) -> str:
@@ -407,6 +468,10 @@ def cmd_status(a) -> int:
         return 0
     for o in out:
         print(f"{o['task_id']}: {o['status']}  owner={o['owner']}  verdict={(o['verdict'] or {}).get('verdict')}")
+        if o["approval_required"]:
+            print("  等审批：需要 approve")
+        if o["delivery_reason"]:
+            print(f"  {o['delivery_reason']}")
         if o["pool_problem"]:
             print(f"  {o['pool_problem']}")
         if o["pool_backoff"]:
@@ -455,12 +520,18 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
         st = box["state"]
         if st["owner"] != who:
             return refuse(f"owner is {st['owner']}, not {who}"), None
+        if st["status"] == "verified" and td.spec().get("on_pass"):
+            # Verification is already durable. Retrying failed delivery is explicit via deliver.
+            if echo:
+                print(json.dumps({"task_id": td.task_id, "run_id": st["verdict"]["run_id"], "verdict": "PASS",
+                                  "delivery_failed": st.get("delivery_failed", False)}))
+            return (1 if st.get("delivery_failed") else 0), "PASS"
         if st["status"] in ("archived", "verified"):
             return refuse(f"task is {st['status']}"), None
         last = st["runs"][-1] if st["runs"] else None
         if not last or last["state"] not in ("exited", "verify_error"):
             return refuse("no exited run waiting for verification"), None
-        d = contract.drift(frozen_of(td, st))
+        d = checked_drift(td, st)
         if d:
             return refuse(f"frozen files changed since submit: {d}"), None
         spec = td.spec()
@@ -490,9 +561,44 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
         write_json(rec_p, rec)
         st["verdict"] = {"run_id": last["run_id"], "verdict": verdict, "by": who, "at": checked}
     td.event("run.verified", who, run_id=last["run_id"], verdict=verdict, note=actor_note)
+    delivery_rc = do_deliver(td, who) if verdict == "PASS" and spec.get("on_pass") else 0
     if echo:
-        print(json.dumps({"task_id": td.task_id, "run_id": last["run_id"], "verdict": verdict}))
-    return (0 if verdict == "PASS" else (1 if verdict == "FAIL" else 2)), verdict
+        result = {"task_id": td.task_id, "run_id": last["run_id"], "verdict": verdict}
+        if spec.get("on_pass") and verdict == "PASS":
+            result["delivery_failed"] = td.state().get("delivery_failed", False)
+            result["delivery_exit_code"] = delivery_rc
+        print(json.dumps(result))
+    return (delivery_rc if verdict == "PASS" else (1 if verdict == "FAIL" else 2)), verdict
+
+
+def do_deliver(td: TaskDir, who: str, echo: bool = False) -> int:
+    with td.locked() as box:
+        st = box["state"]
+        if st["owner"] != who:
+            return refuse(f"owner is {st['owner']}, not {who}")
+        if st["status"] != "verified" or (st.get("verdict") or {}).get("verdict") != "PASS":
+            return refuse("deliver requires a verified task with a PASS verdict")
+        changed = checked_drift(td, st)
+        if changed:
+            return refuse(f"frozen files changed since submit: {changed}")
+        spec, cfg = td.spec(), runner.config()
+        problem = approval_problem(td, st, spec, cfg, changed)
+        if problem:
+            return refuse(problem)
+        try:
+            rc = delivery.run_locked(td, st, spec, who, cfg)
+        except (contract.SpecError, ValueError) as exc:
+            print(f"delivery error: {exc}", file=sys.stderr)
+            return 2
+    if echo:
+        print(json.dumps({"task_id": td.task_id, "result": "delivery_failed" if rc else "delivered",
+                          "delivery_failed": st.get("delivery_failed", False), "on_pass": st.get("on_pass", [])}, ensure_ascii=False))
+    return rc
+
+
+def cmd_deliver(a) -> int:
+    td = TaskDir(a.task_id)
+    return do_deliver(td, a.as_, echo=True) if td.exists else refuse(f"unknown task {a.task_id}")
 
 
 def cmd_park(a) -> int:
@@ -549,6 +655,17 @@ def cmd_inbox(a) -> int:
         ad = td.spec().get("adapter", {})
         if ad.get("kind") == "pool" and not pool.pools(cfg).get(ad["pool"]):
             missing_pools.add(ad["pool"])
+        if st["status"] == "verified" and st.get("delivery_failed"):
+            reason = st.get("delivery_reason") or delivery.failure_reason(st.get("on_pass", []))
+            items.append({"task_id": t, "status": "verified", "owner": st["owner"],
+                          "delivery_failed": True, "reason": reason, "question": reason})
+            continue
+        if st["status"] not in ("archived", "verified", "exhausted") and td.spec().get("risk") == "l3":
+            problem = approval_problem(td, st, td.spec(), cfg, contract.drift(frozen_of(td, st)))
+            if problem:
+                items.append({"task_id": t, "status": st["status"], "owner": st["owner"], "reason": "等审批",
+                              "question": (st.get("question") or {}).get("text"), "hint": problem})
+                continue
         if st["status"] in ("parked", "exhausted", "submit_unknown", "provider_refused") or (st["runs"] and st["runs"][-1]["state"] == "verify_error"):
             items.append({"task_id": t, "status": st["status"], "owner": st["owner"],
                           "question": (st.get("question") or {}).get("text")})
@@ -569,7 +686,8 @@ def cmd_inbox(a) -> int:
             if "until" in i:
                 print(_backoff_text(i))
             else:
-                print(f"{i['task_id'] or i.get('pool')} [{i['status']}] owner={i['owner']}\n  {i['question'] or '(no question recorded)'}")
+                print(f"{i['task_id'] or i.get('pool')} [{i['status']}] owner={i['owner']}\n  "
+                      f"{i.get('reason') or i['question'] or '(no question recorded)'}")
     return 0
 
 
@@ -800,6 +918,8 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                            blocked_before=runner.file_fingerprint(Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")),
                            write_set=scheduling.write_set(spec))
                 st["status"] = "running"
+                if st.get("approval"):
+                    run["approval"] = dict(st["approval"])
                 out = {"result": "CLAIMED", "task_id": t, "run_id": run["run_id"], "workdir": spec["workdir"],
                        "prompt": str(rd / "prompt.md"), "blocked_file": spec.get("blocked_file", "out/BLOCKED.md"),
                        "outputs": spec["outputs"]}
@@ -957,6 +1077,9 @@ def main(argv=None) -> int:
     s = sub.add_parser("takeover"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s.add_argument("--from", dest="from_", required=True)
     s = sub.add_parser("close"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
+    s = sub.add_parser("approve"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
+    s.add_argument("--note")
+    s = sub.add_parser("deliver"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s = sub.add_parser("park"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s.add_argument("--question", required=True)
     s = sub.add_parser("answer"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
@@ -993,7 +1116,7 @@ def main(argv=None) -> int:
     if a.cmd == "_doctor":
         return doctor.run_probe(Path(a.run_dir))
     return {"submit": cmd_submit, "dispatch": cmd_dispatch, "status": cmd_status, "takeover": cmd_takeover,
-            "close": cmd_close, "park": cmd_park, "answer": cmd_answer, "inbox": cmd_inbox,
+            "close": cmd_close, "approve": cmd_approve, "deliver": cmd_deliver, "park": cmd_park, "answer": cmd_answer, "inbox": cmd_inbox,
             "reconcile": cmd_reconcile, "archive": cmd_archive, "cancel": cmd_cancel, "quick": cmd_quick, "claim": cmd_claim, "finish": cmd_finish, "events": cmd_events, "doctor": cmd_doctor}[a.cmd](a)
 
 

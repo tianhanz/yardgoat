@@ -58,6 +58,45 @@ A task spec names the prompt file (`card`), the working directory, the expected 
 Schemas: [task](src/yardgoat/schemas/task.schema.json) · [receipt](src/yardgoat/schemas/receipt.schema.json) · [event](src/yardgoat/schemas/event.schema.json).
 Invariants and store layout: [docs/design.md](docs/design.md) · What it is for: [docs/PRD.md](docs/PRD.md).
 
+## Approval and delivery
+
+Tasks with `"risk": "l3"` need explicit approval before dispatch. They appear in `inbox` as `等审批`;
+dispatch without approval exits 3 with `需要 approve`.
+
+```bash
+yardgoat approve release-example --as reviewer --note "Reviewed the frozen card and verifier"
+yardgoat dispatch release-example --as controller
+```
+
+Optional local config `"approvers": ["reviewer"]` restricts who may approve (an empty list allows nobody).
+Without that setting, any nonempty identity may approve. Approval is bound to the frozen content hash;
+drift blocks execution and revokes approval when a mutation command checks it. Restoring the original
+files then requires a fresh approval. Changed content must be submitted under a new task id.
+`answer` supplies information only; `approve` leaves parked questions and their state unchanged.
+The approval identity, time and note are saved in task state, events and subsequent run receipts.
+
+A spec can declare ordered commands to execute as the owner after the frozen verifier returns PASS:
+
+```json
+"on_pass": [
+  {"name": "stage", "command": "mkdir -p delivered && cp out/result.txt delivered/result.txt"},
+  {"name": "check", "command": "test -s delivered/result.txt"}
+],
+"on_pass_timeout": 600
+```
+
+Commands use a shell and default to the task workdir. An optional step `cwd` is resolved relative to the
+spec directory. The per-step timeout comes from spec `on_pass_timeout`, then the same local config
+setting, then 600 seconds. Commands and their working directories are frozen as part of the task.
+`auto_close` executes the same steps on behalf of the current owner.
+
+The first nonzero step stops delivery, leaves the task `verified` with `delivery_failed: true`, and adds
+`收尾第 N 步 <name> 失败` to `inbox`. Its exit code and output tail are in the receipt and events.
+After resolving the failure, run `yardgoat deliver release-example --as controller` to retry that step
+and continue. Successful steps are preserved across retries and repeated `close`/`deliver` calls.
+Repeated `close` reports the existing result; retry delivery explicitly. Commands should also be
+idempotent across a controller crash between an external side effect and recording its success.
+
 ## Local wiring
 
 How a lane or account is chosen is your machine's business, not the task's. Put it in `~/.config/yardgoat/config.json`:

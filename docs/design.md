@@ -86,6 +86,16 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     absolute path in `status` and reconcile output. Every worker outcome releases its reservation; reconcile
     then starts eligible queued work (or makes pool cards available for claim). An uncertain remote submit
     retains its reservation because it may already be executing. Scope waits alone do not spawn stations.
+22. **Approval is separate from answers.** A frozen `risk: l3` card needs `approve` before dispatch, queued
+    start and pool claim. The optional local `approvers` list restricts accepted identities. Approval stores
+    `by`, `at`, `note` and `content_hash`; each starting run snapshots it into its eventual receipt.
+    `answer` never grants approval, and `approve` never edits the question or its state. Frozen-content
+    drift blocks execution; mutation checks mark an existing approval invalid permanently, even if the
+    bytes are later restored. `status` and `inbox` remain read-only and report current drift/approval needs.
+23. **Delivery follows PASS.** Only the current owner can run frozen `on_pass` steps. A step failure keeps
+    the verification verdict PASS and task status verified, sets `delivery_failed`, stops later steps,
+    and appears in inbox. `deliver` retries the first unsuccessful step; successful recorded steps are
+    skipped. Auto-close follows exactly the same verification and delivery path.
 
 ## Launch-chain health checks
 
@@ -144,7 +154,8 @@ too, so nested aliases cannot escape the reservation. Directory device/inode ide
 cycles; symlink-only loops keep an absolute prefix and are skipped when they cannot be traversed.
 Prefix comparison respects path-component boundaries, so `src/a` and `src/b`
 or `src` and `src-other` can run together. The reservation is saved on the running record until its outcome.
-Omitted or empty `scope` opts out for backwards compatibility. `risk` and `acceptance` remain descriptive.
+Omitted or empty `scope` opts out for backwards compatibility. `risk: l3` enforces the approval gate;
+`acceptance` remains descriptive.
 
 `depends_on: ["prepare-data", "build-tool"]` requires both upstream tasks to be verified before starting.
 The accepted dependency graph is immutable just like the rest of the spec; changing dependencies needs a new id.
@@ -175,6 +186,46 @@ so accepted work keeps moving when no controller session is alive.
 A controller that disappears mid-run loses nothing: the run keeps going, and a new controller needs only
 the task id. `yardgoat status <id>` shows owner, runs, liveness and receipts; `takeover` moves
 ownership; `close` verifies. The old owner can no longer dispatch or close.
+
+## Approval and post-PASS commands
+
+`approve <id> --as <identity> [--note text]` runs under the task lock and binds its record to the accepted
+content hash. This is a logical identity like the existing owner identity, not OS-user impersonation or
+authentication. Configured `approvers` is checked both when approving and when starting; an empty or
+malformed list grants nobody access. The owner and approver need not be the same identity. Approval
+does not waive ownership, dependencies, lane rules, frozen checks or attempt limits. An unapproved
+l3 task needs no run to appear in inbox (`reason: 等审批`). Approval events are `task.approved` and
+`task.approval_invalidated`; each receipt contains the approval snapshot used to start that run.
+
+`on_pass` is a list of objects with nonempty `name` and `command` strings and optional `cwd`. Omitted
+cwd defaults to workdir; explicit relative cwd resolves against the spec directory. The normalized steps
+are part of `content_hash`, so changing their commands, order or directories requires a new task id.
+An optional positive `on_pass_timeout` in the spec overrides the local config value (default 600 seconds).
+Delivery rechecks owner, PASS state, drift and l3 approval before invoking shell commands. They run in
+the controller's OS environment, attributed to the current task owner, with `YARDGOAT_OWNER`,
+`YARDGOAT_TASK_ID` and `YARDGOAT_RUN_DIR` set. No worker or adapter executes these commands.
+
+The task lock serializes delivery against concurrent close/deliver/takeover/archive calls. Delivery runs
+outside the machine schedule lock. Each command has its own process group; timeout kills the group
+and records exit 124, while startup errors record 127. Combined stdout/stderr goes to
+`runs/<run>/on-pass-<step>-<attempt>.log`; the last 4000 bytes are decoded into `output_tail` in the receipt
+and `task.on_pass_finished` event. `task.on_pass_started` records each start. Step records also carry
+the one-based step number, command, cwd, owner, attempt, timestamps, exit code and timeout flag.
+
+The receipt's `on_pass` list is the progress journal: it holds the latest attempt for each started step,
+while events and logs retain earlier attempts. A successful record (`exit_code: 0`) is always skipped,
+including duplicate step names. Each result is atomically written to the receipt before task state and
+before the next step. `deliver` reads this journal to recover a receipt-first commit interrupted before
+task.json was saved. A started step without a recorded result remains retryable. External side effects
+cannot be committed atomically with local files; commands must tolerate retry after a crash in that gap.
+
+The task and receipt retain `verified`/`passed` on delivery failure, with `delivery_failed: true` and a
+task `delivery_reason` naming the failed step. Successful retry clears the flag/reason and inbox entry.
+`close` exits 1 for delivery failure while still reporting `verdict: PASS`; `deliver` exits 0 on completion,
+1 on a failed step, 2 for configuration errors, or 3 for policy refusal. Repeated close on a verified task
+with on_pass reports the existing delivery flag without re-verifying or retrying commands. Recovery or
+retry uses `deliver`, including after ownership changes. Existing close behavior is retained for tasks
+without on_pass. Auto-close uses the same owner and preserves reconcile's single JSON output.
 
 ## Not yet
 

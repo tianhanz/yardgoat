@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 
@@ -93,6 +94,18 @@ def normalize(spec: dict, base: Path, metadata_defaults: bool = True) -> dict:
         s.setdefault("risk", "l2")
     if not isinstance(s.get("risk", "l2"), str) or s.get("risk", "l2") not in ("l1", "l2", "l3"):
         raise SpecError("risk must be l1, l2 or l3")
+    if "on_pass" in s:
+        if not isinstance(s["on_pass"], list):
+            raise SpecError("on_pass must be a list of steps")
+        for step in s["on_pass"]:
+            if not isinstance(step, dict) or any(not isinstance(step.get(k), str) or not step[k].strip()
+                                                 for k in ("name", "command")):
+                raise SpecError("on_pass steps require nonempty name and command strings")
+            if "cwd" in step and (not isinstance(step["cwd"], str) or not step["cwd"].strip()):
+                raise SpecError("on_pass.cwd must be a nonempty path string")
+            step["cwd"] = _abs(base, step.get("cwd", s["workdir"]))
+    if "on_pass_timeout" in s:
+        positive_timeout(s["on_pass_timeout"])
     if "acceptance" in s and not isinstance(s["acceptance"], str):
         raise SpecError("acceptance must be a string")
     if not isinstance(v["command"], str) or not all(isinstance(x, str) for x in v["freeze"]):
@@ -106,6 +119,12 @@ def normalize(spec: dict, base: Path, metadata_defaults: bool = True) -> dict:
     s.setdefault("authority", "")
     s.setdefault("escalate_when", [])
     return s
+
+
+def positive_timeout(value) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise SpecError("on_pass_timeout must be a finite number > 0 (seconds)")
+    return float(value)
 
 
 def freeze(spec: dict) -> dict:
