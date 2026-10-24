@@ -84,25 +84,38 @@ def frozen_of(td: TaskDir, st: dict) -> dict:
     return st["frozen"]
 
 
+DIRECT_MODES = ("tmux", "process")
+IN_FLIGHT = ("queued", "running", "submit_unknown")
+
+
 def _alive(run: dict) -> bool:
-    if run.get("mode") == "file-pool":
-        return run["state"] == "running"
-    if run.get("mode") == "pool":
-        if run["state"] == "queued":
-            return True
+    """Is this run still in flight? Only direct runs are judged by local processes (their process group)."""
+    mode = run.get("mode")
+    if run["state"] in ("queued", "submit_unknown"):
+        return True
+    if run["state"] != "running":
+        return False
+    if mode in DIRECT_MODES:
+        return runner.pgid_alive(run.get("worker_pgid")) or runner.pid_alive(run.get("worker_pid")) \
+            or runner.pid_alive(run.get("pid"))
+    if mode == "pool":
         rec = home() / "pools" / run.get("pool", "") / "stations" / f"{run.get('station', '')}.json"
+        if not run.get("station"):
+            return True
         if not rec.exists():
             return False
         r = read_json(rec)
         return r.get("state") == "running" and (runner.pid_alive(r.get("pid")) or runner.pid_alive(r.get("launcher_pid")))
-    return runner.pid_alive(run.get("worker_pid")) or runner.pid_alive(run.get("pid"))
+    return True  # file-pool and plugin adapters: in flight until their poll() reports an outcome
+
+
+def _receipt_waiting(td: TaskDir, run: dict) -> bool:
+    return run["state"] == "running" and (td.run_dir(run["run_id"]) / "receipt.json").exists()
 
 
 def _active_run(st: dict):
     last = st["runs"][-1] if st["runs"] else None
-    if last and last["state"] == "queued":
-        return last
-    return last if last and last["state"] == "running" and _alive(last) else None
+    return last if last and last["state"] in IN_FLIGHT and _alive(last) else None
 
 
 def direct_slots_in_use() -> int:
@@ -110,9 +123,13 @@ def direct_slots_in_use() -> int:
     for t in list_tasks():
         st = TaskDir(t).state()
         last = st["runs"][-1] if st["runs"] else None
-        if last and last["state"] == "running" and last.get("mode") in ("tmux", "process") and _alive(last):
+        if last and last["state"] == "running" and last.get("mode") in DIRECT_MODES and _alive(last):
             n += 1
     return n
+
+
+def machine_load(cfg: dict) -> int:
+    return direct_slots_in_use() + pool.all_live_stations(cfg)
 
 
 def lane_problem(spec: dict, cfg: dict) -> str | None:
@@ -130,63 +147,78 @@ def lane_problem(spec: dict, cfg: dict) -> str | None:
 
 
 def do_dispatch(td: TaskDir, who: str, actor_note: str = "", echo: bool = True) -> int:
-    """Accept a new attempt: start it now, or queue it when the direct-run cap is reached."""
+    """Accept a new attempt as a queued run; start it at once if capacity allows (all under the schedule lock)."""
+    with pool.schedule_lock():
+        return do_dispatch_locked(td, who, actor_note, echo)
+
+
+def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -> int:
     cfg = runner.config()
-    with td.locked() as box:
-        st = box["state"]
-        if st["owner"] != who:
-            return refuse(f"owner is {st['owner']}, not {who}")
-        if st["status"] in ("verified", "exhausted", "archived"):
-            return refuse(f"task is {st['status']}")
-        if st["status"] == "parked":
-            return refuse("task is parked waiting for an answer; use `yardgoat answer`")
-        act = _active_run(st)
-        if act:
-            if echo:
-                print(json.dumps({"task_id": td.task_id, "result": "already-" + act["state"], "run_id": act["run_id"]}))
-            return REFUSED
-        if st["runs"] and st["runs"][-1]["state"] == "exited":
-            return refuse(f"{st['runs'][-1]['run_id']} exited but is not verified yet; run `yardgoat close` first")
-        if st["runs"] and st["runs"][-1]["state"] == "running":  # recorded running but the process is gone
-            st["runs"][-1]["state"] = "lost"
-        spec = td.spec()
-        problem = _launch_problem(td, st, spec, cfg)
-        if problem:
-            return refuse(problem)
-        used = sum(r["state"] in COUNTED for r in st["runs"])
-        if used >= spec["budget"]["max_attempts"]:
-            st["status"] = "exhausted"
-            return refuse("attempt budget exhausted; escalate to a human")
-        run_id = f"r{len(st['runs']) + 1}"
-        td.run_dir(run_id).mkdir(parents=True, exist_ok=True)
-        st["runs"].append({"run_id": run_id, "state": "queued", "dispatched_by": who, "queued_at": now(), "mode": "queued"})
-        st["status"] = "queued"
-        st["question"] = None
+    if True:  # (kept the block shape of the pre-lock version; the schedule lock is held by the caller)
+        last = (td.state()["runs"] or [None])[-1]
+        if last and _receipt_waiting(td, last):      # a writer died between receipt and state: finish its commit
+            runner.record_outcome(td, last["run_id"], replay=True)
+        with td.locked() as box:
+            st = box["state"]
+            if st["owner"] != who:
+                return refuse(f"owner is {st['owner']}, not {who}")
+            if st["status"] in ("verified", "exhausted", "archived"):
+                return refuse(f"task is {st['status']}")
+            if st["status"] == "parked":
+                return refuse("task is parked waiting for an answer; use `yardgoat answer`")
+            if actor_note.startswith("resumed by reconcile") and st["status"] != "answered":
+                return refuse(f"task is {st['status']}, no longer answered")  # re-checked under the lock (F4)
+            act = _active_run(st)
+            if act:
+                if echo:
+                    print(json.dumps({"task_id": td.task_id, "result": "already-" + act["state"], "run_id": act["run_id"]}))
+                return REFUSED
+            last = st["runs"][-1] if st["runs"] else None
+            if last and last["state"] == "exited":
+                return refuse(f"{last['run_id']} exited but is not verified yet; run `yardgoat close` first")
+            if last and last["state"] == "verify_error":
+                return refuse(f"{last['run_id']}'s verifier crashed; fix its environment and run `yardgoat close` again")
+            if last and last["state"] == "running":  # recorded running, nothing alive, no receipt
+                last["state"] = "lost"
+            spec = td.spec()
+            problem = _launch_problem(td, st, spec, cfg)
+            if problem:
+                return refuse(problem)
+            used = sum(r["state"] in COUNTED for r in st["runs"])
+            if used >= spec["budget"]["max_attempts"]:
+                st["status"] = "exhausted"
+                return refuse("attempt budget exhausted; escalate to a human")
+            run_id = f"r{len(st['runs']) + 1}"
+            td.run_dir(run_id).mkdir(parents=True, exist_ok=True)
+            run = {"run_id": run_id, "state": "queued", "dispatched_by": who, "queued_at": now(), "mode": "queued"}
+            if adapter_kind(spec) == "pool":
+                run.update(mode="pool", pool=spec["adapter"]["pool"])
+            st["runs"].append(run)
+            st["status"] = "queued"
+            st["question"] = None
         cap = cfg.get("max_concurrent")
-        must_wait = adapter_kind(spec) == "direct" and cap is not None and \
-            direct_slots_in_use() + pool.all_live_stations(cfg) >= int(cap)
         if adapter_kind(spec) == "pool":
-            st["runs"][-1].update(mode="pool", pool=spec["adapter"]["pool"])
-    if adapter_kind(spec) == "pool":
-        td.event("run.queued", who, run_id=run_id, pool=spec["adapter"]["pool"], note=actor_note)
-        started = pool.schedule(cfg, direct_slots_in_use())
-        if echo:
-            print(json.dumps({"task_id": td.task_id, "result": "queued", "run_id": run_id, "pool": spec["adapter"]["pool"],
-                              "stations_started": started}))
-        return 0
-    if must_wait:
-        td.event("run.queued", who, run_id=run_id, cap=cap, note=actor_note)
-        if echo:
-            print(json.dumps({"task_id": td.task_id, "result": "queued", "run_id": run_id,
-                              "note": f"{cap} direct runs already in flight; reconcile starts it when a slot frees"}))
-        return 0
-    return start_queued(td, who, actor_note, echo)
+            td.event("run.queued", who, run_id=run_id, pool=spec["adapter"]["pool"], note=actor_note)
+            started = pool.schedule(cfg, direct_slots_in_use)
+            if echo:
+                print(json.dumps({"task_id": td.task_id, "result": "queued", "run_id": run_id, "pool": spec["adapter"]["pool"],
+                                  "stations_started": started}))
+            return 0
+        if adapter_kind(spec) == "direct" and cap is not None and machine_load(cfg) >= int(cap):
+            td.event("run.queued", who, run_id=run_id, cap=cap, note=actor_note)
+            if echo:
+                print(json.dumps({"task_id": td.task_id, "result": "queued", "run_id": run_id,
+                                  "note": f"{cap} runs already in flight; reconcile starts it when a slot frees"}))
+            return 0
+        return start_queued(td, who, actor_note, echo)
 
 
 def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
     d = contract.drift(frozen_of(td, st))
     if d:
         return f"frozen files changed since submit: {d}"
+    if not Path(spec["workdir"]).is_dir():
+        return f"workdir does not exist: {spec['workdir']}"
     if adapter_kind(spec) == "pool":
         try:
             w = pool.workdir_problem(spec, cfg)
@@ -198,7 +230,7 @@ def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
 
 
 def start_queued(td: TaskDir, actor: str, actor_note: str = "", echo: bool = True) -> int:
-    """Launch the task's queued run (re-checking drift and lane policy at launch time)."""
+    """Launch the task's queued run. Caller holds the schedule lock (capacity was checked under it)."""
     cfg = runner.config()
     with td.locked() as box:
         st = box["state"]
@@ -212,13 +244,29 @@ def start_queued(td: TaskDir, actor: str, actor_note: str = "", echo: bool = Tru
             return refuse(problem)
         run.update(state="running", started_at=now())
         st["status"] = "running"
+        ad = adapters.get(adapter_kind(spec), cfg)
         try:
-            run.update(adapters.get(adapter_kind(spec), cfg).submit(td, run["run_id"], spec, cfg))
-        except Exception as e:  # a failed launch leaves no running claim behind
-            run["state"] = "launch_failed"; run["reason"] = str(e)[:300]
-            st["status"] = "accepted"
-            print(f"launch failed: {e}", file=sys.stderr)
-            return 2
+            run.update(ad.submit(td, run["run_id"], spec, cfg))
+        except Exception as e:
+            run["reason"] = str(e)[:300]
+            if adapter_kind(spec) == "direct":     # nothing left the machine: a clean launch failure
+                run["state"] = "launch_failed"; st["status"] = "accepted"
+                print(f"launch failed: {e}", file=sys.stderr)
+                return 2
+            # the remote side may already have the work: never submit a second copy until we know
+            present = None
+            if hasattr(ad, "probe"):
+                try:
+                    present = ad.probe(td, run["run_id"], spec, cfg)
+                except Exception:
+                    present = None
+            if present:
+                run.update(mode=adapter_kind(spec), pool_task_id=f"{td.task_id}-{run['run_id']}",
+                           pool=spec["adapter"].get("pool"), submit_error=run.pop("reason"))
+            else:
+                run["state"] = "submit_unknown"; run["mode"] = adapter_kind(spec); st["status"] = "submit_unknown"
+                print(f"submit outcome unknown: {e}; not resubmitting until resolved (see `yardgoat inbox`)", file=sys.stderr)
+                return 2
         run_id = run["run_id"]
     td.event("run.dispatched", actor, run_id=run_id, mode=run["mode"], window=run.get("window"), note=actor_note)
     if echo:
@@ -295,8 +343,10 @@ def do_close(td: TaskDir, who: str, actor_note: str = "") -> tuple[int, str | No
         st = box["state"]
         if st["owner"] != who:
             return refuse(f"owner is {st['owner']}, not {who}"), None
+        if st["status"] in ("archived", "verified"):
+            return refuse(f"task is {st['status']}"), None
         last = st["runs"][-1] if st["runs"] else None
-        if not last or last["state"] != "exited":
+        if not last or last["state"] not in ("exited", "verify_error"):
             return refuse("no exited run waiting for verification"), None
         d = contract.drift(frozen_of(td, st))
         if d:
@@ -340,8 +390,13 @@ def cmd_park(a) -> int:
         st = box["state"]
         if st["owner"] != a.as_:
             return refuse(f"owner is {st['owner']}, not {a.as_}")
+        if st["status"] in ("archived", "verified", "exhausted", "parked", "answered"):
+            return refuse(f"task is {st['status']}; it cannot be parked")
         if _active_run(st):
             return refuse("a run is in flight; park after it ends")
+        last = st["runs"][-1] if st["runs"] else None
+        if last and last["state"] in ("exited", "verify_error"):
+            return refuse(f"{last['run_id']} is waiting for verification; run `yardgoat close` first")
         st["status"] = "parked"
         st["question"] = {"run_id": None, "text": a.question, "at": now(), "by": a.as_}
     td.event("task.parked", a.as_)
@@ -375,7 +430,7 @@ def cmd_inbox(a) -> int:
     items = []
     for t in list_tasks():
         st = TaskDir(t).state()
-        if st["status"] in ("parked", "exhausted") or (st["runs"] and st["runs"][-1]["state"] == "verify_error"):
+        if st["status"] in ("parked", "exhausted", "submit_unknown") or (st["runs"] and st["runs"][-1]["state"] == "verify_error"):
             items.append({"task_id": t, "status": st["status"], "owner": st["owner"],
                           "question": (st.get("question") or {}).get("text")})
     if a.json:
@@ -387,55 +442,69 @@ def cmd_inbox(a) -> int:
 
 
 def cmd_reconcile(a) -> int:
+    """Server-side upkeep, safe to run concurrently: every state change re-checks under the task lock."""
     cfg = runner.config()
     report = []
-    for t in list_tasks():
-        td = TaskDir(t)
-        st = td.state()
-        spec = td.spec()
-        last = st["runs"][-1] if st["runs"] else None
-        if last and last["state"] == "running" and adapter_kind(spec) == "pool":
-            if not _alive(last):
-                runner.record_outcome(td, last["run_id"], {"state": "lost", "reason": f"station {last.get('station')} is gone",
-                                                           "worker": last.get("station")})
-                report.append({"task_id": t, "run_id": last["run_id"], "observed": "lost"})
-            continue
-        if last and last["state"] == "exited" and spec.get("auto_close"):
-            rc, verdict = do_close(td, st["owner"], actor_note="auto_close by reconcile")
-            report.append({"task_id": t, "run_id": last["run_id"], "auto_closed": verdict})
-            continue
-        if last and last["state"] == "running":
-            try:
-                outcome = adapters.get(adapter_kind(spec), cfg).poll(td, last, spec, cfg)
-            except Exception as e:
-                report.append({"task_id": t, "error": repr(e)}); continue
-            if outcome:
-                runner.record_outcome(td, last["run_id"], outcome)
-                report.append({"task_id": t, "run_id": last["run_id"], "observed": outcome["state"]})
-        elif st["status"] == "answered":
-            st2 = td.state()
-            with td.locked() as box:
-                box["state"]["status"] = "accepted"
-            rc = do_dispatch(td, st2["owner"], actor_note="resumed by reconcile after an answer", echo=False)
-            report.append({"task_id": t, "resumed": rc == 0})
-    # queued runs, oldest first, while direct slots are free
-    cap = cfg.get("max_concurrent")
-    queued = []
-    for t in list_tasks():
-        st = TaskDir(t).state()
-        if st["runs"] and st["runs"][-1]["state"] == "queued":
-            queued.append((st["runs"][-1].get("queued_at", ""), t))
-    for _, t in sorted(queued):
-        td = TaskDir(t)
-        spec = td.spec()
-        if adapter_kind(spec) == "pool":
-            continue  # stations claim pool cards themselves
-        if adapter_kind(spec) == "direct" and cap is not None and direct_slots_in_use() + pool.all_live_stations(cfg) >= int(cap):
-            continue
-        rc = start_queued(td, "reconciler", actor_note="started from the queue", echo=False)
-        report.append({"task_id": t, "started_from_queue": rc == 0})
-    for name in pool.schedule(cfg, direct_slots_in_use()):
-        report.append({"station_started": name})
+    with pool.schedule_lock():
+        for t in list_tasks():
+            td = TaskDir(t)
+            st = td.state()
+            spec = td.spec()
+            last = st["runs"][-1] if st["runs"] else None
+            if not last:
+                continue
+            if _receipt_waiting(td, last):                   # writer died between receipt and state
+                if runner.record_outcome(td, last["run_id"], replay=True):
+                    report.append({"task_id": t, "run_id": last["run_id"], "replayed_receipt": True})
+                continue
+            if last["state"] == "submit_unknown":
+                ad = adapters.get(adapter_kind(spec), cfg)
+                if hasattr(ad, "probe") and ad.probe(td, last["run_id"], spec, cfg):
+                    with td.locked() as box:
+                        r = box["state"]["runs"][-1]
+                        if r["state"] == "submit_unknown":
+                            r.update(state="running", pool_task_id=f"{t}-{r['run_id']}", pool=spec["adapter"].get("pool"))
+                            box["state"]["status"] = "running"
+                    report.append({"task_id": t, "run_id": last["run_id"], "submit_confirmed": True})
+                continue
+            if last["state"] == "running" and adapter_kind(spec) == "pool":
+                if not _alive(last):
+                    if runner.record_outcome(td, last["run_id"], {"state": "lost", "reason": f"station {last.get('station')} is gone",
+                                                                  "worker": last.get("station")}):
+                        report.append({"task_id": t, "run_id": last["run_id"], "observed": "lost"})
+                continue
+            if last["state"] == "exited" and spec.get("auto_close"):
+                rc, verdict = do_close(td, st["owner"], actor_note="auto_close by reconcile")
+                if verdict:
+                    report.append({"task_id": t, "run_id": last["run_id"], "auto_closed": verdict})
+                continue
+            if last["state"] == "running":
+                try:
+                    outcome = adapters.get(adapter_kind(spec), cfg).poll(td, last, spec, cfg)
+                except Exception as e:
+                    report.append({"task_id": t, "error": repr(e)}); continue
+                if outcome and runner.record_outcome(td, last["run_id"], outcome):
+                    report.append({"task_id": t, "run_id": last["run_id"], "observed": outcome["state"]})
+            elif st["status"] == "answered":
+                rc = do_dispatch_locked(td, st["owner"], "resumed by reconcile after an answer")
+                report.append({"task_id": t, "resumed": rc == 0})
+        # queued direct runs, oldest first, while there is capacity
+        cap = cfg.get("max_concurrent")
+        queued = []
+        for t in list_tasks():
+            st = TaskDir(t).state()
+            if st["runs"] and st["runs"][-1]["state"] == "queued":
+                queued.append((st["runs"][-1].get("queued_at", ""), t))
+        for _, t in sorted(queued):
+            td = TaskDir(t)
+            if adapter_kind(td.spec()) == "pool":
+                continue  # stations claim pool cards themselves
+            if adapter_kind(td.spec()) == "direct" and cap is not None and machine_load(cfg) >= int(cap):
+                continue
+            rc = start_queued(td, "reconciler", actor_note="started from the queue", echo=False)
+            report.append({"task_id": t, "started_from_queue": rc == 0})
+        for name in pool.schedule(cfg, direct_slots_in_use):
+            report.append({"station_started": name})
     print(json.dumps({"reconciled_at": now(), "actions": report}, ensure_ascii=False))
     return 0
 
@@ -476,8 +545,8 @@ def cmd_quick(a) -> int:
     if not contract.TASK_ID_RE.match(tid):
         print(f"spec error: bad id {tid}", file=sys.stderr); return 2
     card_dir = home() / "cards" / tid
-    if card_dir.exists() and not TaskDir(tid).exists:
-        print(f"spec error: {card_dir} exists but the task does not", file=sys.stderr); return 2
+    if TaskDir(tid).exists or card_dir.exists():
+        return refuse(f"task id {tid} is already taken (quick never rewrites an existing task's files); use a new --id")
     card_dir.mkdir(parents=True, exist_ok=True)
     text = a.text if a.text != "-" else sys.stdin.read()
     yg_pool = bool(a.pool) and a.pool in pool.pools(cfg)

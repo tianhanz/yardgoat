@@ -82,8 +82,15 @@ class FilePool:
             body = f"# {ptid}\n\n<!-- pool: {pool} -->\n\n{text}\n\n<!-- dispatcher: yardgoat:{td.task_id} -->\n"
             if verify:
                 body += f"\n<!-- verify: {verify} -->\n"
-            (d / f"{ptid}.md").write_text(body, encoding="utf-8")
+            tmp = d / f".{ptid}.{os.getpid()}.tmp"   # not *.md: workers never see a half-written card
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, d / f"{ptid}.md")
         return {"mode": "file-pool", "pool": pool, "pool_task_id": ptid, "pid": None, "window": None}
+
+    def probe(self, td: TaskDir, run_id: str, spec: dict, cfg: dict) -> bool:
+        """Did a submit whose outcome is unknown actually land in the pool?"""
+        stage, _ = self._find(cfg, spec["adapter"]["pool"], f"{td.task_id}-{run_id}")
+        return stage is not None
 
     def _find(self, cfg: dict, pool: str, ptid: str):
         root = Path(os.path.expanduser(self._conf(cfg)["root"])) / pool

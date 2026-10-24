@@ -74,6 +74,21 @@ def normalize(spec: dict, base: Path) -> dict:
     b = s.setdefault("budget", {})
     b.setdefault("max_attempts", 2)
     b.setdefault("max_wall_min", 60)
+    ma, mw = b["max_attempts"], b["max_wall_min"]
+    if isinstance(ma, bool) or not isinstance(ma, int) or ma < 1:
+        raise SpecError("budget.max_attempts must be an integer >= 1")
+    if isinstance(mw, bool) or not isinstance(mw, (int, float)) or mw <= 0:
+        raise SpecError("budget.max_wall_min must be a number > 0")
+    for k in ("outputs", "escalate_when", "allowed_lanes"):
+        if k in s and not (isinstance(s[k], list) and all(isinstance(x, str) for x in s[k])):
+            raise SpecError(f"{k} must be a list of strings")
+    if not isinstance(v["command"], str) or not all(isinstance(x, str) for x in v["freeze"]):
+        raise SpecError("verifier.command must be a string and verifier.freeze a list of paths")
+    for k in ("host", "lane", "acct", "command", "sandbox"):
+        if k in ex and not isinstance(ex[k], str):
+            raise SpecError(f"executor.{k} must be a string")
+    if not Path(s["workdir"]).is_dir():
+        raise SpecError(f"workdir does not exist: {s['workdir']}")
     s.setdefault("outputs", [])
     s.setdefault("authority", "")
     s.setdefault("escalate_when", [])

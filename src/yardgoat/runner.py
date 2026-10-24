@@ -64,11 +64,16 @@ def build_argv(td: TaskDir, spec: dict, run_dir: Path, cfg: dict) -> list[str]:
     return argv
 
 
+LAUNCH_FAIL = "yardgoat-launch-failed:"
+
+
 def script_for(td: TaskDir, spec: dict, run_dir: Path, cfg: dict) -> str:
     lines = ["set -u"]
     for f in cfg.get("source", []):
-        lines.append(f"source {shlex.quote(os.path.expanduser(f))}")
-    lines.append(f"cd {shlex.quote(spec['workdir'])}")
+        q = shlex.quote(os.path.expanduser(f))
+        lines.append(f"source {q} || {{ echo {shlex.quote(LAUNCH_FAIL + ' source ' + f)}; exit 3; }}")
+    w = shlex.quote(spec["workdir"])
+    lines.append(f"cd {w} || {{ echo {shlex.quote(LAUNCH_FAIL + ' cd ' + spec['workdir'])}; exit 3; }}")
     lines.append("exec " + shlex.join(build_argv(td, spec, run_dir, cfg)))
     return "\n".join(lines) + "\n"
 
@@ -85,6 +90,11 @@ def launch(td: TaskDir, run_id: str, cfg: dict) -> dict:
                   f"YARDGOAT_ORIG_PYTHONPATH={shlex.quote(orig)} ")
     if os.environ.get("YARDGOAT_CONFIG"):
         env_prefix += f"YARDGOAT_CONFIG={shlex.quote(os.environ['YARDGOAT_CONFIG'])} "
+    # A tmux window inherits the tmux *server's* environment, not the caller's. Workers are configured by the local
+    # config (source + launcher), deliberately not by whoever dispatched; pass_env is an explicit allowlist.
+    for k in cfg.get("pass_env", []):
+        if k in os.environ:
+            env_prefix += f"{k}={shlex.quote(os.environ[k])} "
     session = cfg.get("tmux_session")
     if session and shutil.which("tmux") and not os.environ.get("YARDGOAT_NO_TMUX"):
         window = f"yg-{td.task_id[:24]}-{run_id}"
@@ -98,6 +108,34 @@ def launch(td: TaskDir, run_id: str, cfg: dict) -> dict:
     p = subprocess.Popen(me, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=env)
     return {"mode": "process", "window": None, "pid": p.pid}
+
+
+def pgid_alive(pgid) -> bool:
+    """Any live (non-zombie) process left in this process group?"""
+    if not pgid:
+        return False
+    for st in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            f = st.read_text().rsplit(") ", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if f[0] != "Z" and f[2] == str(pgid):
+            return True
+    return False
+
+
+def kill_group(pgid, grace: float = 10.0) -> None:
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(int(pgid), sig)
+        except (ProcessLookupError, PermissionError, ValueError):
+            return
+        end = time.time() + grace
+        while time.time() < end and pgid_alive(pgid):
+            time.sleep(0.2)
+        if not pgid_alive(pgid):
+            return
 
 
 def pid_alive(pid) -> bool:
@@ -143,45 +181,58 @@ def detect_cost(log: Path) -> str:
     return "unknown"
 
 
-def record_outcome(td: TaskDir, run_id: str, outcome: dict) -> dict:
-    """Write the receipt and move the run/task state. Used by the direct runner and by reconcile."""
+STATUS_OF = {"exited": "exited", "blocked": "blocked", "lost": "lost", "launch_failed": "launch_failed"}
+STATE_OF = {v: k for k, v in STATUS_OF.items()}
+
+
+def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay: bool = False):
+    """Commit a run's outcome: receipt + run/task state, together, under the task lock, exactly once.
+
+    A run that is no longer `running` is left alone (late or duplicate results are ignored). With replay=True the
+    outcome is taken from a receipt already on disk — recovery when a writer died between receipt and state."""
     spec = td.spec()
     rd = td.run_dir(run_id)
     rd.mkdir(parents=True, exist_ok=True)
-    ex = spec["executor"]
-    artifacts = {}
-    for o in spec["outputs"]:
-        p = Path(spec["workdir"]) / o
-        artifacts[o] = sha256_file(p) if p.is_file() else None
-    state = outcome["state"]
-    receipt = {
-        "task_id": td.task_id, "run_id": run_id, "project": spec["project"], "attempt": int(run_id.lstrip("r")),
-        "adapter": spec.get("adapter", {}).get("kind", "direct"),
-        "exit_code": outcome.get("exit_code"), "timed_out": outcome.get("exit_code") == 124,
-        "host": outcome.get("host", ex["host"]), "lane": outcome.get("lane", ex.get("lane", "")),
-        "account_alias": ex.get("acct", ""), "worker": outcome.get("worker"),
-        "actual_model": outcome.get("actual_model", ""), "model_source": outcome.get("model_source", "none"),
-        "cost_basis": outcome.get("cost_basis", "unknown"), "artifacts": artifacts, "finished_at": now(),
-        "status": {"exited": "exited", "blocked": "blocked", "lost": "lost", "launch_failed": "launch_failed"}[state],
-    }
-    if state == "blocked":
-        receipt["question"] = outcome.get("question", "")
-    if state in ("lost", "launch_failed"):
-        receipt["reason"] = outcome.get("reason", "")
-    write_json(rd / "receipt.json", receipt)
     with td.locked() as box:
         st = box["state"]
         run = next(r for r in st["runs"] if r["run_id"] == run_id)
-        run.update(state=state, exit_code=outcome.get("exit_code"), finished_at=receipt["finished_at"])
+        if run["state"] != "running":
+            return None
+        if replay:
+            receipt = read_json(rd / "receipt.json")
+            state = STATE_OF.get(receipt.get("status"), "exited")
+        else:
+            ex = spec["executor"]
+            artifacts = {}
+            for o in spec["outputs"]:
+                p = Path(spec["workdir"]) / o
+                artifacts[o] = sha256_file(p) if p.is_file() else None
+            state = outcome["state"]
+            receipt = {
+                "task_id": td.task_id, "run_id": run_id, "project": spec["project"], "attempt": int(run_id.lstrip("r")),
+                "adapter": spec.get("adapter", {}).get("kind", "direct"),
+                "exit_code": outcome.get("exit_code"), "timed_out": outcome.get("exit_code") == 124,
+                "host": outcome.get("host", ex["host"]), "lane": outcome.get("lane", ex.get("lane", "")),
+                "account_alias": ex.get("acct", ""), "worker": outcome.get("worker"),
+                "actual_model": outcome.get("actual_model", ""), "model_source": outcome.get("model_source", "none"),
+                "cost_basis": outcome.get("cost_basis", "unknown"), "artifacts": artifacts, "finished_at": now(),
+                "status": STATUS_OF[state],
+            }
+            if state == "blocked":
+                receipt["question"] = outcome.get("question", "")
+            if state in ("lost", "launch_failed"):
+                receipt["reason"] = outcome.get("reason", "")
+            write_json(rd / "receipt.json", receipt)
+        run.update(state=state, exit_code=receipt.get("exit_code"), finished_at=receipt["finished_at"])
         if state == "blocked":
             st["status"] = "parked"
-            st["question"] = {"run_id": run_id, "text": receipt["question"], "at": receipt["finished_at"]}
+            st["question"] = {"run_id": run_id, "text": receipt.get("question", ""), "at": receipt["finished_at"]}
         elif state in ("lost", "launch_failed"):
             st["status"] = "accepted"  # may be dispatched again within budget
         else:
             st["status"] = "exited"
-    td.event({"exited": "run.exited", "blocked": "task.parked", "lost": "run.lost", "launch_failed": "run.launch_failed"}[state], "runner",
-             run_id=run_id, exit_code=outcome.get("exit_code"))
+    td.event({"exited": "run.exited", "blocked": "task.parked", "lost": "run.lost", "launch_failed": "run.launch_failed"}[state],
+             "runner", run_id=run_id, exit_code=receipt.get("exit_code"), replay=replay)
     return receipt
 
 
@@ -207,18 +258,29 @@ def run_and_receipt(td: TaskDir, run_id: str) -> int:
         run["worker_pid"] = os.getpid()
     td.event("run.started", "runner", run_id=run_id)
     started = time.time()
-    timeout = int(spec["budget"]["max_wall_min"]) * 60
+    timeout = float(spec["budget"]["max_wall_min"]) * 60
     with open(rd / "log", "wb") as log:
+        # own process group: a timeout ends the worker *and* everything it spawned, and liveness is judged by the
+        # group, so a worker that outlives this runner still counts as running (no parallel retry)
+        p = subprocess.Popen(["bash", str(rd / "script.sh")], stdin=subprocess.DEVNULL, stdout=log,
+                             stderr=subprocess.STDOUT, env=worker_env(), start_new_session=True)
+        with td.locked() as box:
+            run = next(r for r in box["state"]["runs"] if r["run_id"] == run_id)
+            run["worker_pgid"] = p.pid
         try:
-            rc = subprocess.run(["bash", str(rd / "script.sh")], stdin=subprocess.DEVNULL, stdout=log,
-                                stderr=subprocess.STDOUT, timeout=timeout, env=worker_env()).returncode
+            rc = p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            kill_group(p.pid)
+            p.wait()
             rc = 124
     model, model_src = detect_model(rd / "log")
     out = {"state": "exited", "exit_code": rc, "actual_model": model, "model_source": model_src,
            "cost_basis": detect_cost(rd / "log")}
     codes = cfg.get("launcher_failure_codes", [])
-    if rc in codes and model_src == "none" and time.time() - started < 120:
+    head = (rd / "log").read_text(errors="replace")[:2000]
+    if any(LAUNCH_FAIL in l for l in head.splitlines()[:5]):
+        out.update(state="launch_failed", reason=next(l for l in head.splitlines() if LAUNCH_FAIL in l)[:500])
+    elif rc in codes and model_src == "none" and time.time() - started < 120:
         # the launcher refused before any agent started (bad lane, missing tool): an infrastructure
         # failure, not an attempt at the task — it must not consume the task's attempt budget
         first = (rd / "log").read_text(errors="replace").strip().splitlines()[:1]

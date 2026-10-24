@@ -34,7 +34,7 @@ def sha256_file(p: str | Path) -> str:
 
 
 def write_json(p: Path, obj) -> None:
-    tmp = p.with_name(p.name + ".tmp")
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{time.time_ns()}.tmp")  # unique: concurrent writers never share a tmp file
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     os.replace(tmp, p)
 

@@ -43,6 +43,16 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 13. **Frozen hashes have an authoritative copy** outside the directories stations may write
     (`$YARDGOAT_HOME/frozen/`); a task whose `task.json` hashes disagree with it is treated as drifted.
 14. **`auto_close`** in a spec lets `reconcile` run the frozen verifier on the owner's behalf once a run exits.
+15. **Concurrency.** Every "check capacity, then start" decision (dispatch, reconcile, station scheduling) holds one
+    machine-wide schedule lock; lock order is schedule → pool → task. Outcomes are committed exactly once, receipt and
+    state together under the task lock; a late or duplicate outcome is ignored, and a receipt whose state never got
+    written is replayed by `reconcile`.
+16. **Process groups.** A direct worker runs in its own process group; a timeout ends the whole group, and liveness is
+    judged by the group, so a worker that outlives its runner still blocks a retry.
+17. **Unknown submits are not retried blindly.** If an adapter's submit fails, Yardgoat asks the adapter whether the
+    work landed (`probe`); if it cannot tell, the run is `submit_unknown`, blocks further dispatch and shows in the inbox.
+18. **Environment.** Workers get the tmux server's environment plus the local config's `source` files and launcher —
+    deliberately not the dispatcher's environment; `pass_env` is an explicit allowlist.
 
 ## Adapters
 

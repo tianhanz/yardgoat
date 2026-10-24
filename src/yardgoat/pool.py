@@ -102,8 +102,19 @@ def all_live_stations(cfg: dict) -> int:
     return sum(len(live_stations(p)) for p in pools(cfg))
 
 
-def schedule(cfg: dict, direct_in_use: int) -> list[str]:
-    """Start stations where queued cards outnumber live stations. Returns started station names."""
+@contextmanager
+def schedule_lock():
+    """One machine-wide lock for every 'check capacity, then start' decision (direct runs and stations).
+    Lock order: schedule lock first, then a pool or task lock — never the other way round."""
+    home().mkdir(parents=True, exist_ok=True)
+    with open(home() / ".schedule.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        yield
+
+
+def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
+    """Start stations where queued cards outnumber live stations. Caller holds schedule_lock()."""
+    direct_in_use = direct_in_use_fn() if callable(direct_in_use_fn) else direct_in_use_fn
     started = []
     cap = cfg.get("max_concurrent")
     for name, c in pools(cfg).items():
