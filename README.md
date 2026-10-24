@@ -242,8 +242,25 @@ the reviewed directory, and line numbers start at 1. See the [findings schema](s
 `review` enables automatic verification through `reconcile`, including repair runs.
 Each `<task-id>-review-<round>` child has its own frozen verifier checking output structure,
 file/line references, unchanged original/snapshot trees, and a frozen workspace baseline
-excluding exactly the listed outputs. Other persistent additions, deletions, content/mode
-changes or symlinks fail verification. An invalid or failed review
+excluding exactly the listed outputs. In either reviewed tree, comparisons ignore untracked
+`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.hypothesis/`, `.benchmarks/`
+directories at any depth and ordinary `*.pyc` files. Files are still copied and are never
+removed or rewritten by the ignore policy. Other persistent additions, deletions and content
+changes fail; existing entries' mode/type changes and all symlink changes still fail.
+
+Machine-local config may add `"review_ignore": [".host-state/", "logs/**/*.tmp"]`.
+Globs are relative to the reviewed root; `*` stays within one component, `**` spans zero or
+more components, and matching directories cover their subtrees. The rules and Git-tracked
+paths are frozen when each review child is created. Editing config afterwards does not change
+that child's checks or retries. Tracked paths and their parent directories remain protected
+even if they match a rule; matching tracked paths generate a warning. Keep custom rules narrow:
+broad patterns can conceal real changes in untracked files. Ignores do not permit extra files
+outside `target/` in the review workdir. See [review integrity](docs/design.md#engineering-review-loop)
+for the full policy.
+
+To run tests, copy the snapshot to a temporary directory outside the review workdir first,
+or at least set `PYTHONDONTWRITEBYTECODE=1` and add pytest `-p no:cacheprovider`. Leave no
+test/build artifacts in the snapshot. An invalid or failed review
 never means clean: it retries within the child's two-attempt budget, then needs attention.
 Frozen-file rejection, verifier errors, exhausted/archived/cancelled children and launch
 refusals park the parent with a reason. Restoring a frozen verifier and answering replays

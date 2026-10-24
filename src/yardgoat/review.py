@@ -4,13 +4,54 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
+import os
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 from . import contract, delivery, pool, runner, review_verify, scheduling
 from .store import TaskDir, home, now, read_json, write_json
+
+LOG = logging.getLogger(__name__)
+
+
+def ignore_policy(source: Path, cfg: dict) -> dict:
+    """Freeze machine-local globs and Git's tracked paths when taking a snapshot."""
+    patterns = cfg.get("review_ignore", [])
+    if not isinstance(patterns, list) or any(
+            not isinstance(p, str) or not p or p.startswith("~") or "\x00" in p
+            or Path(p).is_absolute() or ".." in Path(p).parts or Path(p) == Path(".")
+            for p in patterns):
+        raise contract.SpecError("review_ignore must be a list of relative path globs")
+    tracked = []
+    # Also protect tracked paths when review.path is a subdirectory or a worktree.
+    # Do not silently discard protection if Git cannot read a repository's index.
+    git_env = dict(os.environ, LC_ALL="C", GIT_OPTIONAL_LOCKS="0")
+
+    def git(*args):
+        try:
+            return subprocess.run(["git", "-C", str(source), *args], env=git_env,
+                                  capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            raise contract.SpecError("timed out freezing tracked review paths") from exc
+
+    try:
+        probe = git("rev-parse", "--is-inside-work-tree")
+    except FileNotFoundError:
+        if any((p / ".git").exists() for p in (source, *source.parents)):
+            raise contract.SpecError("Git is required to freeze tracked review paths")
+        return {"review_ignore": list(patterns), "tracked_paths": []}
+    if probe.returncode and b"not a git repository" not in probe.stderr:
+        raise contract.SpecError("cannot locate reviewed repository: " + os.fsdecode(probe.stderr).strip())
+    if probe.returncode == 0 and probe.stdout.strip() == b"true":
+        result = git("ls-files", "--cached", "-z", "--", ".")
+        if result.returncode:
+            raise contract.SpecError("cannot freeze tracked review paths: " + os.fsdecode(result.stderr).strip())
+        tracked = sorted(set(os.fsdecode(name) for name in result.stdout.split(b"\0") if name))
+    return {"review_ignore": list(patterns), "tracked_paths": tracked}
 
 
 def validate(spec: dict) -> None:
@@ -287,16 +328,24 @@ def create_child(td: TaskDir, st: dict, spec: dict, row: dict, cfg: dict) -> Tas
         if settings["source"] != str(source) or settings["target"] != str(wd / "target"):
             raise contract.SpecError("review workspace/source changed during creation; restore the original paths")
     else:
+        settings = ignore_policy(source, cfg)
         before = review_verify.manifest(source)
         target = wd / "target"
         if target.exists():
             shutil.rmtree(target)  # only an unsubmitted, interrupted snapshot owned by this round
         shutil.copytree(source, target, symlinks=True)
-        if review_verify.manifest(target) != before or review_verify.manifest(source) != before:
+        if (not review_verify.unchanged(review_verify.manifest(target), before, settings)
+                or not review_verify.unchanged(review_verify.manifest(source), before, settings)):
             raise contract.SpecError("review target changed while taking the snapshot")
-        write_json(settings_path, {"source": str(source), "target": str(target), "manifest": before,
-                                   "allowed_outputs": outputs,
-                                   "workspace_manifest": review_verify.workspace_manifest(wd, outputs)})
+        settings.update(source=str(source), target=str(target), manifest=before,
+                        allowed_outputs=outputs, workspace_manifest=review_verify.workspace_manifest(wd, outputs))
+        write_json(settings_path, settings)
+    for name in settings.get("tracked_paths", []):
+        if review_verify.matches_ignore(name, settings["manifest"], settings["review_ignore"]):
+            LOG.warning("review_ignore matches tracked path %r in %s; it remains protected", name, child.task_id)
+            event_once(td, "task.review_ignore_warning", f"{child.task_id}:review-ignore:{name}",
+                       review_task=child.task_id, path=name,
+                       message="Ignore rule matches a Git-tracked path; it remains protected")
     verifier = assets / "verify.py"
     if not verifier.exists():
         shutil.copyfile(Path(review_verify.__file__), verifier)
@@ -311,6 +360,9 @@ def create_child(td: TaskDir, st: dict, spec: dict, row: dict, cfg: dict) -> Tas
 Review the snapshot in `{wd / 'target'}` of `{source}`. Read only; do not change
 the snapshot or the original directory. Assess concurrency, consistency, error handling
 and missing tests. Explain concrete failure scenarios and actionable fixes.
+To run tests, first copy the snapshot to a temporary directory outside this review workdir;
+or at minimum set `PYTHONDONTWRITEBYTECODE=1` and run pytest with `-p no:cacheprovider`.
+Do not leave test or build artifacts in the snapshot.
 
 Original goal: {spec['goal']}
 Acceptance: {spec.get('acceptance', '(see original card)')}

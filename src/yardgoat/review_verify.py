@@ -6,9 +6,75 @@ import json
 import os
 import stat
 import sys
+from fnmatch import fnmatchcase
+from functools import lru_cache
 from pathlib import Path
 
 SEVERITIES = ("blocker", "major", "minor", "info")
+CACHE_DIRS = frozenset(("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+                        ".hypothesis", ".benchmarks"))
+
+
+def glob_match(name: str, pattern: str) -> bool:
+    """Root-relative glob: * matches one component, ** matches zero or more."""
+    parts, globs = Path(name).parts, Path(pattern).parts
+
+    @lru_cache(None)
+    def match(i: int, j: int) -> bool:
+        if j == len(globs):
+            return i == len(parts)
+        if globs[j] == "**":
+            return match(i, j + 1) or (i < len(parts) and match(i + 1, j))
+        return i < len(parts) and fnmatchcase(parts[i], globs[j]) and match(i + 1, j + 1)
+
+    return match(0, 0)
+
+
+def matches_ignore(name: str, entries: dict, patterns: list[str]) -> bool:
+    """Match an entry or a containing directory; never treat the root as ignored."""
+    if name == ".":
+        return False
+    path = Path(name)
+    candidates = [path, *(p for p in path.parents if p != Path("."))]
+    for candidate in candidates:
+        key = candidate.as_posix()
+        directory = entries.get(key, {}).get("kind") == "dir"
+        if candidate != path and not directory:
+            continue
+        if directory and candidate.name in CACHE_DIRS:
+            return True
+        if candidate == path and entries.get(key, {}).get("kind") == "file" and key.endswith(".pyc"):
+            return True
+        if any((not pattern.endswith("/") or directory) and glob_match(key, pattern)
+               for pattern in patterns):
+            return True
+    return False
+
+
+def comparison_manifest(entries: dict, settings: dict, prefix: str = "") -> dict:
+    """Filter only at comparison time, using the child's frozen tracked paths."""
+    if "review_ignore" not in settings:  # retain strict behavior for legacy settings
+        return entries
+    protected = {"."}
+    for name in settings["tracked_paths"]:
+        path = Path(name)
+        protected.update(p.as_posix() for p in (path, *path.parents))
+    relative = {name[len(prefix):]: value for name, value in entries.items() if name.startswith(prefix)}
+    result = {name: value for name, value in entries.items() if not name.startswith(prefix)}
+    for name, value in relative.items():
+        if (name in protected or value["kind"] == "link"
+                or not matches_ignore(name, relative, settings["review_ignore"])):
+            result[prefix + name] = value
+    return result
+
+
+def unchanged(actual: dict, expected: dict, settings: dict, prefix: str = "") -> bool:
+    # Cache bytes/additions/removals are harmless; an existing entry's type or
+    # permissions must still not change. Symlinks are never ignored.
+    if any((actual[name]["kind"], actual[name]["mode"]) != (expected[name]["kind"], expected[name]["mode"])
+           for name in actual.keys() & expected.keys()):
+        return False
+    return comparison_manifest(actual, settings, prefix) == comparison_manifest(expected, settings, prefix)
 
 
 def manifest(root: Path) -> dict:
@@ -52,10 +118,11 @@ def workspace_manifest(root: Path, outputs: list[str]) -> dict:
 def verify(settings: dict) -> list[dict]:
     source, target = Path(settings["source"]), Path(settings["target"])
     expected = settings["manifest"]
-    if manifest(source) != expected or manifest(target) != expected:
+    if not unchanged(manifest(source), expected, settings) or not unchanged(manifest(target), expected, settings):
         raise ValueError("review target was modified (original or snapshot)")
     workdir = target.parent
-    if workspace_manifest(workdir, settings["allowed_outputs"]) != settings["workspace_manifest"]:
+    if not unchanged(workspace_manifest(workdir, settings["allowed_outputs"]),
+                     settings["workspace_manifest"], settings, prefix="target/"):
         raise ValueError("review workspace was modified outside the allowed outputs")
     findings_path = workdir / "out/findings.json"
     report_path = workdir / "out/REVIEW.md"

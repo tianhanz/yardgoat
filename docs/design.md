@@ -560,10 +560,38 @@ The original directory and snapshot are
 both checked for additions, removals, file bytes, modes, empty directories and symlink destinations.
 Links are copied without traversal; findings must name ordinary files inside the snapshot.
 The target must not contain the review workspace or owner-side assets, avoiding recursive snapshots.
+
+Manifest comparisons ignore untracked build/test caches in either tree: directories named
+`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.hypothesis` and `.benchmarks`
+at any depth, and ordinary `*.pyc` files. Snapshots and stored manifests still include those
+entries; ignoring affects comparison only and never deletes or rewrites files. Existing
+entries' type and permission changes still fail, and symlinks are never ignored.
+Reviewers should copy the snapshot to a temporary directory outside the review workdir before
+running tests, or at least use `PYTHONDONTWRITEBYTECODE=1` and pytest `-p no:cacheprovider`
+and leave no artifacts in the snapshot.
+
+Machine-local config can add `"review_ignore": [".host-state/", "logs/**/*.tmp"]`.
+These are relative to the reviewed directory: `*`, `?` and character classes match within
+one path component, and `**` matches zero or more components. A matching directory ignores
+its subtree; a trailing `/` matches directories only. Patterns are anchored at the reviewed
+root, so use `**/.host-state/` to match that directory at any depth. Absolute paths and `..`
+components are rejected. Broad rules can hide real changes in untracked files; prefer narrow
+tool-specific paths. This setting is read and **frozen at review child creation**, together
+with the Git-tracked paths, in the child's hashed owner-side settings. Later configuration or
+index changes cannot alter that child's policy, including retries and interrupted creation
+resumed from saved settings. Each later child freezes its own current policy; existing frozen
+children retain their original behavior.
+
+Git-tracked paths, including files inside a reviewed repository subdirectory or worktree,
+and their containing directories are always compared, even when an ignore rule matches.
+Matching tracked paths produce a warning and a `task.review_ignore_warning` parent event
+at child creation. An unreadable Git index fails creation rather than dropping this protection.
 The frozen owner-side settings also contain a complete workdir manifest, excluding exactly
 `out/findings.json`, `out/REVIEW.md` and the card's explicit `out/BLOCKED.md`. The verifier rejects
 other persistent additions, removals, modes, bytes or symlinks; allowed output entries must be
-ordinary files. This baseline is retained across child retries and is never refreshed from a
+ordinary files. The same frozen ignore policy applies only within its `target/` subtree;
+even cache-shaped files elsewhere in the workdir remain unauthorized. This baseline is
+retained across child retries and is never refreshed from a
 completed worker's files.
 This is an integrity check at verification time, not an OS read-only mount or a monitor of
 transient writes. Other scoped workers are excluded by the retained lease.
