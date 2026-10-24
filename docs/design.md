@@ -114,7 +114,9 @@ is `bash`, and the launcher is bypassed just as for real shell workers.
 
 Pool probes also create and remove a file in a mailbox under the pool root. Probes use the next station's account,
 including account rotation. `--json` returns each check and its reason; a failed check exits 1. Results with timestamps
-live in `$YARDGOAT_HOME/doctor/pool/<pool>.json` or `doctor/direct/<host-lane>.json`; probe scripts and logs live under `doctor/runs/`. Pool health
+live in `$YARDGOAT_HOME/doctor/pool/<pool>.json` or `doctor/direct/<host-lane>.json`; these saved reports exactly match
+the printed JSON. Without `--pool`, the report also includes the global reconcile freshness check described below.
+Probe scripts, logs and raw launch-chain results live under `doctor/runs/`. Pool health
 is also stored in `pools/<pool>/state.json` and surfaced by `status` and `inbox`.
 
 Before starting a station, `pool.schedule` requires a successful result for that account newer than local
@@ -470,12 +472,21 @@ the most recent completion supplies its error summary and does not erase a newer
 start. This is observational bookkeeping, not a lock on reconciliation.
 
 `status --json` preserves the existing task/list shapes and adds `reconcile_health`
-to each row (a health-only row for an otherwise empty list). Explicit `doctor` adds
-a freshness check: a recorded round with no end, an unreadable record, or an end
+to each row (a health-only row for an otherwise empty list). `reconcile` returns the
+same health record it just persisted. These are command projections; neither adds
+fields to stored task specs, task state, receipts or events.
+
+`doctor` **without `--pool`** (including `--host`) adds a global freshness check:
+a recorded round with no end, an unreadable record, or an end
 older than `reconcile_stale_min` (default 10 minutes) alarms. A new store with no
-record reports that no round has run yet. This check is not added to the cached
-launch probe or automatic station admission. Health is never read by project
-authorization and is never treated as a controller heartbeat.
+record reports that no round has run yet. The check, aggregate `ok` and failure
+`reason` are finalized before saving `doctor/direct/<host-lane>.json`; the CLI
+prints that returned report unchanged. Full health data remains available through
+`status --json`, rather than a second top-level field in doctor reports.
+`doctor --pool P`, its saved pool report and automatic station admission contain
+only launch-chain checks: global reconcile staleness cannot make a healthy pool
+fail or invalidate its probe cache. Health is never read by project authorization
+and is never treated as a controller heartbeat.
 
 ## Engineering review loop
 

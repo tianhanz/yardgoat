@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote
 
-from . import pool, runner
+from . import health, pool, runner
 from .store import home, now, read_json, write_json
 
 PROBE_TIMEOUT = 20
@@ -113,6 +113,12 @@ def run(cfg: dict, name: str | None = None, host: str = "codex", lane: str = "",
             report = _failed(request, "startup timed out before the probe returned")
     except (OSError, RuntimeError, ValueError) as e:
         report = _failed(request, str(e))
+    if not name:
+        # Reconcile health is global, not a pool launch/admission result. Finish
+        # the non-pool report before persisting it; the CLI only renders it.
+        report["checks"].append(health.check(cfg))
+        report["ok"] = all(c["ok"] for c in report["checks"])
+        report["reason"] = "; ".join(c["name"] + ": " + c["reason"] for c in report["checks"] if not c["ok"])
     path = record_path(key, "pool" if name else "direct")
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, report)

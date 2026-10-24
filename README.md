@@ -132,8 +132,10 @@ Schemas: [session](src/yardgoat/schemas/session.schema.json),
 [control configuration](src/yardgoat/schemas/control-config.schema.json).
 
 Each `reconcile` records start/end, last error-free completion and an error summary
-in `reconcile-health.json`. JSON status includes `reconcile_health`; doctor alarms
-when a recorded completion is older than `reconcile_stale_min` (default 10 minutes).
+in `reconcile-health.json`. JSON status includes `reconcile_health`; doctor without
+`--pool` (for example, `yardgoat doctor --host shell --json`) alarms when a recorded
+completion is older than `reconcile_stale_min` (default 10 minutes). Pool doctor
+reports only the pool's launch chain. Both modes print the same report they save.
 Caught station launch failures are included in the error summary and retain the
 previous error-free completion time.
 This record never grants or revokes project control.

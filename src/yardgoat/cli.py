@@ -1322,10 +1322,6 @@ def cmd_doctor(a) -> int:
     try:
         cfg = runner.config()
         report = doctor.run(cfg, name=a.pool, host=a.host or "codex", lane=a.lane or "", acct=a.acct)
-        report["checks"].append(health.check(cfg))
-        report["ok"] = all(c["ok"] for c in report["checks"])
-        report["reconcile_health"] = health.read()
-        report["reason"] = "; ".join(c["reason"] for c in report["checks"] if not c["ok"])
     except (RuntimeError, OSError, ValueError) as e:
         print(f"doctor error: {e}", file=sys.stderr)
         return 2

@@ -515,13 +515,74 @@ def test_health_status_doctor_and_failure_does_not_advance_success(env, monkeypa
     assert status[0]["reconcile_health"] == result
     result["last_finished_at"] = "2000-01-01T00:00:00+0000"
     (Path(env["YARDGOAT_HOME"]) / "reconcile-health.json").write_text(json.dumps(result))
-    # Probe injection avoids real tmux, models, or a launch chain in this unit test.
-    monkeypatch.setattr(cli.doctor, "run", lambda *a, **kw: {"checks": [{"name": "launcher", "ok": True}], "ok": True})
+    # Exercise report assembly and persistence with only a local bash --version
+    # probe. The isolated fixture disables tmux and never invokes an agent.
     assert cli.cmd_doctor(SimpleNamespace(pool=None, host="shell", lane="", acct=None, json=True)) == 1
     assert "stale" in capsys.readouterr().out
     monkeypatch.setattr(cli, "_reconcile", lambda *a: (_ for _ in ()).throw(RuntimeError("broken action")))
     assert cli.cmd_reconcile(SimpleNamespace()) == 2
     assert health.read()["errors"]["count"] == 1 and "broken action" in health.read()["errors"]["first"][0]
+
+
+@pytest.mark.parametrize("pool_mode", [False, True], ids=["global", "pool"])
+@pytest.mark.parametrize("health_state", ["absent", "fresh", "stale"])
+@pytest.mark.parametrize("probe_ok", [False, True], ids=["failed-probe", "successful-probe"])
+def test_doctor_printed_report_matches_saved_report(env, tmp_path, pool_mode, health_state, probe_ok):
+    from yardgoat import doctor, health
+    root = tmp_path / "pool"
+    root.mkdir()
+    marker = tmp_path / "worker-was-called"
+    cfg = {"pools": {"fixture": {"host": "shell", "root": str(root),
+                                "command": f"touch {marker}"}}}
+    if not probe_ok:
+        cfg["source"] = [str(tmp_path / "missing-source.sh")]
+    Path(env["YARDGOAT_CONFIG"]).write_text(json.dumps(cfg))
+    if health_state != "absent":
+        health.start()
+        record = health.finish([])
+        if health_state == "stale":
+            record["last_finished_at"] = "2000-01-01T00:00:00+0000"
+            (Path(env["YARDGOAT_HOME"]) / "reconcile-health.json").write_text(json.dumps(record))
+    expected_health = health.read()
+    ok = probe_ok and (pool_mode or health_state != "stale")
+    args = ("--pool", "fixture") if pool_mode else ("--host", "shell")
+    report = call(env, "doctor", *args, "--json", rc=0 if ok else 1)
+    saved = doctor.record_path("fixture" if pool_mode else "shell-", "pool" if pool_mode else "direct")
+    assert json.loads(saved.read_text()) == report
+    assert doctor.valid_report(report) and report["ok"] is ok
+    assert "reconcile_health" not in report
+    checks = {c["name"]: c for c in report["checks"]}
+    assert checks["startup"]["ok"] is probe_ok
+    assert report["reason"] == "; ".join(c["name"] + ": " + c["reason"]
+                                         for c in report["checks"] if not c["ok"])
+    if pool_mode:
+        assert "reconcile_health" not in checks
+        state = json.loads((Path(env["YARDGOAT_HOME"]) / "pools/fixture/state.json").read_text())
+        assert state["doctor"] == report
+        if probe_ok:
+            assert doctor.ensure("fixture", cfg, "") == report
+    else:
+        assert checks["reconcile_health"]["ok"] is (health_state != "stale")
+    assert call(env, "status", "--json")[0]["reconcile_health"] == expected_health
+    assert health.read() == expected_health
+    assert not marker.exists()
+
+
+def test_status_health_is_read_only_and_reconcile_matches_saved_record(env, tmp_path):
+    from test_contract import make_task
+    from yardgoat import health
+    for task_id in ("fixture-one", "fixture-two"):
+        call(env, "submit", make_task(tmp_path, task_id=task_id), "--as", "operator")
+    result = call(env, "reconcile")["reconcile_health"]
+    assert result == health.read()
+    root = Path(env["YARDGOAT_HOME"])
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    rows = call(env, "status", "--json")
+    assert [r["task_id"] for r in rows] == ["fixture-one", "fixture-two"]
+    assert all(r["reconcile_health"] == result for r in rows)
+    single = call(env, "status", "fixture-one", "--json")
+    assert single == rows[0]
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
 
 
 def test_health_is_independent_of_control_and_error_summary_is_bounded(env, agents):
