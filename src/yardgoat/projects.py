@@ -116,9 +116,20 @@ def move(state, sid, how):
                            "since": now(), "how": how}
 
 
+def _recheck_identity(check, *args):
+    """Repeat a successful preflight under the project lock, before any replay/state use."""
+    try:
+        return check(*args)
+    except Refused as exc:
+        # Initial failures retain their original reason; this check ran only after
+        # the same authorization succeeded before waiting for the project lock.
+        raise Refused(f"identity or authorization changed while waiting for project lock: {exc}") from None
+
+
 def claim(project_id, caller, epoch):
-    sid = sessions.require_registered(caller)
+    sessions.require_registered(caller)
     with locked(project_id) as state:
+        sid = _recheck_identity(sessions.require_registered, caller)
         expect(state, epoch)
         normal(state)
         if state["claim"] != "open" or epoch != 0 or state["controller"]["session_id"] is not None:
@@ -130,8 +141,9 @@ def claim(project_id, caller, epoch):
 
 
 def reclaim(project_id, caller, epoch, cfg=None):
-    sid = sessions.require_registered(caller)
+    sessions.require_registered(caller)
     with locked(project_id) as state:
+        sid = _recheck_identity(sessions.require_registered, caller)
         if reclaim_policy(state, cfg) != "dead":
             raise Refused("project does not allow reclaim (policy is none)")
         old_session = state["controller"]["session_id"]
@@ -150,8 +162,9 @@ def reclaim(project_id, caller, epoch, cfg=None):
 
 
 def handoff(project_id, caller, target, epoch):
-    sid = sessions.require_registered(caller)
+    sessions.require_registered(caller)
     with locked(project_id) as state:
+        sid = _recheck_identity(sessions.require_registered, caller)
         expect(state, epoch)
         normal(state)
         controller(state, sid)
@@ -199,7 +212,7 @@ def transfer_actor(caller, for_session=None, cfg=None):
 
 
 def begin(project_id, caller, epoch, *, transfer_id=None, token_file=None, for_session=None, cfg=None):
-    sid, provenance = transfer_actor(caller, for_session, cfg)
+    transfer_actor(caller, for_session, cfg)
     if (transfer_id is None) != (token_file is None):
         raise ValueError("--transfer and --token-file must be supplied together for begin")
     supplied = transfer_id is not None
@@ -212,6 +225,7 @@ def begin(project_id, caller, epoch, *, transfer_id=None, token_file=None, for_s
         token = "yg-" + secrets.token_urlsafe(32)
         transfer_id = "t-" + secrets.token_hex(16)
     with locked(project_id) as state:
+        sid, provenance = _recheck_identity(transfer_actor, caller, for_session, cfg)
         # A supervisor must satisfy ALL delegated checks, even for a replay.
         # Ordinary original sessions may read terminal results after losing control.
         if for_session is not None:
@@ -266,9 +280,12 @@ def commit(project_id, transfer_id, token=None, caller=None, target=None, *, tok
         token = read_token_file(token_file)
     # An explicit target uses the bearer token; otherwise the caller must be recognized.
     # Both paths require a live registered target. The CLI separately enforces assertions.
-    if target is None:
+    use_caller = target is None
+    if use_caller:
         target = sessions.require_registered(caller)
     with locked(project_id) as state:
+        if use_caller:
+            target = _recheck_identity(sessions.require_registered, caller)
         record = transfer_record(state, transfer_id)
         check_token(record, token)
         if record["status"] == "committed":
@@ -303,6 +320,8 @@ def abort(project_id, transfer_id, token=None, caller=None, *, token_file=None, 
         token = read_token_file(token_file)
     actor, provenance = transfer_actor(caller, for_session, cfg) if token is None else ("transfer-token", {})
     with locked(project_id) as state:
+        if token is None:
+            actor, provenance = _recheck_identity(transfer_actor, caller, for_session, cfg)
         record = transfer_record(state, transfer_id)
         if token is not None:
             check_token(record, token)
@@ -325,6 +344,7 @@ def abort(project_id, transfer_id, token=None, caller=None, *, token_file=None, 
 def assign(project_id, target, epoch, cfg, administrator, reason):
     sessions.require_admin(cfg, administrator, reason)
     with locked(project_id) as state:
+        _recheck_identity(sessions.require_admin, cfg, administrator, reason)
         expect(state, epoch)
         sessions.require_target(target)
         old = snapshot(state)
