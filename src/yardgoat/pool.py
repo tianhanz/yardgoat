@@ -116,7 +116,9 @@ def get_station(name: str, station: str) -> dict | None:
 
 
 def station_alive(rec: dict | None) -> bool:
-    return bool(rec) and rec.get("state") == "running" and (runner.pid_alive(rec.get("pid")) or runner.pid_alive(rec.get("launcher_pid")))
+    """Wrapper alive, or (wrapper gone) its agent process group still running: either way the slot is taken."""
+    return bool(rec) and rec.get("state") == "running" and (
+        runner.pid_alive(rec.get("pid")) or runner.pid_alive(rec.get("launcher_pid")) or runner.pgid_alive(rec.get("worker_pgid")))
 
 
 def live_stations(name: str) -> list[dict]:
@@ -277,10 +279,14 @@ def serve_mailbox(name: str, station: str, mb: Path, cli, respond_only: bool = F
             continue  # still being written; next tick
         if respond_only:
             out = (3, {"result": "REFUSED", "reason": "station is shutting down"})
+        elif time.time() > float(r.get("expires", 1e18)):
+            out = (3, {"result": "REFUSED", "reason": "request expired before the station handled it"})
         elif r.get("op") == "claim":
             out = cli.claim_card(name, station)
         elif r.get("op") == "finish":
-            out = cli.finish_card(r.get("task_id", ""), r.get("run_id", ""), station)
+            cur = (get_station(name, station) or {}).get("current") or {}
+            late = cur.get("task_id") == r.get("task_id") and cur.get("run_id") == r.get("run_id") and time.time() > cur.get("deadline", 1e18)
+            out = cli.finish_card(r.get("task_id", ""), r.get("run_id", ""), station, late=late)
         else:
             out = (2, {"result": "ERROR", "reason": f"unknown op {r.get('op')!r}"})
         tmp = mb / f".{req.stem}.resp.tmp"

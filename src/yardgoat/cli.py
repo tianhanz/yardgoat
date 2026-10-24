@@ -455,6 +455,7 @@ def cmd_reconcile(a) -> int:
     """Server-side upkeep, safe to run concurrently: every state change re-checks under the task lock."""
     cfg = runner.config()
     report = []
+    to_close = []
     with pool.schedule_lock():
         for t in list_tasks():
             td = TaskDir(t)
@@ -484,9 +485,7 @@ def cmd_reconcile(a) -> int:
                         report.append({"task_id": t, "run_id": last["run_id"], "observed": "lost"})
                 continue
             if last["state"] == "exited" and spec.get("auto_close") and st["status"] == "exited":
-                rc, verdict = do_close(td, st["owner"], actor_note="auto_close by reconcile")
-                if verdict:
-                    report.append({"task_id": t, "run_id": last["run_id"], "auto_closed": verdict})
+                to_close.append((td, st["owner"]))  # verified after the schedule lock is released (review 3, F1)
                 continue
             if last["state"] == "running":
                 try:
@@ -515,6 +514,10 @@ def cmd_reconcile(a) -> int:
             report.append({"task_id": t, "started_from_queue": rc == 0})
         for name in pool.schedule(cfg, direct_slots_in_use):
             report.append({"station_started": name})
+    for td, owner in to_close:   # do_close re-checks state and run under the task lock
+        rc, verdict = do_close(td, owner, actor_note="auto_close by reconcile")
+        if verdict:
+            report.append({"task_id": td.task_id, "run_id": td.state()["verdict"]["run_id"], "auto_closed": verdict})
     print(json.dumps({"reconciled_at": now(), "actions": report}, ensure_ascii=False))
     return 0
 
@@ -641,7 +644,7 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
     return 0, {"result": "EMPTY"}
 
 
-def finish_card(task_id: str, run_id: str, station: str) -> tuple[int, dict]:
+def finish_card(task_id: str, run_id: str, station: str, late: bool = False) -> tuple[int, dict]:
     td = TaskDir(task_id)
     if not td.exists:
         return 3, {"result": "REFUSED", "reason": f"unknown task {task_id}"}
@@ -655,10 +658,17 @@ def finish_card(task_id: str, run_id: str, station: str) -> tuple[int, dict]:
            "actual_model": pool.station_model(run["pool"], station), "model_source": "station-log",
            "cost_basis": "shared-station"}
     bf = Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")
-    if bf.is_file() and bf.stat().st_mtime >= run.get("claimed_epoch", 0):
+    if late:  # arrived after the card's deadline: a timeout, not a normal delivery (review 3, F5)
+        out.update(exit_code=124)
+    elif bf.is_file() and bf.stat().st_mtime >= run.get("claimed_epoch", 0):
         out.update(state="blocked", question=bf.read_text(encoding="utf-8", errors="replace").strip()[:2000])
     rec = runner.record_outcome(td, run_id, out)   # checks, under the task lock, that the run is still running
-    pool.update_station(run["pool"], station, current=None)
+    with pool.station_lock(run["pool"], station):  # clear the station's hold only if it is *this* card (review 3, F2)
+        srec = pool.get_station(run["pool"], station) or {}
+        cur = srec.get("current") or {}
+        if cur.get("task_id") == task_id and cur.get("run_id") == run_id:
+            srec["current"] = None
+            write_json(pool.station_file(run["pool"], station), srec)
     if rec is None:
         return 3, {"result": "REFUSED", "reason": f"{run_id} is no longer running (timed out, lost or already finished)"}
     return 0, {"task_id": task_id, "run_id": run_id, "result": out["state"]}
@@ -670,16 +680,17 @@ def _via_mailbox(op: dict) -> int:
     mb = Path(os.environ["YARDGOAT_MAILBOX"])
     rid = uuid.uuid4().hex[:12]
     tmp = mb / f".req-{rid}.tmp"
-    tmp.write_text(json.dumps(op, ensure_ascii=False))
+    end = time.time() + 300
+    tmp.write_text(json.dumps({**op, "expires": end - 5}, ensure_ascii=False))
     os.replace(tmp, mb / f"req-{rid}.json")
     resp = mb / f"resp-{rid}.json"
-    end = time.time() + 300
     while time.time() < end:
         if resp.exists():
             r = json.loads(resp.read_text()); resp.unlink(missing_ok=True)
             print(json.dumps(r["out"], ensure_ascii=False))
             return r["rc"]
         time.sleep(0.2)
+    (mb / f"req-{rid}.json").unlink(missing_ok=True)  # withdraw it; the broker also refuses expired requests
     print(json.dumps({"result": "ERROR", "reason": "station wrapper did not answer within 300 s"}))
     return 2
 

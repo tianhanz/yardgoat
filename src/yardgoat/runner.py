@@ -198,6 +198,13 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay
         run = next(r for r in st["runs"] if r["run_id"] == run_id)
         if run["state"] != "running":
             return None
+        existing = rd / "receipt.json"
+        if not replay and existing.exists():
+            try:  # a receipt already on disk is the first committed result: finish committing it, never overwrite it
+                ex0 = read_json(existing)
+                replay = ex0.get("task_id") == td.task_id and ex0.get("run_id") == run_id
+            except (OSError, ValueError):
+                replay = False
         if replay:
             receipt = read_json(rd / "receipt.json")
             state = STATE_OF.get(receipt.get("status"), "exited")
@@ -224,7 +231,9 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay
                 receipt["reason"] = outcome.get("reason", "")
             write_json(rd / "receipt.json", receipt)
         run.update(state=state, exit_code=receipt.get("exit_code"), finished_at=receipt["finished_at"])
-        if state == "blocked":
+        if st["status"] in ("archived", "verified"):
+            pass  # a terminal task keeps its status; only the run record is completed (review 3, F7)
+        elif state == "blocked":
             st["status"] = "parked"
             st["question"] = {"run_id": run_id, "text": receipt.get("question", ""), "at": receipt["finished_at"]}
         elif state in ("lost", "launch_failed"):

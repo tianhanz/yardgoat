@@ -104,9 +104,15 @@ def test_reconcile_marks_a_vanished_direct_run_lost_and_allows_redispatch(tmp_pa
     yg(env, "dispatch", "t-demo", "--as", "A")
     time.sleep(1.5)
     st = json.loads(yg(env, "status", "t-demo", "--json")[1])
+    # a run has vanished only when its worker process group is gone too (review 3, F3)
     for pid in {st["runs"][0].get("worker_pid"), st["runs"][0].get("pid")} - {None}:
         try:
             os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if st["runs"][0].get("worker_pgid"):
+        try:
+            os.killpg(st["runs"][0]["worker_pgid"], signal.SIGKILL)
         except ProcessLookupError:
             pass
     time.sleep(0.5)

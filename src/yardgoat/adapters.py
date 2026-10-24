@@ -42,8 +42,8 @@ class Direct:
 
     def poll(self, td: TaskDir, run: dict, spec: dict, cfg: dict):
         # the runner writes the receipt itself; we only notice runs whose process died without one
-        if runner.pid_alive(run.get("worker_pid")) or runner.pid_alive(run.get("pid")):
-            return None
+        if runner.pgid_alive(run.get("worker_pgid")) or runner.pid_alive(run.get("worker_pid")) or runner.pid_alive(run.get("pid")):
+            return None  # the worker's process group is still alive: not lost, keep its slot
         if (td.run_dir(run["run_id"]) / "receipt.json").exists():
             return None  # already recorded by the runner
         return {"state": "lost", "reason": "worker process ended without writing a receipt"}
