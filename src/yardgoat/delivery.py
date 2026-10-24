@@ -39,7 +39,7 @@ def view(td: TaskDir, st: dict, spec: dict) -> dict:
             receipt = read_json(path)
             records = receipt.get("on_pass", [])
             reason = receipt.get("delivery_reason", reason)
-    pending = bool(spec.get("on_pass") and st.get("verdict", {})
+    pending = bool(st.get("status") == "verified" and spec.get("on_pass") and st.get("verdict", {})
                    and st["verdict"]["verdict"] == "PASS" and not complete(spec["on_pass"], records))
     return {"on_pass": records, "delivery_failed": pending, "delivery_pending": pending,
             "delivery_reason": (reason or failure_reason(records) or "收尾未完成") if pending else None}

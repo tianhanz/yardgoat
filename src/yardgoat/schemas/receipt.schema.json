@@ -74,7 +74,9 @@
     "failed",
     "verifier_error",
     "launch_failed",
-    "provider_refused"
+    "provider_refused",
+    "reviewing",
+    "reviewed"
    ]
   },
   "verifier": {
@@ -232,6 +234,222 @@
     "string",
     "null"
    ]
+  },
+  "review": {
+   "type": "object",
+   "required": [
+    "rounds",
+    "complete"
+   ],
+   "properties": {
+    "rounds": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "round",
+       "task_id",
+       "run_id",
+       "status",
+       "findings_count"
+      ],
+      "properties": {
+       "round": {
+        "type": "integer",
+        "minimum": 1
+       },
+       "task_id": {
+        "type": "string"
+       },
+       "run_id": {
+        "type": "string"
+       },
+       "status": {
+        "enum": [
+         "pending",
+         "processed"
+        ]
+       },
+       "findings_count": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "minimum": 0
+       },
+       "blocking_count": {
+        "type": "integer",
+        "minimum": 0
+       },
+       "findings": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "required": [
+          "id",
+          "severity",
+          "file",
+          "line",
+          "title",
+          "scenario",
+          "fix"
+         ],
+         "properties": {
+          "id": {
+           "type": "string",
+           "minLength": 1,
+           "pattern": "\\S"
+          },
+          "file": {
+           "type": "string",
+           "minLength": 1,
+           "pattern": "\\S"
+          },
+          "title": {
+           "type": "string",
+           "minLength": 1,
+           "pattern": "\\S"
+          },
+          "scenario": {
+           "type": "string",
+           "minLength": 1,
+           "pattern": "\\S"
+          },
+          "fix": {
+           "type": "string",
+           "minLength": 1,
+           "pattern": "\\S"
+          },
+          "severity": {
+           "enum": [
+            "blocker",
+            "major",
+            "minor",
+            "info"
+           ]
+          },
+          "line": {
+           "type": "integer",
+           "minimum": 1
+          }
+         }
+        }
+       },
+       "decision": {
+        "enum": [
+         "repair",
+         "park",
+         "pass",
+         "pass_with_followups"
+        ]
+       },
+       "followups": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "review_run_id": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "complete": {
+     "type": "boolean"
+    },
+    "outcome": {
+     "enum": [
+      "park",
+      "pass",
+      "pass_with_followups"
+     ]
+    }
+   }
+  },
+  "review_round": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "review_of": {
+   "type": "object",
+   "required": [
+    "task_id",
+    "round"
+   ],
+   "properties": {
+    "task_id": {
+     "type": "string"
+    },
+    "round": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "run_id": {
+     "type": "string"
+    }
+   }
+  },
+  "review_findings": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": [
+     "id",
+     "severity",
+     "file",
+     "line",
+     "title",
+     "scenario",
+     "fix"
+    ],
+    "properties": {
+     "id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+     },
+     "file": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+     },
+     "title": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+     },
+     "scenario": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+     },
+     "fix": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+     },
+     "severity": {
+      "enum": [
+       "blocker",
+       "major",
+       "minor",
+       "info"
+      ]
+     },
+     "line": {
+      "type": "integer",
+      "minimum": 1
+     }
+    }
+   }
+  },
+  "findings_count": {
+   "type": [
+    "integer",
+    "null"
+   ],
+   "minimum": 0
   }
  }
 }

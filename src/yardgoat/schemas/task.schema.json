@@ -182,7 +182,7 @@
   },
   "on_pass": {
    "type": "array",
-   "description": "Ordered owner-side shell commands run only after a PASS verdict. Commands and working directories are frozen in content_hash.",
+   "description": "Ordered owner-side shell commands after final PASS, including any configured review loop.",
    "items": {
     "type": "object",
     "required": [
@@ -213,6 +213,77 @@
    "type": "number",
    "exclusiveMinimum": 0,
    "description": "Per-step timeout in seconds. Overrides local on_pass_timeout; default 600."
+  },
+  "review": {
+   "type": "object",
+   "required": [
+    "pool"
+   ],
+   "properties": {
+    "pool": {
+     "type": "string",
+     "minLength": 1,
+     "pattern": "\\S"
+    },
+    "rounds": {
+     "type": "integer",
+     "minimum": 1,
+     "default": 3
+    },
+    "blocking": {
+     "type": "array",
+     "items": {
+      "enum": [
+       "blocker",
+       "major",
+       "minor",
+       "info"
+      ]
+     },
+     "default": [
+      "blocker",
+      "major"
+     ]
+    },
+    "after_max_rounds": {
+     "enum": [
+      "pass_with_followups",
+      "park"
+     ],
+     "default": "park"
+    },
+    "path": {
+     "type": "string",
+     "minLength": 1,
+     "pattern": "^(?!/|~)(?!.*(?:^|/)\\.\\.(?:/|$)).+",
+     "default": ".",
+     "description": "Directory relative to workdir to snapshot and review. Must be inside workdir; the review workspace and owner store must be outside this directory."
+    }
+   },
+   "description": "Automatic frozen verification, independent pool review and bounded repair loop. Pool and effective lane must differ from execution; review enables auto-close."
+  },
+  "review_of": {
+   "type": "object",
+   "required": [
+    "task_id",
+    "round"
+   ],
+   "properties": {
+    "task_id": {
+     "type": "string"
+    },
+    "round": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "run_id": {
+     "type": "string"
+    }
+   }
+  },
+  "review_followup": {
+   "type": "object",
+   "description": "Generated follow-up provenance; accepted tasks appear in inbox without automatic dispatch."
   }
  }
 }

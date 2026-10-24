@@ -1,4 +1,4 @@
-# Design (P0 + P1 + pools)
+# Design (P0 + P1 + pools + engineering review)
 
 Yardgoat puts one dispatch contract in front of the agent fleets you already run. P0 is the smallest
 piece that makes the contract real: a file-backed task store, a CLI, and a direct runner.
@@ -23,7 +23,7 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 2. **One owner.** Only the current owner can dispatch or close. Ownership moves only through `takeover --from <current owner>`, which records whether a run was in flight.
 3. **No duplicate dispatch.** While a run is alive, `dispatch` returns the existing run. A run that exited must be verified before another attempt.
 4. **Frozen verification.** The card and every file listed in `verifier.freeze` are hashed at submit; any drift blocks both dispatch and close.
-5. **Exited ≠ verified.** A normal worker exit only writes a receipt with `status: exited`. `close` runs the verifier: exit 0 → `passed`, exit 1 → `failed` (retry allowed within `budget.max_attempts`), anything else → `verifier_error` (a crashing verifier is not a failing deliverable).
+5. **Exited ≠ verified.** A normal worker exit only writes a receipt with `status: exited`. `close` runs the verifier: exit 0 → `passed` (or `reviewing` when review is configured), exit 1 → `failed` (retry allowed within `budget.max_attempts`), anything else → `verifier_error` (a crashing verifier is not a failing deliverable).
 6. **Bounded attempts.** When the budget is spent the task becomes `exhausted` and needs a human.
 
 7. **Lane policy at the dispatch edge.** If a spec lists `allowed_lanes`, the executor lane must be in it; lanes in the local config's `forbidden_lanes` are refused on that machine regardless of the spec.
@@ -83,7 +83,8 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     the scheduler compares `workdir + scope` against every running task and active delivery write set, across all adapters and
     pools. The check, reservation and start share the machine schedule lock; claim follows schedule → pool →
     task lock order. Conflicts keep the same run queued, spend no attempt, and name the conflicting task and
-    absolute path in `status` and reconcile output. Every worker outcome releases its reservation; reconcile
+    absolute path in `status` and reconcile output. Every worker outcome releases its run reservation; review-enabled
+    tasks also hold a task-level reservation until final verification or archive. Reconcile
     then starts eligible queued work (or makes pool cards available for claim). An uncertain remote submit
     retains its reservation because it may already be executing. Scope waits alone do not spawn stations.
 22. **Approval is separate from answers.** A frozen `risk: l3` card needs `approve` before dispatch, queued
@@ -96,6 +97,10 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     the verification verdict PASS and task status verified, sets `delivery_failed`, stops later steps,
     and appears in inbox. `deliver` retries the first unsuccessful step; successful recorded steps are
     skipped. Auto-close follows exactly the same verification and delivery path.
+24. **Review is part of acceptance.** A frozen verifier PASS starts the configured independent review;
+    it does not verify the parent. While reviewing or repairing, dependencies and delivery remain gated,
+    and the task-level write set stays reserved. Only a clean review or the explicit round-limit
+    `pass_with_followups` policy reaches verified. Review child verification failures cannot produce PASS.
 
 ## Launch-chain health checks
 
@@ -256,6 +261,66 @@ count as human decisions.
 
 Issue-driven and queue-file adapters (beyond `file-pool`), an MCP entry point, cost/model-call budget
 gates, leases for multi-host stores, and richer evaluation data. See the roadmap in the README.
+
+## Engineering review loop
+
+The accepted `review` object names `pool`, optional `path` (default `.` relative to workdir),
+`rounds` (default 3), `blocking` (default blocker/major) and `after_max_rounds` (default park).
+All fields participate in the content hash. Pool names and effective lanes must differ from
+the execution channel; if both lanes are absent the hosts must differ. Checks occur at submit,
+parent launch, review creation and review child launch, so configuration changes cannot silently
+turn a review into self-review. Configured review enables auto-close for execution and repairs.
+
+After frozen acceptance, `review.begin` records a pending round containing the exact child id
+`<parent>-review-<n>` and the execution run id. Parent/run/receipt become `reviewing` with the
+verifier PASS retained as evidence. Successful reviewed runs transition to `reviewed` when a
+repair is requested. These successful rounds are excluded from the failure retry counter;
+failed repairs still consume the original `max_attempts`. The review round budget advances
+only after frozen acceptance succeeds, including when a repair needed failure retries.
+
+`review.advance` holds schedule → parent → child locks for child creation and result decisions.
+Generated cards, snapshot manifests and standalone verifier copies live in owner-side
+`reviews/<parent>/<round>/`; accepted specs have the ordinary authoritative frozen copies.
+Review workdirs live under the review pool root in `.yardgoat-reviews/<child>/`, with `target/`
+containing a snapshot and `out/` containing the review. The original directory and snapshot are
+both checked for additions, removals, file bytes, modes, empty directories and symlink destinations.
+Links are copied without traversal; findings must name ordinary files inside the snapshot.
+The target and owner store must not contain the review workspace, avoiding recursive snapshots.
+This is an integrity check at verification time, not an OS read-only mount or a monitor of
+transient writes. Other scoped workers are excluded by the retained lease.
+
+The standalone verifier requires a nonempty REVIEW.md, a JSON array, unique nonempty finding
+IDs, known severities, concrete file/line references and nonempty title/scenario/fix strings.
+It returns the validated findings on stdout; close saves those bytes as structured receipt
+data before marking the child verified. Parent decisions read that receipt, never the mutable
+findings output after verification. The child has a two-attempt failure budget. Failed output
+validation retries the child; exhaustion, verifier error, archive, refusal or a blocked child
+parks the parent with an inspectable reason. Answering cannot skip a pending child result.
+
+Round records, deterministic child/follow-up IDs and numbered `review-NNN` answer keys make repeated
+close and reconcile safe. Answers use the same prompt mechanism as human replies and are
+attributed to the reconciler. Numeric prefixes preserve ordering with human answers. A result event has a stable round ID and is replayed without
+duplicates. The child and its frozen receipt are the durable source for replay if the parent
+controller stops before saving its state; existing accepted child IDs are never overwritten.
+Takeover takes the schedule lock and changes child owners with the parent; reconciliation also
+repairs an interrupted owner propagation. Direct child takeover is refused in favor of the parent.
+
+Blocking findings before the limit trigger one repair dispatch. Without blocking findings the
+parent becomes verified and follows the normal M3 delivery path. At the limit, park leaves the
+parent unverified with findings in its question and retains its write set until archive. Answering
+does not reset the immutable round budget. `pass_with_followups` accepts one follow-up per remaining
+finding (including nonblocking ones), then verifies the parent. Follow-ups inherit execution,
+scope, risk, authority and frozen acceptance; they have no review or on_pass automation and no
+run until explicitly dispatched. They appear as accepted decisions in inbox. An l3 follow-up
+requires a new approval; repairs of the original card retain its valid original approval.
+
+The original task holds `review_reservation` from worker launch/claim, across exits, verification,
+review waits and repair queueing. New repair reservations union with the retained prefixes.
+Review children write only their separate out directory, so they do not conflict with their
+parent. Final verification removes the review lease and invokes normal M3 delivery; archive
+also stops reserving it. Each execution/repair receipt has `review_round`; child receipts also
+include `review_of`, `review_findings`, `findings_count`. Parent receipts retain round summaries
+and the final receipt includes all rounds, decisions, finding counts and follow-up task IDs.
 
 ## Reports and pending reminders
 

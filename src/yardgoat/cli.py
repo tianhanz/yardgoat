@@ -34,7 +34,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import adapters, contract, delivery, doctor, notify, pool, report, runner, scheduling
+from . import adapters, contract, delivery, doctor, notify, pool, report, review, runner, scheduling
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 REFUSED = 3
@@ -53,6 +53,9 @@ def adapter_kind(spec: dict) -> str:
 def cmd_submit(a) -> int:
     try:
         spec = contract.load_spec_file(a.spec)
+        problem = review.channel_problem(spec, runner.config())
+        if problem:
+            raise contract.SpecError(problem)
         frozen = contract.freeze(spec)
     except (contract.SpecError, OSError, ValueError) as e:
         print(f"spec error: {e}", file=sys.stderr)
@@ -70,6 +73,8 @@ def cmd_submit(a) -> int:
                 return 0
             return refuse(f"{td.task_id} already exists with different content (task ids are immutable)")
         try:
+            if "review_of" in spec or "review_followup" in spec:
+                raise contract.SpecError("review_of and review_followup are reserved for generated review tasks")
             scheduling.validate_dependencies(spec)
         except contract.SpecError as e:
             print(f"spec error: {e}", file=sys.stderr)
@@ -239,6 +244,10 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
                 return refuse(f"owner is {st['owner']}, not {who}")
             if st["status"] in ("verified", "exhausted", "archived"):
                 return refuse(f"task is {st['status']}")
+            if st["status"] == "reviewing" or st.get("review", {}).get("complete"):
+                return refuse("review is pending or its round budget is complete")
+            if any(r["status"] == "pending" for r in st.get("review", {}).get("rounds", [])):
+                return refuse("a review result is still pending; reconcile it before starting a repair")
             if st["status"] == "parked":
                 return refuse("task is parked waiting for an answer; use `yardgoat answer`")
             if actor_note.startswith("resumed by reconcile") and st["status"] != "answered":
@@ -266,6 +275,8 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
             run_id = f"r{len(st['runs']) + 1}"
             td.run_dir(run_id).mkdir(parents=True, exist_ok=True)
             run = {"run_id": run_id, "state": "queued", "dispatched_by": who, "queued_at": now(), "mode": "queued"}
+            if spec.get("review"):
+                run["review_round"] = len(st.get("review", {}).get("rounds", [])) + 1
             if st.get("approval"):
                 run["approval"] = dict(st["approval"])
             if adapter_kind(spec) == "pool":
@@ -312,7 +323,13 @@ def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
             return str(e)
         if w:
             return w
-    return lane_problem(spec, cfg)
+    problem = review.channel_problem(spec, cfg)
+    if spec.get("review_of"):
+        parent = TaskDir(spec["review_of"]["task_id"])
+        problem = review.channel_problem(parent.spec(), cfg)
+        if parent.state()["status"] != "reviewing":
+            return "review parent is no longer waiting for this review"
+    return problem or lane_problem(spec, cfg)
 
 
 def _wait_for_dependencies(td: TaskDir, st: dict, run: dict, waiting: list[str], actor: str) -> None:
@@ -375,6 +392,7 @@ def start_queued(td: TaskDir, actor: str, actor_note: str = "", echo: bool = Tru
             run["state"] = "launch_failed"; run["reason"] = problem; st["status"] = "accepted"
             return refuse(problem)
         run.update(state="running", started_at=now(), write_set=scheduling.write_set(spec))
+        review.reserve(st, run, spec)
         if st.get("approval"):
             run["approval"] = dict(st["approval"])
         st["status"] = "running"
@@ -438,6 +456,7 @@ def _status_obj(td: TaskDir) -> dict:
         backoff = {**backoff, "pool": name}
     return {"task_id": td.task_id, "status": st["status"], "owner": st["owner"], "owner_history": st["owner_history"],
             "approval": st.get("approval"), "approval_required": bool(needs_approval),
+            "review": st.get("review"),
             **delivery.view(td, st, td.spec()),
             "pool_backoff": backoff,
             "pool_doctor": health, "pool_problem": problem,
@@ -496,13 +515,16 @@ def cmd_takeover(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
         return refuse(f"unknown task {a.task_id}")
-    with td.locked() as box:
+    if td.spec().get("review_of"):
+        return refuse(f"take over the review parent {td.spec()['review_of']['task_id']} instead")
+    with pool.schedule_lock(), td.locked() as box:
         st = box["state"]
         if st["owner"] != a.from_:
             return refuse(f"current owner is {st['owner']}, not {a.from_}")
         st["owner_history"].append({"from": a.from_, "to": a.as_, "at": now(),
                                     "run_in_flight": (_active_run(st) or {}).get("run_id")})
         st["owner"] = a.as_
+        review.sync_owners(td, st, a.from_)
     td.event("task.owner_changed", a.as_, previous=a.from_)
     print(json.dumps({"task_id": td.task_id, "result": "owner-changed", "from": a.from_, "to": a.as_}))
     return 0
@@ -517,6 +539,15 @@ def cmd_close(a) -> int:
 
 
 def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -> tuple[int, str | None]:
+    # Repeated close can recover an interrupted child submit without rerunning verification.
+    before = td.state()
+    if before["status"] == "reviewing":
+        if before["owner"] != who:
+            return refuse(f"owner is {before['owner']}, not {who}"), None
+        rc = review.advance(td, who)
+        if echo:
+            print(json.dumps({"task_id": td.task_id, "status": td.state()["status"], "verdict": "PASS"}))
+        return rc, "PASS"
     with td.locked() as box:
         st = box["state"]
         if st["owner"] != who:
@@ -548,6 +579,14 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
         except subprocess.TimeoutExpired:
             rc = 124
         verdict = {0: "PASS", 1: "FAIL"}.get(rc, "ERROR")
+        review_findings = None
+        if verdict == "PASS" and spec.get("review_of"):
+            try:
+                review_findings = json.loads(p.stdout)["findings"]
+                if not isinstance(review_findings, list):
+                    raise ValueError("review verifier did not return an array")
+            except (ValueError, KeyError, TypeError):
+                verdict, rc = "ERROR", 2
         checked = now()
         rec_p = rd / "receipt.json"
         rec = json.loads(rec_p.read_text())
@@ -555,7 +594,12 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
                            "checked_at": checked, "checked_by": who}
         if verdict == "PASS":
             rec["status"] = "passed"; last["state"] = "verified"; st["status"] = "verified"
-            if spec.get("on_pass"):
+            if review_findings is not None:
+                rec.update(review_findings=review_findings, findings_count=len(review_findings),
+                           review_round=spec["review_of"]["round"])
+            if spec.get("review"):
+                review.begin(st, last, rec)
+            elif spec.get("on_pass"):
                 delivery.mark_pending(st, rec)
         elif verdict == "FAIL":
             rec["status"] = "failed"; last["state"] = "failed"
@@ -566,10 +610,17 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
         write_json(rec_p, rec)
         st["verdict"] = {"run_id": last["run_id"], "verdict": verdict, "by": who, "at": checked}
     td.event("run.verified", who, run_id=last["run_id"], verdict=verdict, note=actor_note)
-    delivery_rc = do_deliver(td, who) if verdict == "PASS" and spec.get("on_pass") else 0
+    delivery_rc = 0
+    if verdict == "PASS":
+        if spec.get("review"):
+            delivery_rc = review.advance(td, who)
+        elif spec.get("review_of"):
+            delivery_rc = review.advance(TaskDir(spec["review_of"]["task_id"]))
+        elif spec.get("on_pass"):
+            delivery_rc = do_deliver(td, who)
     if echo:
         result = {"task_id": td.task_id, "run_id": last["run_id"], "verdict": verdict}
-        if spec.get("on_pass") and verdict == "PASS":
+        if spec.get("on_pass") and verdict == "PASS" and td.state()["status"] == "verified":
             result.update(delivery.view(td, td.state(), spec))
             result["delivery_exit_code"] = delivery_rc
         print(json.dumps(result))
@@ -634,7 +685,7 @@ def cmd_park(a) -> int:
         st = box["state"]
         if st["owner"] != a.as_:
             return refuse(f"owner is {st['owner']}, not {a.as_}")
-        if st["status"] in ("archived", "verified", "exhausted", "parked", "answered"):
+        if st["status"] in ("archived", "verified", "exhausted", "parked", "answered", "reviewing"):
             return refuse(f"task is {st['status']}; it cannot be parked")
         if _active_run(st):
             return refuse("a run is in flight; park after it ends")
@@ -648,6 +699,26 @@ def cmd_park(a) -> int:
     return 0
 
 
+def append_answer(td: TaskDir, actor: str, text: str, key: str | None = None) -> str:
+    """Caller holds the task lock. Stable keys make review replies replayable."""
+    d = td.path / "answers"
+    d.mkdir(exist_ok=True)
+    ordinal = len(list(d.glob("*.md"))) + 1
+    if key:
+        existing = sorted(d.glob(f"*-{key}.md"))
+        key = existing[0].stem if existing else f"{ordinal:03d}-{key}"
+    else:
+        key = f"{ordinal:03d}"
+    path = d / f"{key}.md"
+    if not path.exists():
+        temporary = d / f".{key}.{os.getpid()}.tmp"
+        temporary.write_text(f"(answered by {actor} at {now()})\n\n{text.strip()}\n", encoding="utf-8")
+        os.replace(temporary, path)
+    if not any(e["kind"] == "task.answered" and e.get("answer") == key for e in td.events()):
+        td.event("task.answered", actor, answer=key)
+    return key
+
+
 def cmd_answer(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
@@ -659,13 +730,11 @@ def cmd_answer(a) -> int:
         st = box["state"]
         if st["status"] != "parked":
             return refuse(f"task is {st['status']}, not parked")
-        d = td.path / "answers"
-        d.mkdir(exist_ok=True)
-        n = len(list(d.glob("*.md"))) + 1
-        (d / f"{n:03d}.md").write_text(f"(answered by {a.as_} at {now()})\n\n{text.strip()}\n", encoding="utf-8")
+        append_answer(td, a.as_, text)
         st["status"] = "answered"
+        if any(r["status"] == "pending" for r in st.get("review", {}).get("rounds", [])):
+            st["status"] = "reviewing"
         st["question"]["answered_by"] = a.as_
-    td.event("task.answered", a.as_, answer=f"{n:03d}")
     print(json.dumps({"task_id": td.task_id, "result": "answered", "note": "reconcile resumes it on behalf of the owner"}))
     return 0
 
@@ -681,6 +750,11 @@ def cmd_inbox(a) -> int:
         if ad.get("kind") == "pool" and not pool.pools(cfg).get(ad["pool"]):
             missing_pools.add(ad["pool"])
         progress = delivery.view(td, st, td.spec())
+        if st["status"] == "accepted" and td.spec().get("review_followup"):
+            items.append({"task_id": t, "status": "accepted", "owner": st["owner"],
+                          "question": "Review follow-up awaiting a dispatch decision",
+                          "review_followup": td.spec()["review_followup"]})
+            continue
         if st["status"] == "verified" and progress["delivery_pending"]:
             reason = progress["delivery_reason"]
             items.append({"task_id": t, "status": "verified", "owner": st["owner"],
@@ -751,7 +825,7 @@ def cmd_reconcile(a) -> int:
                     if receipt:
                         report.append({"task_id": t, "run_id": last["run_id"], "observed": receipt["status"]})
                 continue
-            if last["state"] == "exited" and spec.get("auto_close") and st["status"] == "exited":
+            if last["state"] == "exited" and (spec.get("auto_close") or spec.get("review")) and st["status"] == "exited":
                 to_close.append((td, st["owner"]))  # verified after the schedule lock is released (review 3, F1)
                 continue
             if last["state"] == "running":
@@ -764,6 +838,9 @@ def cmd_reconcile(a) -> int:
             elif st["status"] == "answered":
                 rc = do_dispatch_locked(td, st["owner"], "resumed by reconcile after an answer")
                 report.append({"task_id": t, "resumed": rc == 0})
+            elif st["status"] == "failed" and spec.get("review"):
+                rc = do_dispatch_locked(td, st["owner"], "automatic retry within review failure budget")
+                report.append({"task_id": t, "retried": rc == 0})
         # Poll all workers before releasing dependency waits or scope reservations. A verifier
         # runs outside this lock; its downstream tasks become eligible on the following tick.
         # Release dependency waits before sorting the queue, so their new queued_at participates
@@ -816,9 +893,14 @@ def cmd_reconcile(a) -> int:
         rc, verdict = do_close(td, owner, actor_note="auto_close by reconcile")
         if verdict:
             action = {"task_id": td.task_id, "run_id": td.state()["verdict"]["run_id"], "auto_closed": verdict}
-            if verdict == "PASS" and td.spec().get("on_pass"):
+            if verdict == "PASS" and td.spec().get("on_pass") and td.state()["status"] == "verified":
                 action.update(delivery.view(td, td.state(), td.spec()), delivery_exit_code=rc)
             report.append(action)
+    for t in list_tasks():
+        td = TaskDir(t)
+        if td.state()["status"] == "reviewing":
+            rc = review.advance(td)
+            report.append({"task_id": t, "review_status": td.state()["status"], "review_exit_code": rc})
     notified = notify.notify_pending(cfg)
     print(json.dumps({"reconciled_at": now(), "actions": report, "notified": notified}, ensure_ascii=False))
     return 0
@@ -946,6 +1028,7 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                            log_start=pool.log_position(pool_name, station),
                            blocked_before=runner.file_fingerprint(Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")),
                            write_set=scheduling.write_set(spec))
+                review.reserve(st, run, spec)
                 st["status"] = "running"
                 if st.get("approval"):
                     run["approval"] = dict(st["approval"])

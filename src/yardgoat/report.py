@@ -15,7 +15,7 @@ ABNORMAL = ("lost", "launch_failed", "submit_unknown", "verify_error", "provider
 # Match the dispatch budget; a queued/cancelled, blocked or refused launch is not an attempt.
 ATTEMPTS = {"exited", "failed", "verified", "lost", "verify_error"}
 NORMAL = {"accepted", "queued", "running", "exited", "verified", "failed", "exhausted",
-          "blocked", "parked", "answered", "archived", "cancelled"}
+          "blocked", "parked", "answered", "archived", "cancelled", "reviewing", "reviewed"}
 ALIASES = {"passed": "verified", "verifier_error": "verify_error", "canceled": "cancelled"}
 INTERVENTIONS = {"task.answered": "answer", "task.owner_changed": "takeover",
                  "task.archived": "archive", "run.cancelled": "cancel", "task.approved": "approve"}
@@ -150,7 +150,7 @@ def _facts(state, receipts, events, machine_actors):
         receipt = receipts.get(run["run_id"], {})
         run_events = by_run[run["run_id"]]
         statuses = _statuses(run, receipt, run_events)
-        if statuses & ATTEMPTS:
+        if statuses & ATTEMPTS and run.get("state") not in ("reviewing", "reviewed"):
             attempts += 1
             if attempts == 1:
                 verdicts = [e["verdict"] for e in run_events if e.get("kind") == "run.verified" and e.get("verdict")]
