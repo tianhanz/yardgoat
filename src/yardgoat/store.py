@@ -75,12 +75,20 @@ class TaskDir:
         return self.path.parent.parent / "frozen" / f"{self.task_id}.json"
 
     def spec(self) -> dict:
-        """The accepted spec. The authoritative copy lives outside the task store that stations may touch."""
+        """Accepted spec plus any explicit owner-confirmed legacy review policy.
+
+        Both live in the authoritative frozen record, outside station-writable state.
+        The original spec and its content hash remain unchanged by confirmation.
+        """
         f = self.frozen_path
         if f.exists():
             d = read_json(f)
             if "spec" in d:
-                return d["spec"]
+                spec = d["spec"]
+                confirmation = d.get("review_confirmation")
+                if confirmation and spec.get("review") and not spec["review"].get("channel"):
+                    spec["review"]["channel"] = confirmation["channel"]
+                return spec
         return read_json(self.path / "spec.json")
 
     def event(self, kind: str, actor: str, **data) -> dict:

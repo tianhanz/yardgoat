@@ -189,7 +189,7 @@ def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
             # one more station per `spawn_per_queued` waiting cards: small batches stay on one warm station.
             # Only stations without a card in hand count as available — a station busy with a long card does not.
             k = max(1, int(c.get("spawn_per_queued", 1)))
-            free = sum(1 for x in live if not x.get("current"))
+            free = sum(1 for x in live if not x.get("current") and not x.get("restart_required"))
             want = min(-(-q // k) - free, int(c.get("max_stations", 1)) - len(live))
             while want > 0:
                 if provider_backoff(name, cfg, next_station(name, c)[1]):

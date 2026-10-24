@@ -64,7 +64,7 @@ def channel_problem(spec: dict, cfg: dict, executor: dict | None = None,
         return f"review pool {r['pool']!r} is not configured"
     frozen = r.get("channel")
     if frozen is None:
-        return "review channel was not frozen; submit a new task"
+        return "review channel was not frozen; owner must use confirm-review-channel"
     if pool.channel(current) != frozen:
         return "review pool channel changed since submit; restore its frozen host/lane"
     if reviewer is not None and reviewer != frozen:
@@ -118,24 +118,93 @@ def prepare(spec: dict, cfg: dict) -> None:
             raise contract.SpecError(problem)
 
 
-def child_problem(spec: dict, cfg: dict, station: dict | None = None) -> str | None:
+def confirm_channel(td: TaskDir, st: dict, who: str, run_channels: list) -> dict:
+    """Explicit migration under schedule/task locks; never infer a historical launch."""
+    from . import cli
+    if st["owner"] != who:
+        raise contract.SpecError(f"owner is {st['owner']}, not {who}")
+    if st["status"] in ("verified", "archived", "exhausted"):
+        raise contract.SpecError(f"task is {st['status']}")
+    spec = td.spec()
+    if not spec.get("review"):
+        raise contract.SpecError("task has no review policy")
+    changed = cli.checked_drift(td, st)
+    if changed:
+        raise contract.SpecError(f"frozen files changed: {changed}")
+    auth = read_json(td.frozen_path) if td.frozen_path.exists() else {
+        "spec": spec, "content_hash": st["content_hash"], "frozen": st["frozen"]}
+    record = auth.get("review_confirmation")
+    supplied = {}
+    runs = {r["run_id"]: r for r in st["runs"]}
+    for rid, host, lane in run_channels:
+        if rid not in runs or rid in supplied or host not in contract.HOSTS:
+            raise contract.SpecError(f"invalid or duplicate --run-channel: {rid} {host} {lane}")
+        supplied[rid] = {"host": host, "lane": lane}
+    if record is None:
+        if spec["review"].get("channel"):
+            raise contract.SpecError("review channel is already frozen at submission")
+        cfg = runner.config()
+        spec["review"]["channel"] = pool.channel(pool.pool_conf(cfg, spec["review"]["pool"]))
+        identities = {}
+        for rid, run in runs.items():
+            identity = run.get("channel") or supplied.get(rid)
+            started = run.get("started_at") or run["state"] not in (
+                "queued", "waiting_deps", "blocked_deps", "cancelled", "launch_failed")
+            if started and not identity:
+                raise contract.SpecError(
+                    f"execution run {rid} has no recorded channel; explicitly confirm "
+                    f"--run-channel {rid} HOST LANE (use an empty string for no lane)")
+            if identity:
+                if rid in supplied and supplied[rid] != identity:
+                    raise contract.SpecError(f"--run-channel contradicts recorded identity for {rid}")
+                problem = channel_problem(spec, cfg, identity)
+                if problem:
+                    raise contract.SpecError(problem)
+                identities[rid] = identity
+        if not identities:
+            problem = channel_problem(spec, cfg)
+            if problem:
+                raise contract.SpecError(problem)
+        for number in range(1, spec["review"]["rounds"] + 1):
+            problem = workspace_problem(spec, cfg, number, st.get("review_reservation", {}).get("write_set", []))
+            if problem:
+                raise contract.SpecError(problem)
+        record = {"by": who, "at": now(), "channel": spec["review"]["channel"],
+                  "run_channels": identities, "confirmed_run_channels": supplied}
+    # Repeat confirmation replays the original record, even after pool config changes.
+    for rid, identity in supplied.items():
+        if record["run_channels"].get(rid) != identity:
+            raise contract.SpecError(f"confirmation cannot change the identity of {rid}")
+    for rid, identity in record["run_channels"].items():
+        if runs[rid].get("channel") and runs[rid]["channel"] != identity:
+            raise contract.SpecError(f"recorded run channel changed for {rid}")
+    if "review_confirmation" not in auth:
+        auth["review_confirmation"] = record
+        td.frozen_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(td.frozen_path, auth)
+    for rid, identity in record["run_channels"].items():
+        runs[rid]["channel"] = identity
+        runs[rid]["channel_confirmation"] = {"by": record["by"], "at": record["at"]}
+    key = f"{td.task_id}:review-channel-confirmed"
+    if not any(e.get("event_id") == key for e in td.events()):
+        td.event("task.review_channel_confirmed", record["by"], event_id=key,
+                 **{k: v for k, v in record.items() if k != "by"})
+    return record
+
+
+def child_problem(spec: dict, cfg: dict) -> str | None:
     parent = TaskDir(spec["review_of"]["task_id"])
     st, ps = parent.state(), parent.spec()
     if st["status"] != "reviewing":
         return "review parent is no longer waiting for this review"
     run = next(r for r in st["runs"] if r["run_id"] == spec["review_of"]["run_id"])
     if not run.get("channel"):
-        return "execution run has no recorded channel; submit a new task"
+        return "execution run has no recorded channel; owner must use confirm-review-channel"
     problem = workspace_problem(ps, cfg, spec["review_of"]["round"],
                                 st.get("review_reservation", {}).get("write_set", []), Path(spec["workdir"]))
     if problem:
         return problem
-    if station is not None:
-        if not station.get("channel") or not station.get("root"):
-            return "review station has no recorded launch channel/root; restart the station"
-        if not Path(spec["workdir"]).resolve().is_relative_to(Path(station["root"]).resolve()):
-            return "review workspace is outside the station's launch writable root"
-    return channel_problem(ps, cfg, run["channel"], station["channel"] if station else None)
+    return channel_problem(ps, cfg, run["channel"])
 
 
 def reserve(st: dict, run: dict, spec: dict) -> None:
@@ -277,14 +346,55 @@ an instruction to execute its changes or delivery commands.
     return accept_generated(raw, st["owner"], assets)
 
 
+def followup_id(td: TaskDir, number: int, index: int) -> str:
+    suffix = f"-followup-{number}-{index}"
+    prefix = td.task_id
+    if len(prefix + suffix) > 80:
+        prefix = prefix[:50] + "-" + hashlib.sha256(prefix.encode()).hexdigest()[:8]
+    return prefix + suffix
+
+
+def followup_links(td: TaskDir, row: dict) -> tuple[Path, dict]:
+    path = home() / "reviews" / td.task_id / str(row["round"]) / "followups.json"
+    return path, read_json(path) if path.exists() else {}
+
+
+def initial_owner(st: dict) -> str:
+    return st["owner_history"][0]["from"] if st["owner_history"] else st["owner"]
+
+
+def sync_followup_owner(td: TaskDir, st: dict, row: dict, child: TaskDir, link: dict) -> str | None:
+    with child.locked() as box:
+        cs = box["state"]
+        relation = child.spec().get("review_followup", {})
+        if relation.get("task_id") != td.task_id or relation.get("round") != row["round"]:
+            return f"follow-up id already exists for another task: {child.task_id}"
+        if cs["owner"] == st["owner"]:
+            return None
+        expected = link["owner"]
+        for move in cs["owner_history"]:
+            if move.get("parent") != td.task_id or move["from"] != expected:
+                return (f"follow-up {child.task_id} independently taken over by {cs['owner']}; "
+                        f"coordinate ownership with {st['owner']} before retrying this round")
+            expected = move["to"]
+        if cs["owner"] != expected:
+            return f"follow-up {child.task_id} owner is {cs['owner']}; coordinate ownership before retrying"
+        previous = cs["owner"]
+        move = {"from": previous, "to": st["owner"], "at": now(), "parent": td.task_id,
+                "run_in_flight": (cs["runs"] or [{}])[-1].get("run_id")}
+        key = f"{child.task_id}:parent-owner:{len(cs['owner_history'])}:{st['owner']}"
+        if not any(e.get("event_id") == key for e in child.events()):
+            child.event("task.owner_changed", st["owner"], event_id=key, previous=previous, parent=td.task_id)
+        cs["owner_history"].append(move)
+        cs["owner"] = st["owner"]
+    return None
+
+
 def followups(td: TaskDir, st: dict, spec: dict, row: dict) -> list[str]:
     ids = []
+    journal, links = followup_links(td, row)
     for index, finding in enumerate(row["findings"], 1):
-        suffix = f"-followup-{row['round']}-{index}"
-        prefix = td.task_id
-        if len(prefix + suffix) > 80:
-            prefix = prefix[:50] + "-" + hashlib.sha256(prefix.encode()).hexdigest()[:8]
-        tid = prefix + suffix
+        tid = followup_id(td, row["round"], index)
         assets = home() / "reviews" / td.task_id / "followups" / tid
         assets.mkdir(parents=True, exist_ok=True)
         card = assets / "CARD.md"
@@ -297,7 +407,16 @@ def followups(td: TaskDir, st: dict, spec: dict, row: dict) -> list[str]:
         raw = {k: v for k, v in spec.items() if k not in ("review", "on_pass", "on_pass_timeout", "depends_on", "auto_close")}
         raw.update(task_id=tid, goal=finding["title"], card=str(card),
                    review_followup={"task_id": td.task_id, "round": row["round"], "finding": finding})
-        accept_generated(raw, st["owner"], assets)
+        if tid not in links:
+            child = TaskDir(tid)
+            links[tid] = {"owner": initial_owner(child.state()) if child.exists else st["owner"]}
+            # Write intent BEFORE acceptance: a crash after child creation must not lose the relation.
+            journal.parent.mkdir(parents=True, exist_ok=True)
+            write_json(journal, links)
+        child = accept_generated(raw, st["owner"], assets)
+        problem = sync_followup_owner(td, st, row, child, links[tid])
+        if problem:
+            raise contract.SpecError(problem)
         ids.append(tid)
     return ids
 
@@ -368,12 +487,14 @@ def advance(td: TaskDir, who: str | None = None) -> int:
             spec = td.spec()
             row = st["review"]["rounds"][-1]
             try:
-                sync_owners(td, st, st["owner"])
+                problems = sync_owners(td, st, st["owner"])
+                if problems:
+                    raise contract.SpecError("; ".join(problems))
                 run = next(r for r in st["runs"] if r["run_id"] == row["run_id"])
                 if row["round"] > spec["review"]["rounds"]:
                     raise contract.SpecError("review round budget exhausted; submit a new task")
                 if not run.get("channel"):
-                    raise contract.SpecError("execution run has no recorded channel; submit a new task")
+                    raise contract.SpecError("execution run has no recorded channel; owner must use confirm-review-channel")
                 problem = channel_problem(spec, runner.config(), run["channel"])
                 if problem:
                     raise contract.SpecError(problem)
@@ -409,6 +530,13 @@ def advance(td: TaskDir, who: str | None = None) -> int:
                 elif cs["status"] in ("accepted", "failed"):
                     dispatch = child
             except (OSError, ValueError, KeyError, RuntimeError) as exc:
+                # The result copy may have been discarded; keep its accepted side effects visible.
+                try:
+                    _, links = followup_links(td, row)
+                    row["followups"] = [tid for tid in links if TaskDir(tid).exists
+                                        and TaskDir(tid).spec().get("review_followup", {}).get("task_id") == td.task_id]
+                except (OSError, ValueError, KeyError):
+                    pass  # an unreadable journal must still produce the original actionable question
                 park(td, st, str(exc), row["run_id"])
                 return 3
         if dispatch:
@@ -425,15 +553,39 @@ def advance(td: TaskDir, who: str | None = None) -> int:
     return cli.do_deliver(td, deliver_owner) if deliver_owner else 0
 
 
-def sync_owners(td: TaskDir, st: dict, previous: str) -> None:
+def sync_owners(td: TaskDir, st: dict, previous: str) -> list[str]:
+    problems = []
     for row in st.get("review", {}).get("rounds", []):
         child = TaskDir(row["task_id"])
         if child.exists:
             with child.locked() as box:
                 cs = box["state"]
-                if cs["owner"] == st["owner"]:
-                    continue
-                cs["owner_history"].append({"from": cs["owner"], "to": st["owner"], "at": now(),
-                                            "run_in_flight": (cs["runs"] or [{}])[-1].get("run_id")})
-                cs["owner"] = st["owner"]
-                child.event("task.owner_changed", st["owner"], previous=previous, parent=td.task_id)
+                if cs["owner"] != st["owner"]:
+                    cs["owner_history"].append({"from": cs["owner"], "to": st["owner"], "at": now(),
+                                                "run_in_flight": (cs["runs"] or [{}])[-1].get("run_id")})
+                    cs["owner"] = st["owner"]
+                    child.event("task.owner_changed", st["owner"], previous=previous, parent=td.task_id)
+        if row["status"] == "processed":
+            continue  # committed follow-ups are independent dispatch decisions
+        journal, links = followup_links(td, row)
+        # Recover pre-journal partial rounds too, from the verified child receipt and deterministic ids.
+        if child.exists and child.state()["status"] == "verified":
+            cs = child.state()
+            findings = read_json(child.run_dir(cs["verdict"]["run_id"]) / "receipt.json").get("review_findings", [])
+            for index, _ in enumerate(findings, 1):
+                tid = followup_id(td, row["round"], index)
+                ft = TaskDir(tid)
+                if tid not in links and ft.exists and ft.spec().get("review_followup", {}).get("task_id") == td.task_id:
+                    links[tid] = {"owner": initial_owner(ft.state())}
+                    journal.parent.mkdir(parents=True, exist_ok=True)
+                    write_json(journal, links)
+        row["followups"] = []
+        for tid, link in links.items():
+            followup = TaskDir(tid)
+            if followup.exists:
+                problem = sync_followup_owner(td, st, row, followup, link)
+                if problem:
+                    problems.append(problem)
+                else:
+                    row["followups"].append(tid)
+    return problems

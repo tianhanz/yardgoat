@@ -305,8 +305,27 @@ run, and receipts retain that identity even when configuration later changes. Di
 dispatch also records its effective channel. Review creation selects the execution run by the
 round's `run_id`, compares it with the frozen review channel, and rejects changed review pool
 configuration. Review claim additionally checks the actual station channel and launch root;
-legacy stations missing that identity must be restarted. Refusal leaves a visible parked parent.
+legacy stations missing that identity must be restarted. Task configuration/frozen-material
+errors retain task-level failure handling. Station incompatibility instead returns EMPTY with
+`restart_required`, `restart_reason` and a timestamp on the station, leaving the run/task queued.
+The scheduler excludes these processes from available stations but includes them in physical
+capacity while alive; the normal EMPTY response lets the worker exit. A healthy station can
+claim the unchanged card during a rolling upgrade, without answering each task.
 Configured review enables auto-close for execution and repairs.
+
+`confirm-review-channel <id> --as <current-owner>` migrates legacy accepted/running/reviewing
+tasks explicitly, under schedule → task locks. The authoritative frozen record gains a
+`review_confirmation` extension, containing actor/time, the review pool channel at confirmation,
+recorded run channels and any owner-supplied `--run-channel RUN HOST LANE` declarations.
+The original accepted spec/hash, IDs, dependencies and rounds are untouched. `TaskDir.spec`
+overlays only this explicit extension for a legacy missing review channel. No ordinary read,
+dispatch, answer or reconcile derives that missing field from current config. Missing historical
+execution identities require individual owner declarations; existing identities cannot be
+overwritten. Channel separation and workspace checks run before recording the confirmation.
+The extension is written before run updates and the deduplicated `task.review_channel_confirmed`
+event; repeating the command repairs an interrupted write using the original actor/time/channel,
+not a newly read pool config. Confirmation never dispatches, changes task status or consumes a
+round. A parked task still needs its normal answer; a running task finishes its existing run.
 
 After frozen acceptance, `review.begin` records a pending round containing the exact child id
 `<parent>-review-<n>` and the execution run id. Parent/run/receipt become `reviewing` with the
@@ -369,8 +388,21 @@ parent state. An ordinary side-effect error parks the original pending state, re
 reservation and retry entry point. A crash before state commit replays those idempotent side
 effects. Partial follow-up success is reused by deterministic ID plus content hash; a foreign
 ID collision stays pending and visible instead of starting a new execution round.
-Takeover takes the schedule lock and changes child owners with the parent; reconciliation also
-repairs an interrupted owner propagation. Direct child takeover is refused in favor of the parent.
+Before accepting each follow-up, a round writes its deterministic ID and initial owner into
+owner-side `reviews/<parent>/<round>/followups.json`. This journal survives discarded staged
+state and crashes immediately after acceptance. The pending parent row exposes accepted IDs.
+Takeover takes the schedule lock and changes review child owners with the parent; reconciliation
+also repairs interrupted owner propagation. Pending follow-ups are synchronized using their
+journal and `owner_history`, with inherited ownership changes marked by parent ID. Older partial
+rounds without a journal recover existing associations from the verified review receipt and
+deterministic IDs. A foreign ID is never adopted. An independent follow-up takeover is preserved;
+the parent parks with the conflicting task/owner until ownership is explicitly coordinated and
+the parent answered. Matching owners need no mutation; repeated replay adds no history entry.
+After the round is processed follow-ups are independent. Direct review child takeover is refused
+in favor of the parent.
+
+Removed-pool inbox warnings consider only tasks outside verified/archived/exhausted. Per-task
+status still annotates a removed pool on historical tasks for inspection.
 
 Blocking findings before the limit trigger one repair dispatch. Without blocking findings the
 parent becomes verified and follows the normal M3 delivery path. At the limit, park leaves the

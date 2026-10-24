@@ -91,7 +91,10 @@ def test_actual_station_channel_is_checked(rig, name):
     pool.update_station(name, f"{name}-st-1", channel={"host": "shell", "lane": "audit" if name == "work" else "work"})
     assert cli.claim_card(name, f"{name}-st-1")[1]["result"] == "EMPTY"
     rig.call("reconcile")
-    assert_parked(rig, "channel")
+    assert TaskDir("parent").state()["status"] == ("reviewing" if name == "audit" else "queued")
+    tid = "parent-review-1" if name == "audit" else "parent"
+    assert TaskDir(tid).state()["runs"][-1]["state"] == "queued"
+    assert "channel" in pool.get_station(name, f"{name}-st-1")["restart_reason"]
 
 
 @pytest.mark.parametrize("scope", [["."], [".yardgoat-reviews/*"], ["alias"]])
@@ -198,16 +201,17 @@ def test_review_frozen_drift_parks_parent_and_restored_result_replays(rig):
     assert len(child.state()["runs"]) == 1
 
 
-def test_child_launch_refusal_can_retry_after_parent_answer(rig):
+def test_child_station_refusal_can_retry_after_station_restart(rig):
     rig.submit()
     rig.dispatch()
     rig.execute()
     pool.update_station("audit", "audit-st-1", channel={"host": "shell", "lane": "work"})
     assert cli.claim_card("audit", "audit-st-1")[1]["result"] == "EMPTY"
     rig.call("reconcile")
-    assert_parked(rig, "channel")
-    pool.update_station("audit", "audit-st-1", channel={"host": "shell", "lane": "audit"})
-    rig.call("answer", "parent", "--as", "owner", "--text", "Station restarted with correct channel")
+    assert TaskDir("parent").state()["status"] == "reviewing"
+    assert TaskDir("parent-review-1").state()["status"] == "queued"
+    # Model a restarted process with a newly recorded identity.
+    pool.update_station("audit", "audit-st-1", channel={"host": "shell", "lane": "audit"}, restart_required=False)
     rig.call("reconcile")
     rig.review(1, [])
     assert TaskDir("parent").state()["status"] == "verified"
@@ -308,7 +312,9 @@ def test_review_cannot_use_station_with_stale_writable_root(rig, tmp_path):
     pool.update_station("audit", "audit-st-1", root=str(tmp_path / "unrelated"))
     assert cli.claim_card("audit", "audit-st-1")[1]["result"] == "EMPTY"
     rig.call("reconcile")
-    assert_parked(rig, "writable root")
+    assert TaskDir("parent").state()["status"] == "reviewing"
+    assert TaskDir("parent-review-1").state()["status"] == "queued"
+    assert "writable root" in pool.get_station("audit", "audit-st-1")["restart_reason"]
 
 
 def test_doctor_checks_review_workspace_writability(rig, env, tmp_path):

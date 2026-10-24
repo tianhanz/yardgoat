@@ -310,7 +310,7 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
         return start_queued(td, who, actor_note, echo)
 
 
-def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict, station: dict | None = None) -> str | None:
+def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
     d = checked_drift(td, st)
     if d:
         return f"frozen files changed since submit: {d}"
@@ -326,12 +326,23 @@ def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict, station: dict 
             return str(e)
         if w:
             return w
-    if station is not None and spec.get("review") and not station.get("channel"):
-        return "execution station has no recorded launch channel; restart the station"
-    problem = review.channel_problem(spec, cfg, station.get("channel") if station else None)
+    problem = review.channel_problem(spec, cfg)
     if spec.get("review_of"):
-        problem = review.child_problem(spec, cfg, station)
+        problem = review.child_problem(spec, cfg)
     return problem or lane_problem(spec, cfg)
+
+
+def _station_problem(spec: dict, cfg: dict, station: dict) -> str | None:
+    """A station's launch identity is not a fault in a queued card."""
+    if not (spec.get("review") or spec.get("review_of")):
+        return None
+    if not station.get("channel") or not station.get("root"):
+        return "station has no recorded launch channel/root; restart the station"
+    if station["channel"] != review.execution_channel(spec, cfg):
+        return "station launch channel differs from the configured pool channel; restart the station"
+    if not Path(spec["workdir"]).resolve().is_relative_to(Path(station["root"]).resolve()):
+        return "workdir is outside the station's launch writable root; restart the station"
+    return None
 
 
 def _wait_for_dependencies(td: TaskDir, st: dict, run: dict, waiting: list[str], actor: str) -> None:
@@ -533,7 +544,9 @@ def cmd_takeover(a) -> int:
         st["owner_history"].append({"from": a.from_, "to": a.as_, "at": now(),
                                     "run_in_flight": (_active_run(st) or {}).get("run_id")})
         st["owner"] = a.as_
-        review.sync_owners(td, st, a.from_)
+        problems = review.sync_owners(td, st, a.from_)
+        if problems:
+            review.park(td, st, "; ".join(problems))
     td.event("task.owner_changed", a.as_, previous=a.from_)
     print(json.dumps({"task_id": td.task_id, "result": "owner-changed", "from": a.from_, "to": a.as_}))
     return 0
@@ -789,6 +802,19 @@ def cmd_answer(a) -> int:
     return 0
 
 
+def cmd_confirm_review_channel(a) -> int:
+    td = TaskDir(a.task_id)
+    if not td.exists:
+        return refuse(f"unknown task {a.task_id}")
+    with pool.schedule_lock(), td.locked() as box:
+        try:
+            record = review.confirm_channel(td, box["state"], a.as_, a.run_channel or [])
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            return refuse(str(exc))
+    print(json.dumps({"task_id": td.task_id, "result": "review-channel-confirmed", **record}))
+    return 0
+
+
 def cmd_inbox(a) -> int:
     items = []
     cfg = runner.config()
@@ -797,7 +823,8 @@ def cmd_inbox(a) -> int:
         td = TaskDir(t)
         st = td.state()
         ad = td.spec().get("adapter", {})
-        if ad.get("kind") == "pool" and not pool.pools(cfg).get(ad["pool"]):
+        if (st["status"] not in ("verified", "archived", "exhausted")
+                and ad.get("kind") == "pool" and not pool.pools(cfg).get(ad["pool"])):
             missing_pools.add(ad["pool"])
         progress = delivery.view(td, st, td.spec())
         if st["status"] == "accepted" and td.spec().get("review_followup"):
@@ -1083,6 +1110,8 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                 return 3, {"result": "REFUSED", "reason": f"{station} is not a live station of pool {pool_name}"}
             if rec.get("current"):
                 return 3, {"result": "REFUSED", "reason": f"{station} still holds {rec['current']['task_id']}; finish it first"}
+            if rec.get("restart_required"):
+                return 0, {"result": "EMPTY", "reason": rec["restart_reason"]}
             if len(rec.get("tasks", [])) >= int(c.get("max_tasks_per_station", 5)):
                 return 0, {"result": "EMPTY", "reason": "this station reached max_tasks_per_station"}
         for _, t in pool.queued_cards(pool_name):
@@ -1095,12 +1124,17 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                 spec = td.spec()
                 if not _queue_gate(td, st, run, spec, station):
                     continue
-                problem = _launch_problem(td, st, spec, cfg, rec)
+                problem = _launch_problem(td, st, spec, cfg)
                 if problem:
                     run.update(state="launch_failed", reason=problem); st["status"] = "accepted"
                     if spec.get("review"):
                         review.park(td, st, problem, run["run_id"])
                     continue
+                problem = _station_problem(spec, cfg, rec)
+                if problem:
+                    pool.update_station(pool_name, station, restart_required=True,
+                                        restart_reason=problem, restart_requested_at=now())
+                    return 0, {"result": "EMPTY", "reason": problem}
                 rd = td.run_dir(run["run_id"]); rd.mkdir(parents=True, exist_ok=True)
                 (rd / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
                 run.update(state="running", station=station, task_id=t, started_at=now(), claimed_epoch=time.time(),
@@ -1278,6 +1312,10 @@ def main(argv=None) -> int:
     s.add_argument("--question", required=True)
     s = sub.add_parser("answer"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     g = s.add_mutually_exclusive_group(required=True); g.add_argument("--text"); g.add_argument("--file")
+    s = sub.add_parser("confirm-review-channel"); s.add_argument("task_id")
+    s.add_argument("--as", dest="as_", required=True)
+    s.add_argument("--run-channel", nargs=3, action="append", metavar=("RUN", "HOST", "LANE"),
+                   help="explicitly confirm a missing historical execution identity (repeat for each run)")
     s = sub.add_parser("inbox"); s.add_argument("--json", action="store_true")
     sub.add_parser("reconcile")
     s = sub.add_parser("quick"); s.add_argument("text", help="card text, or - to read stdin")
@@ -1311,6 +1349,7 @@ def main(argv=None) -> int:
         return doctor.run_probe(Path(a.run_dir))
     return {"submit": cmd_submit, "dispatch": cmd_dispatch, "status": cmd_status, "takeover": cmd_takeover,
             "close": cmd_close, "approve": cmd_approve, "deliver": cmd_deliver, "park": cmd_park, "answer": cmd_answer, "inbox": cmd_inbox,
+            "confirm-review-channel": cmd_confirm_review_channel,
             "reconcile": cmd_reconcile, "archive": cmd_archive, "cancel": cmd_cancel, "quick": cmd_quick, "claim": cmd_claim, "finish": cmd_finish, "events": cmd_events, "doctor": cmd_doctor}[a.cmd](a)
 
 

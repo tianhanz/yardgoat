@@ -40,7 +40,8 @@
     "task.on_pass_started",
     "task.on_pass_finished",
     "task.delivery_assumed_stopped",
-    "task.review_processed"
+    "task.review_processed",
+    "task.review_channel_confirmed"
    ]
   },
   "actor": {

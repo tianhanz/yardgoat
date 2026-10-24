@@ -115,15 +115,37 @@ Configure the review pool with a different pool name and effective lane from the
 If lanes are omitted, different hosts are required. Submission freezes the review pool's
 effective `host` and `lane` in `review.channel`. Each execution run records its actual launch
 channel; review creation and claim compare that run with the frozen channel and the review
-station's recorded launch channel. Configuration drift or an incompatible station parks the
-parent for attention. Restore the configuration/restart the station, then answer to retry.
-Existing stations without recorded launch identity must be restarted for reviewed tasks.
+station's recorded launch channel. Configuration drift parks the parent for attention;
+restore the configuration, then answer to retry. An incompatible station (missing identity,
+wrong channel or obsolete writable root) receives `EMPTY` and is marked `restart_required`.
+Its cards stay queued for a healthy or newly started station, without a parent answer.
+Such a station is not counted as available; its live process still counts against capacity
+until it exits. Existing stations without launch identity must be restarted for reviewed tasks.
 `path` is a directory relative to workdir (default `.`); the review workspace and Yardgoat
 store must be outside that directory. The directory can be created by the initial worker.
 Submission also rejects review workdirs or write sets overlapping any parent scope prefix,
 including glob prefixes and symlink targets; creation rechecks the retained write set.
 When the pool omits `root`, reviews and stations both use `$YARDGOAT_HOME/pools/<pool>/stations`.
 Doctor checks that the `.yardgoat-reviews` directory is writable through the launch chain.
+
+For tasks accepted by older versions without `review.channel`, the current owner must explicitly
+freeze the review pool's **current** channel. This retains the task ID, dependencies and rounds:
+
+```bash
+yardgoat confirm-review-channel task-id --as owner
+# If an execution has already started but its historical channel is missing:
+yardgoat confirm-review-channel task-id --as owner --run-channel r1 codex execution-lane
+```
+
+Repeat `--run-channel RUN HOST LANE` for each missing execution identity; use `''` for an empty
+lane. The owner must confirm the actual historical identity, not infer it from current config.
+If it is unknown, investigate before confirming. Recorded identities cannot be overwritten.
+This works for accepted, running and reviewing tasks, including ones parked during upgrade.
+Confirmation records who, when, the fixed review channel and confirmed run identities in the
+authoritative record and events, without rewriting the accepted spec or hash. Repeating it
+replays that same confirmation, never refreezes changed config. It does not dispatch, answer
+or spend a round: use normal dispatch/reconcile afterwards, or answer first if already parked.
+
 Reviewers receive a snapshot, the execution run's actual prompt, all recorded answers and
 previous rounds' findings, and must confirm whether those findings were fixed.
 They write `out/findings.json` and `out/REVIEW.md`; `out/BLOCKED.md` is allowed for a concrete
@@ -159,6 +181,15 @@ finding count and the validated findings used to decide the result.
 If follow-up submission or result recording fails, the round remains pending and its write
 set remains reserved. Answering retries that result, reusing any follow-ups already accepted.
 The result is marked processed only after all follow-ups, its receipt and its event succeed.
+Pending rounds journal follow-up IDs before creation. Parent takeover and result replay also
+transfer those follow-ups and record their ownership history. A follow-up taken over separately
+is not overwritten: the parent parks with the task and owner to coordinate. Explicitly align
+that follow-up's owner with the parent, then answer the parent to retry. After the round is
+processed, its follow-ups remain independent tasks.
+
+`inbox` reports a removed pool only when an unfinished task still refers to it. Historical
+verified, archived and exhausted tasks do not trigger that pool warning; `status <task-id>`
+continues to show it for an individual historical task.
 
 ## Local wiring
 
