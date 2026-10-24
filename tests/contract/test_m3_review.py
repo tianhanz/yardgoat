@@ -334,8 +334,9 @@ def test_F2_pool_claim_and_second_delivery_respect_orphan_reservation(tmp_path, 
         assert "t-demo" in json.loads(yg(env, "status", "second", "--json")[1])["delivery_reason"]
         (tmp_path / "work/out/release").touch()
         from yardgoat.runner import pgid_alive
-        pid = int((tmp_path / "work/out/pids").read_text())
-        until(lambda: not pgid_alive(pid))
+        # the delivery supervisor leads the group and outlives the shell briefly: wait on the recorded group
+        pgid = json.loads(yg(env, "status", "t-demo", "--json")[1])["runs"][0]["receipt"]["on_pass"][0]["pgid"]
+        until(lambda: not pgid_alive(pgid))
         assert yg(env, "deliver", "t-demo", "--as", "owner")[0] == 0
         assert yg(env, "deliver", "second", "--as", "owner")[0] == 0
         assert cli.claim_card("local", "local-st-1")[1]["result"] == "CLAIMED"
