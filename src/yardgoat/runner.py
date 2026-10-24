@@ -112,7 +112,7 @@ def launch_daemon(me: list[str], cfg: dict, root: str, window: str, linger: int 
         cmd = " ".join(f"{k}={shlex.quote(v)}" for k, v in envs.items()) + " " + shlex.join(me)
         if linger:
             cmd += f"; echo '[yardgoat] finished; window closes in {linger}s'; sleep {linger}"
-        r = subprocess.run(["tmux", "new-window", "-d", "-P", "-F", "#{pane_pid}", "-t", session, "-n", window, cmd],
+        r = subprocess.run([*tmux_argv(cfg), "new-window", "-d", "-P", "-F", "#{pane_pid}", "-t", session, "-n", window, cmd],
                            capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError("tmux new-window failed: " + r.stderr.strip())
@@ -121,6 +121,21 @@ def launch_daemon(me: list[str], cfg: dict, root: str, window: str, linger: int 
     p = subprocess.Popen(me, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=env)
     return {"mode": "process", "window": None, "pid": p.pid}
+
+
+def tmux_argv(cfg: dict) -> list[str]:
+    """tmux with an explicit server socket. Cron and interactive shells reach different tmux servers when relying on
+    $TMUX, so the socket comes from the local config (tmux_socket), falling back to the caller's $TMUX socket."""
+    sock = cfg.get("tmux_socket") or (os.environ.get("TMUX", "").split(",")[0] or None)
+    return ["tmux", "-S", os.path.expanduser(sock)] if sock else ["tmux"]
+
+
+def launch_env_fingerprint(cfg: dict) -> str:
+    """What a worker launch depends on in the *caller's* environment. A health check is only reusable under the same one."""
+    import hashlib
+    parts = [" ".join(tmux_argv(cfg)), os.environ.get("PATH", ""), sys.executable, str(bool(cfg.get("tmux_session"))),
+             str(bool(os.environ.get("YARDGOAT_NO_TMUX")))]
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:16]
 
 
 def pgid_alive(pgid) -> bool:

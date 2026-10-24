@@ -76,3 +76,42 @@ def test_quick_passes_depends_on_and_auto_close_into_the_spec(tmp_path, env):
     assert rc == 0, err
     spec = json.loads((Path(env["YARDGOAT_HOME"]) / "cards/q-down/spec.json").read_text())
     assert spec["depends_on"] == ["q-up"] and spec["auto_close"] is True
+
+
+def test_tmux_socket_comes_from_config_not_the_callers_environment(env):
+    setenv(env)
+    from yardgoat import runner
+    assert runner.tmux_argv({"tmux_socket": "/tmp/some/sock"}) == ["tmux", "-S", "/tmp/some/sock"]
+    os.environ.pop("TMUX", None)
+    assert runner.tmux_argv({}) == ["tmux"]
+
+
+def test_doctor_cache_is_not_reused_under_a_different_launch_environment(tmp_path, env):
+    """2026-10-24: a check passed in an interactive shell was trusted by cron, where tmux could not be reached."""
+    setenv(env)
+    from yardgoat import doctor, runner
+    cfg = {"tmux_socket": "/tmp/a"}
+    fp_a = runner.launch_env_fingerprint(cfg)
+    fp_b = runner.launch_env_fingerprint({"tmux_socket": "/tmp/b"})
+    assert fp_a != fp_b
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = "/nonexistent:" + old
+    try:
+        assert runner.launch_env_fingerprint(cfg) != fp_a
+    finally:
+        os.environ["PATH"] = old
+
+
+def test_a_failed_station_launch_backs_the_pool_off(tmp_path, env):
+    setenv(env)
+    from yardgoat import pool
+    os.environ.pop("YARDGOAT_NO_TMUX", None)
+    try:
+        cfg = {"tmux_session": "no-such-session", "tmux_socket": str(tmp_path / "no-server"),
+               "pools": {"p": {"host": "shell", "command": "true", "root": str(tmp_path)}}}
+        st = pool.start_station("p", cfg["pools"]["p"], cfg)
+        assert pool.get_station("p", st)["state"] == "launch_failed"
+        b = pool.provider_backoff("p", cfg)
+        assert b and b["status"] == "launch_failed"
+    finally:
+        os.environ["YARDGOAT_NO_TMUX"] = "1"

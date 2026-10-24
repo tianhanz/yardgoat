@@ -68,6 +68,7 @@ def _report(request: dict, checks: list[dict]) -> dict:
     return {"pool": request.get("pool"), "host": request["executor"]["host"],
             "lane": request["executor"].get("lane", ""), "account_alias": request["executor"].get("acct", ""),
             "checked_at": now(), "checked_epoch": time.time(), "ok": not failed,
+            "env": runner.launch_env_fingerprint(runner.config()),
             "checks": checks, "reason": "; ".join(failed)}
 
 
@@ -126,6 +127,7 @@ def ensure(name: str, cfg: dict, acct: str) -> dict:
     try:
         fresh = report and report["ok"] and report["pool"] == name and \
             report["host"] == ex["host"] and report["lane"] == ex.get("lane", "") and report["account_alias"] == acct and \
+            report.get("env") == runner.launch_env_fingerprint(cfg) and \
             0 <= time.time() - float(report["checked_epoch"]) < float(cfg.get("doctor_ttl_h", 12)) * 3600
     except (KeyError, TypeError, ValueError):
         fresh = False

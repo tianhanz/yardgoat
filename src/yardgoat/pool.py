@@ -214,6 +214,10 @@ def start_station(name: str, c: dict, cfg: dict) -> str:
         update_station(name, station, launcher_pid=launched["pid"])
     except (OSError, RuntimeError) as e:
         update_station(name, station, state="launch_failed", reason=str(e))
+        # back off: without this, every reconcile starts (and fails) one more station
+        write_json(pool_dir(name) / "launch-backoff.json",
+                   {"pool": name, "status": "launch_failed", "station": station, "reason": str(e)[:500], "at": now(),
+                    "until": time.time() + max(1, float(cfg.get("launch_backoff_seconds", 600)))})
     return station
 
 
@@ -299,7 +303,7 @@ def pause_provider(name: str, station: dict, cfg: dict, reason: str) -> None:
 def provider_backoff(name: str, cfg: dict, acct: str | None = None) -> dict | None:
     c = pool_conf(cfg, name)
     acct = next_station(name, c)[1] if acct is None else acct
-    for path in (pool_dir(name) / "provider-backoff.json", _account_backoff(c, acct)):
+    for path in (pool_dir(name) / "provider-backoff.json", pool_dir(name) / "launch-backoff.json", _account_backoff(c, acct)):
         if path.exists():
             record = read_json(path)
             if record.get("until", 0) > time.time():
