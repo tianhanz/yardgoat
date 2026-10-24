@@ -47,7 +47,9 @@ def prompt_text(td: TaskDir, spec: dict) -> str:
 def build_argv(td: TaskDir, spec: dict, run_dir: Path, cfg: dict, probe_argv: list[str] | None = None) -> list[str]:
     ex = spec["executor"]
     host = ex["host"]
-    prompt = "" if probe_argv is not None else prompt_text(td, spec)
+    prompt_path = run_dir / "prompt.md"
+    prompt = "" if probe_argv is not None else (prompt_path.read_text(encoding="utf-8")
+                                              if prompt_path.exists() else prompt_text(td, spec))
     extra = list(cfg.get("host_args", {}).get(host, [])) + list(ex.get("args", []))
     if host == "codex":
         argv = ["codex", "exec", "--json", "-s", ex.get("sandbox", "workspace-write"), "--skip-git-repo-check",
@@ -379,6 +381,8 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | Callable[[dict], di
                 "cost_basis": outcome.get("cost_basis", "unknown"), "artifacts": artifacts, "finished_at": now(),
                 "status": STATUS_OF[state],
             }
+            if run.get("channel"):
+                receipt.update(run["channel"])
             if run.get("approval"):
                 receipt["approval"] = run["approval"]
             if run.get("review_round") or spec.get("review_of"):

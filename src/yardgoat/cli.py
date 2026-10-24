@@ -53,11 +53,9 @@ def adapter_kind(spec: dict) -> str:
 def cmd_submit(a) -> int:
     try:
         spec = contract.load_spec_file(a.spec)
-        problem = review.channel_problem(spec, runner.config())
-        if problem:
-            raise contract.SpecError(problem)
+        review.prepare(spec, runner.config())
         frozen = contract.freeze(spec)
-    except (contract.SpecError, OSError, ValueError) as e:
+    except (contract.SpecError, OSError, ValueError, RuntimeError) as e:
         print(f"spec error: {e}", file=sys.stderr)
         return 2
     h = contract.content_hash(spec, frozen)
@@ -265,8 +263,13 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
             if last and last["state"] == "running":  # recorded running, nothing alive, no receipt
                 last["state"] = "lost"
             spec = td.spec()
+            if spec.get("review") and len(st.get("review", {}).get("rounds", [])) >= spec["review"]["rounds"]:
+                review.park(td, st, "review round budget exhausted; submit a new task or archive")
+                return refuse("review round budget exhausted; submit a new task or archive")
             problem = _launch_problem(td, st, spec, cfg)
             if problem:
+                if spec.get("review"):
+                    review.park(td, st, problem)
                 return refuse(problem)
             used = sum(r["state"] in COUNTED for r in st["runs"])
             if used >= spec["budget"]["max_attempts"]:
@@ -307,7 +310,7 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
         return start_queued(td, who, actor_note, echo)
 
 
-def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
+def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict, station: dict | None = None) -> str | None:
     d = checked_drift(td, st)
     if d:
         return f"frozen files changed since submit: {d}"
@@ -323,12 +326,11 @@ def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
             return str(e)
         if w:
             return w
-    problem = review.channel_problem(spec, cfg)
+    if station is not None and spec.get("review") and not station.get("channel"):
+        return "execution station has no recorded launch channel; restart the station"
+    problem = review.channel_problem(spec, cfg, station.get("channel") if station else None)
     if spec.get("review_of"):
-        parent = TaskDir(spec["review_of"]["task_id"])
-        problem = review.channel_problem(parent.spec(), cfg)
-        if parent.state()["status"] != "reviewing":
-            return "review parent is no longer waiting for this review"
+        problem = review.child_problem(spec, cfg, station)
     return problem or lane_problem(spec, cfg)
 
 
@@ -390,8 +392,12 @@ def start_queued(td: TaskDir, actor: str, actor_note: str = "", echo: bool = Tru
         problem = _launch_problem(td, st, spec, cfg)
         if problem:
             run["state"] = "launch_failed"; run["reason"] = problem; st["status"] = "accepted"
+            if spec.get("review"):
+                review.park(td, st, problem, run["run_id"])
             return refuse(problem)
         run.update(state="running", started_at=now(), write_set=scheduling.write_set(spec))
+        run["channel"] = review.execution_channel(spec, cfg)
+        (td.run_dir(run["run_id"]) / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
         review.reserve(st, run, spec)
         if st.get("approval"):
             run["approval"] = dict(st["approval"])
@@ -457,6 +463,7 @@ def _status_obj(td: TaskDir) -> dict:
     return {"task_id": td.task_id, "status": st["status"], "owner": st["owner"], "owner_history": st["owner_history"],
             "approval": st.get("approval"), "approval_required": bool(needs_approval),
             "review": st.get("review"),
+            "review_reservation": st.get("review_reservation") if st["status"] not in ("verified", "archived") else None,
             **delivery.view(td, st, td.spec()),
             "pool_backoff": backoff,
             "pool_doctor": health, "pool_problem": problem,
@@ -498,6 +505,8 @@ def cmd_status(a) -> int:
             print(f"  {_backoff_text(o['pool_backoff'])}")
         if o["question"]:
             print(f"  QUESTION: {o['question']['text'][:200]}")
+        if o["review_reservation"]:
+            print(f"  Review write set reserved: {', '.join(o['review_reservation']['write_set'])}")
         for r in o["runs"]:
             rec = r["receipt"]
             tail = f" exit={rec['exit_code']} model={rec['actual_model'] or '?'}" if rec else ""
@@ -539,6 +548,13 @@ def cmd_close(a) -> int:
 
 
 def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -> tuple[int, str | None]:
+    result = _do_close(td, who, actor_note, echo)
+    if td.spec().get("review_of") and td.state()["owner"] == who and result[1] != "PASS":
+        review.advance(TaskDir(td.spec()["review_of"]["task_id"]))
+    return result
+
+
+def _do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -> tuple[int, str | None]:
     # Repeated close can recover an interrupted child submit without rerunning verification.
     before = td.state()
     if before["status"] == "reviewing":
@@ -578,6 +594,9 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
             (rd / "verify.out").write_text(p.stdout + ("\n--- stderr ---\n" + p.stderr if p.stderr else ""))
         except subprocess.TimeoutExpired:
             rc = 124
+        except OSError as exc:
+            rc = 127
+            (rd / "verify.out").write_text(f"Verifier could not start: {exc}\n")
         verdict = {0: "PASS", 1: "FAIL"}.get(rc, "ERROR")
         review_findings = None
         if verdict == "PASS" and spec.get("review_of"):
@@ -598,7 +617,7 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
                 rec.update(review_findings=review_findings, findings_count=len(review_findings),
                            review_round=spec["review_of"]["round"])
             if spec.get("review"):
-                review.begin(st, last, rec)
+                review.begin(st, last, rec, spec)
             elif spec.get("on_pass"):
                 delivery.mark_pending(st, rec)
         elif verdict == "FAIL":
@@ -755,10 +774,16 @@ def cmd_answer(a) -> int:
         st = box["state"]
         if st["status"] != "parked":
             return refuse(f"task is {st['status']}, not parked")
+        progress = st.get("review", {})
+        pending = any(r["status"] == "pending" for r in progress.get("rounds", []))
+        config = td.spec().get("review")
+        if progress.get("complete") or (config and not pending and len(progress.get("rounds", [])) >= config["rounds"]):
+            return refuse("review round budget exhausted; submit a new task or archive this task")
         append_answer(td, a.as_, text)
         st["status"] = "answered"
-        if any(r["status"] == "pending" for r in st.get("review", {}).get("rounds", [])):
+        if pending:
             st["status"] = "reviewing"
+            st["review_resume_requested"] = True
         st["question"]["answered_by"] = a.as_
     print(json.dumps({"task_id": td.task_id, "result": "answered", "note": "reconcile resumes it on behalf of the owner"}))
     return 0
@@ -1070,13 +1095,16 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                 spec = td.spec()
                 if not _queue_gate(td, st, run, spec, station):
                     continue
-                problem = _launch_problem(td, st, spec, cfg)
+                problem = _launch_problem(td, st, spec, cfg, rec)
                 if problem:
                     run.update(state="launch_failed", reason=problem); st["status"] = "accepted"
+                    if spec.get("review"):
+                        review.park(td, st, problem, run["run_id"])
                     continue
                 rd = td.run_dir(run["run_id"]); rd.mkdir(parents=True, exist_ok=True)
                 (rd / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
                 run.update(state="running", station=station, task_id=t, started_at=now(), claimed_epoch=time.time(),
+                           channel=rec.get("channel", pool.channel(c)),
                            log_start=pool.log_position(pool_name, station),
                            blocked_before=runner.file_fingerprint(Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")),
                            write_set=scheduling.write_set(spec))

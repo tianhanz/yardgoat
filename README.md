@@ -112,18 +112,34 @@ Add `review` to a task spec to run an independent review after its frozen verifi
 ```
 
 Configure the review pool with a different pool name and effective lane from the executor.
-If lanes are omitted, different hosts are required. This is checked at submission and launch.
+If lanes are omitted, different hosts are required. Submission freezes the review pool's
+effective `host` and `lane` in `review.channel`. Each execution run records its actual launch
+channel; review creation and claim compare that run with the frozen channel and the review
+station's recorded launch channel. Configuration drift or an incompatible station parks the
+parent for attention. Restore the configuration/restart the station, then answer to retry.
+Existing stations without recorded launch identity must be restarted for reviewed tasks.
 `path` is a directory relative to workdir (default `.`); the review workspace and Yardgoat
 store must be outside that directory. The directory can be created by the initial worker.
-Reviewers receive a snapshot under their pool root, the original goal/card and acceptance
-instructions. They write `out/findings.json` and `out/REVIEW.md`. Findings use
+Submission also rejects review workdirs or write sets overlapping any parent scope prefix,
+including glob prefixes and symlink targets; creation rechecks the retained write set.
+When the pool omits `root`, reviews and stations both use `$YARDGOAT_HOME/pools/<pool>/stations`.
+Doctor checks that the `.yardgoat-reviews` directory is writable through the launch chain.
+Reviewers receive a snapshot, the execution run's actual prompt, all recorded answers and
+previous rounds' findings, and must confirm whether those findings were fixed.
+They write `out/findings.json` and `out/REVIEW.md`; `out/BLOCKED.md` is allowed for a concrete
+question. These are the only writable review files. Findings use
 `id`, `severity`, `file`, `line`, `title`, `scenario`, `fix`; file paths are relative to
 the reviewed directory, and line numbers start at 1. See the [findings schema](src/yardgoat/schemas/findings.schema.json).
 
 `review` enables automatic verification through `reconcile`, including repair runs.
 Each `<task-id>-review-<round>` child has its own frozen verifier checking output structure,
-file/line references and unchanged original/snapshot trees. An invalid or failed review
+file/line references, unchanged original/snapshot trees, and a frozen workspace baseline
+excluding exactly the listed outputs. Other persistent additions, deletions, content/mode
+changes or symlinks fail verification. An invalid or failed review
 never means clean: it retries within the child's two-attempt budget, then needs attention.
+Frozen-file rejection, verifier errors, exhausted/archived/cancelled children and launch
+refusals park the parent with a reason. Restoring a frozen verifier and answering replays
+the same pending review; it does not spend another review round.
 Blocking findings become an answer appended to the original prompt, and a repair is dispatched.
 Successful review/repair rounds do not spend the original failure retry budget.
 
@@ -134,10 +150,15 @@ parent and submits one task per remaining finding. Those follow-ups appear in `i
 without runs until their owner chooses to dispatch them. They inherit the original risk
 and require their own approval when l3. A parked round-limit result cannot acquire more
 rounds by answering; submit a new task for further work.
+`answer` refuses completed round budgets and keeps the task visible in `inbox`.
+`status` shows the retained review write set until verification or archive releases it.
 
 Take over the parent to transfer its review children too. Repeated close/reconcile does not
 duplicate children, answers or repair rounds. Receipts include round numbers, each round's
 finding count and the validated findings used to decide the result.
+If follow-up submission or result recording fails, the round remains pending and its write
+set remains reserved. Answering retries that result, reusing any follow-ups already accepted.
+The result is marked processed only after all follow-ups, its receipt and its event succeed.
 
 ## Local wiring
 

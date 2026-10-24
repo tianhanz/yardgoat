@@ -60,6 +60,15 @@ def pool_dir(name: str) -> Path:
     return d
 
 
+def effective_root(name: str, c: dict) -> Path:
+    """The writable cwd used by stations, mailboxes and generated reviews."""
+    return Path(c.get("root") or home() / "pools" / name / "stations").expanduser().resolve()
+
+
+def channel(c: dict) -> dict:
+    return {"host": c["host"], "lane": c.get("lane", "")}
+
+
 @contextmanager
 def pool_lock(name: str):
     with open(pool_dir(name) / ".lock", "w") as lk:
@@ -223,7 +232,7 @@ def start_station(name: str, c: dict, cfg: dict) -> str:
 
 def mailbox_dir(name: str, station: str, c: dict) -> Path:
     """Inside the pool root (the only place a sandboxed station may write); the broker reads it from outside."""
-    root = Path(os.path.expanduser(c.get("root", str(pool_dir(name) / "stations"))))
+    root = effective_root(name, c)
     d = root / ".yardgoat-mailbox" / station
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -238,7 +247,7 @@ def station_argv(name: str, station: str, c: dict, cfg: dict, probe_argv: list[s
     host = c["host"]
     sd = pool_dir(name) / "stations"
     extra = list(cfg.get("host_args", {}).get(host, [])) + list(c.get("args", []))
-    root = os.path.expanduser(c.get("root", str(sd)))
+    root = str(effective_root(name, c))
     if host == "codex":
         # no --add-dir: the station writes only its pool root; claim/finish go through the mailbox in that root
         argv = ["codex", "exec", "--json", "-s", c.get("sandbox", "workspace-write"), "--skip-git-repo-check", "-C", root,
@@ -261,7 +270,7 @@ def station_argv(name: str, station: str, c: dict, cfg: dict, probe_argv: list[s
 
 def station_script(name: str, station: str, c: dict, cfg: dict, mb: Path,
                    probe_argv: list[str] | None = None) -> str:
-    root = os.path.expanduser(c.get("root", str(pool_dir(name) / "stations")))
+    root = str(effective_root(name, c))
     return runner.shell_script(root, cfg, station_argv(name, station, c, cfg, probe_argv),
                                {"YARDGOAT_STATION": station, "YARDGOAT_MAILBOX": str(mb),
                                 "YARDGOAT_MAILBOX_HOME": str(home().resolve())})
@@ -376,7 +385,8 @@ def run_station(name: str, station: str) -> int:
     c = pool_conf(cfg, name)
     d = pool_dir(name) / "stations"
     mb = mailbox_dir(name, station, c)
-    update_station(name, station, pid=os.getpid(), mailbox=str(mb))
+    update_station(name, station, pid=os.getpid(), mailbox=str(mb),
+                   channel=channel(c), root=str(effective_root(name, c)))
     (d / f"{station}.sh").write_text(station_script(name, station, c, cfg, mb))
     env = station_env()
     timed_out = None

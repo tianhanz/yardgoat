@@ -220,6 +220,15 @@
     "pool"
    ],
    "properties": {
+    "channel": {
+     "type": "object",
+     "description": "Owner-resolved review pool host/lane, frozen at submission and compared with actual run/station channels.",
+     "required": ["host", "lane"],
+     "properties": {
+      "host": {"enum": ["codex", "claude", "kimi", "shell"]},
+      "lane": {"type": "string"}
+     }
+    },
     "pool": {
      "type": "string",
      "minLength": 1,

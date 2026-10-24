@@ -41,12 +41,22 @@ def manifest(root: Path) -> dict:
     return result
 
 
+def workspace_manifest(root: Path, outputs: list[str]) -> dict:
+    entries = manifest(root)
+    for name in outputs:
+        if name in entries and entries[name]["kind"] != "file":
+            raise ValueError(f"review output must be an ordinary file: {name}")
+    return {name: value for name, value in entries.items() if name not in outputs}
+
+
 def verify(settings: dict) -> list[dict]:
     source, target = Path(settings["source"]), Path(settings["target"])
     expected = settings["manifest"]
     if manifest(source) != expected or manifest(target) != expected:
         raise ValueError("review target was modified (original or snapshot)")
     workdir = target.parent
+    if workspace_manifest(workdir, settings["allowed_outputs"]) != settings["workspace_manifest"]:
+        raise ValueError("review workspace was modified outside the allowed outputs")
     findings_path = workdir / "out/findings.json"
     report_path = workdir / "out/REVIEW.md"
     for path in (findings_path, report_path):

@@ -297,10 +297,16 @@ gates, leases for multi-host stores, and richer evaluation data. See the roadmap
 
 The accepted `review` object names `pool`, optional `path` (default `.` relative to workdir),
 `rounds` (default 3), `blocking` (default blocker/major) and `after_max_rounds` (default park).
-All fields participate in the content hash. Pool names and effective lanes must differ from
-the execution channel; if both lanes are absent the hosts must differ. Checks occur at submit,
-parent launch, review creation and review child launch, so configuration changes cannot silently
-turn a review into self-review. Configured review enables auto-close for execution and repairs.
+Submission adds the effective review `channel` (`host`, `lane`); all fields participate in the
+content hash. Pool names and effective lanes must differ from the execution channel; if both
+lanes are absent the hosts must differ. A station wrapper records its channel and writable root
+from the configuration used to launch that process. Claim copies the actual channel into the
+run, and receipts retain that identity even when configuration later changes. Direct/file-pool
+dispatch also records its effective channel. Review creation selects the execution run by the
+round's `run_id`, compares it with the frozen review channel, and rejects changed review pool
+configuration. Review claim additionally checks the actual station channel and launch root;
+legacy stations missing that identity must be restarted. Refusal leaves a visible parked parent.
+Configured review enables auto-close for execution and repairs.
 
 After frozen acceptance, `review.begin` records a pending round containing the exact child id
 `<parent>-review-<n>` and the execution run id. Parent/run/receipt become `reviewing` with the
@@ -308,15 +314,30 @@ verifier PASS retained as evidence. Successful reviewed runs transition to `revi
 repair is requested. These successful rounds are excluded from the failure retry counter;
 failed repairs still consume the original `max_attempts`. The review round budget advances
 only after frozen acceptance succeeds, including when a repair needed failure retries.
+Dispatch and `begin` independently enforce the immutable round limit, even if a legacy or
+interrupted state has an incorrect `complete` flag.
 
 `review.advance` holds schedule → parent → child locks for child creation and result decisions.
 Generated cards, snapshot manifests and standalone verifier copies live in owner-side
 `reviews/<parent>/<round>/`; accepted specs have the ordinary authoritative frozen copies.
 Review workdirs live under the review pool root in `.yardgoat-reviews/<child>/`, with `target/`
-containing a snapshot and `out/` containing the review. The original directory and snapshot are
+containing a snapshot and `out/` containing the review. `pool.effective_root` is shared by review
+placement, station argv/scripts, mailboxes and doctor; the default is
+`$YARDGOAT_HOME/pools/<pool>/stations`. Doctor probes `.yardgoat-reviews` writability through the
+same launch chain; cached health also includes the effective root and this check.
+Submission checks every possible child workdir and its output scope against the parent's full
+write set (canonical glob prefixes and symlink targets). Creation checks again against the union
+of current scope and retained run reservations; existing children and claims are rechecked too.
+Overlaps are rejected with paths, never left queued against their parent's reservation.
+The original directory and snapshot are
 both checked for additions, removals, file bytes, modes, empty directories and symlink destinations.
 Links are copied without traversal; findings must name ordinary files inside the snapshot.
-The target and owner store must not contain the review workspace, avoiding recursive snapshots.
+The target must not contain the review workspace or owner-side assets, avoiding recursive snapshots.
+The frozen owner-side settings also contain a complete workdir manifest, excluding exactly
+`out/findings.json`, `out/REVIEW.md` and the card's explicit `out/BLOCKED.md`. The verifier rejects
+other persistent additions, removals, modes, bytes or symlinks; allowed output entries must be
+ordinary files. This baseline is retained across child retries and is never refreshed from a
+completed worker's files.
 This is an integrity check at verification time, not an OS read-only mount or a monitor of
 transient writes. Other scoped workers are excluded by the retained lease.
 
@@ -327,19 +348,36 @@ data before marking the child verified. Parent decisions read that receipt, neve
 findings output after verification. The child has a two-attempt failure budget. Failed output
 validation retries the child; exhaustion, verifier error, archive, refusal or a blocked child
 parks the parent with an inspectable reason. Answering cannot skip a pending child result.
+Frozen child-file drift is detected even when close refuses without a verdict; a failed close
+also advances the parent immediately after releasing the child lock. Restoring frozen files and
+answering the parent replays the pending round; verifier errors can be retried with child close
+after the environment is fixed. A launch refusal can retry the same round after a parent answer.
+
+Run prompts are captured at dispatch/claim. The frozen review card embeds the exact corresponding
+execution prompt with its run/path provenance, all answers in recorded order, and the earlier
+rounds' validated findings. It asks the reviewer to confirm each previous fix. This material is
+read-only review context and grants no authority to execute the original task's changes.
 
 Round records, deterministic child/follow-up IDs and numbered `review-NNN` answer keys make repeated
 close and reconcile safe. Answers use the same prompt mechanism as human replies and are
 attributed to the reconciler. Numeric prefixes preserve ordering with human answers. A result event has a stable round ID and is replayed without
 duplicates. The child and its frozen receipt are the durable source for replay if the parent
 controller stops before saving its state; existing accepted child IDs are never overwritten.
+Result consumption stages state in a copy: create/reuse all follow-ups, write the receipt and
+deduplicated event, then commit `processed`, the final decision and lease release together in
+parent state. An ordinary side-effect error parks the original pending state, retaining its
+reservation and retry entry point. A crash before state commit replays those idempotent side
+effects. Partial follow-up success is reused by deterministic ID plus content hash; a foreign
+ID collision stays pending and visible instead of starting a new execution round.
 Takeover takes the schedule lock and changes child owners with the parent; reconciliation also
 repairs an interrupted owner propagation. Direct child takeover is refused in favor of the parent.
 
 Blocking findings before the limit trigger one repair dispatch. Without blocking findings the
 parent becomes verified and follows the normal M3 delivery path. At the limit, park leaves the
-parent unverified with findings in its question and retains its write set until archive. Answering
-does not reset the immutable round budget. `pass_with_followups` accepts one follow-up per remaining
+parent unverified with findings in its question and retains its write set until archive. `answer`
+refuses a completed review budget, explaining that further work needs a new task or archive;
+the task stays in inbox. JSON and text status display its retained review write set.
+`pass_with_followups` accepts one follow-up per remaining
 finding (including nonblocking ones), then verifies the parent. Follow-ups inherit execution,
 scope, risk, authority and frozen acceptance; they have no review or on_pass automation and no
 run until explicitly dispatched. They appear as accepted decisions in inbox. An l3 follow-up

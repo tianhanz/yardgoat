@@ -67,6 +67,7 @@ def _report(request: dict, checks: list[dict]) -> dict:
     failed = [c["name"] + ": " + c["reason"] for c in checks if not c["ok"]]
     return {"pool": request.get("pool"), "host": request["executor"]["host"],
             "lane": request["executor"].get("lane", ""), "account_alias": request["executor"].get("acct", ""),
+            "workdir": request["workdir"],
             "checked_at": now(), "checked_epoch": time.time(), "ok": not failed,
             "env": runner.launch_env_fingerprint(runner.config()),
             "checks": checks, "reason": "; ".join(failed)}
@@ -83,7 +84,7 @@ def run(cfg: dict, name: str | None = None, host: str = "codex", lane: str = "",
     if name:
         ex = dict(pool.pool_conf(cfg, name))
         ex["acct"] = acct if acct is not None else pool.next_station(name, ex)[1]
-        workdir = os.path.expanduser(ex.get("root", str(pool.pool_dir(name) / "stations")))
+        workdir = str(pool.effective_root(name, ex))
     else:
         ex = {"host": host, "lane": lane, "acct": acct or "", "command": "true"}
         workdir = str(Path.cwd())
@@ -127,6 +128,8 @@ def ensure(name: str, cfg: dict, acct: str) -> dict:
     try:
         fresh = report and report["ok"] and report["pool"] == name and \
             report["host"] == ex["host"] and report["lane"] == ex.get("lane", "") and report["account_alias"] == acct and \
+            report.get("workdir") == str(pool.effective_root(name, ex)) and \
+            any(c["name"] == "review_workspace" for c in report["checks"]) and \
             report.get("env") == runner.launch_env_fingerprint(cfg) and \
             0 <= time.time() - float(report["checked_epoch"]) < float(cfg.get("doctor_ttl_h", 12)) * 3600
     except (KeyError, TypeError, ValueError):
@@ -134,7 +137,7 @@ def ensure(name: str, cfg: dict, acct: str) -> dict:
     return report if fresh else run(cfg, name=name, acct=acct)
 
 
-def _probe_script(rd: Path, host: str, mailbox: Path | None) -> str:
+def _probe_script(rd: Path, host: str, mailbox: Path | None, root: Path | None = None) -> str:
     command = "bash" if host == "shell" else host
     q = shlex.quote
     lines = ["set +e", f"command -v {q(command)} > {q(str(rd / 'host_path.out'))} 2>&1",
@@ -145,6 +148,11 @@ def _probe_script(rd: Path, host: str, mailbox: Path | None) -> str:
         probe = q(str(mailbox / (rd.name + ".probe")))
         lines += [f"( : > {probe} && rm -- {probe} ) > {q(str(rd / 'mailbox.out'))} 2>&1",
                   f"printf '%s' \"$?\" > {q(str(rd / 'mailbox.rc'))}"]
+    if root is not None:
+        directory = q(str(root / ".yardgoat-reviews"))
+        probe = q(str(root / ".yardgoat-reviews" / (rd.name + ".probe")))
+        lines += [f"( mkdir -p -- {directory} && : > {probe} && rm -- {probe} ) > {q(str(rd / 'review_workspace.out'))} 2>&1",
+                  f"printf '%s' \"$?\" > {q(str(rd / 'review_workspace.rc'))}"]
     # Collect failures without making the launcher appear broken when only --version failed.
     lines += [f"printf done > {q(str(rd / 'complete'))}", "exit 0"]
     return "\n".join(lines) + "\n"
@@ -156,7 +164,7 @@ def run_probe(rd: Path) -> int:
     cfg, ex, name = request["config"], request["executor"], request.get("pool")
     try:
         mb = pool.mailbox_dir(name, rd.name, ex) if name else None
-        (rd / "probe.sh").write_text(_probe_script(rd, ex["host"], mb))
+        (rd / "probe.sh").write_text(_probe_script(rd, ex["host"], mb, pool.effective_root(name, ex) if name else None))
         probe_argv = ["bash", str(rd / "probe.sh")]
         if name:
             script = pool.station_script(name, rd.name, ex, cfg, mb, probe_argv)
@@ -182,7 +190,7 @@ def run_probe(rd: Path) -> int:
         checks = [{"name": "startup", "ok": completed, "reason": "source and working directory ready" if completed else reason},
                   {"name": "launcher", "ok": rc == 0 and completed,
                    "reason": "exit 0" if rc == 0 and completed else reason}]
-        for key in ["host_path", "host_version"] + (["mailbox"] if name else []):
+        for key in ["host_path", "host_version"] + (["mailbox", "review_workspace"] if name else []):
             result = rd / f"{key}.rc"
             ok = result.exists() and result.read_text() == "0"
             detail = (rd / f"{key}.out").read_text(errors="replace").strip() if result.exists() else ""

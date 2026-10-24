@@ -28,6 +28,7 @@ def rig(tmp_path, env, monkeypatch):
     for name in cfg["pools"]:
         (tmp_path / name).mkdir()
         pool.update_station(name, f"{name}-st-1", station=f"{name}-st-1", pool=name,
+                            channel={"host": "shell", "lane": name}, root=str(tmp_path / name),
                             state="running", tasks=[], pid=os.getpid())
     Path(env["YARDGOAT_CONFIG"]).write_text(json.dumps(cfg))
 
