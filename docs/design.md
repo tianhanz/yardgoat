@@ -67,20 +67,20 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     in the inbox with a request to reword or switch lanes before resending. Reconcile does not automatically retry it.
     Lost-wrapper recovery and receipt replay preserve the same classification.
 
-20. **Dependencies require verification.** `depends_on` lists accepted upstream task ids. Submission validates
+20. **Dependencies require verification and declared delivery.** `depends_on` lists accepted upstream task ids. Submission validates
     self-references, missing ids and cycles by traversing authoritative accepted specs, under the schedule lock.
     Dispatch uses the same dependency gate as queue release and claim: terminated upstreams immediately park the
-    task; otherwise it creates one `waiting_deps` run if any upstream is not `verified`. Waiting counts only as in flight:
+    task; otherwise it creates one `waiting_deps` run if any upstream is not `verified` or has unfinished `on_pass` steps. Waiting counts only as in flight:
     it prevents duplicate dispatch and survives takeover, but uses no attempt, direct slot or pool station.
-    `status` names the unverified upstreams; `cancel` can cancel the wait without spending an attempt.
-    Reconcile moves the same run to `queued` once all upstreams are verified, then applies ordinary capacity,
+    `status` names the upstreams and distinguishes verification from unfinished delivery; `cancel` can cancel the wait without spending an attempt.
+    Reconcile moves the same run to `queued` once all upstreams are verified and all their declared delivery steps succeeded, then applies ordinary capacity,
     lane, drift and pool rules. Worker exit or a retryable verifier failure is insufficient. An `archived` or
     `exhausted` upstream instead parks the task with a `blocked_deps` run and an inbox question naming the
     terminated upstream. No worker or receipt is created for that run. Answering does not waive the dependency;
     an impossible dependency requires a replacement task spec under a new id. Auto-verification stays outside
     the schedule lock; downstream tasks observe its result on the next reconcile tick.
 21. **Declared writes exclude overlapping work.** Before direct start, file-pool/plugin submit, and pool claim,
-    the scheduler compares `workdir + scope` against every running task's write set, across all adapters and
+    the scheduler compares `workdir + scope` against every running task and active delivery write set, across all adapters and
     pools. The check, reservation and start share the machine schedule lock; claim follows schedule → pool →
     task lock order. Conflicts keep the same run queued, spend no attempt, and name the conflicting task and
     absolute path in `status` and reconcile output. Every worker outcome releases its reservation; reconcile
@@ -158,6 +158,10 @@ Omitted or empty `scope` opts out for backwards compatibility. `risk: l3` enforc
 `acceptance` remains descriptive.
 
 `depends_on: ["prepare-data", "build-tool"]` requires both upstream tasks to be verified before starting.
+If an upstream declares nonempty `on_pass`, every declared step must also have a successful receipt
+record. Pending, running, interrupted, preflight-blocked or failed delivery keeps dependents waiting;
+`status` explicitly says it is waiting for that upstream’s 收尾. Without `on_pass`, verification alone
+continues to release dependents. Dispatch, queue release and pool claim all use this same gate.
 The accepted dependency graph is immutable just like the rest of the spec; changing dependencies needs a new id.
 
 ### Known limitations of scope scans
@@ -205,27 +209,48 @@ Delivery rechecks owner, PASS state, drift and l3 approval before invoking shell
 the controller's OS environment, attributed to the current task owner, with `YARDGOAT_OWNER`,
 `YARDGOAT_TASK_ID` and `YARDGOAT_RUN_DIR` set. No worker or adapter executes these commands.
 
-The task lock serializes delivery against concurrent close/deliver/takeover/archive calls. Delivery runs
-outside the machine schedule lock. Each command has its own process group; timeout kills the group
-and records exit 124, while startup errors record 127. Combined stdout/stderr goes to
-`runs/<run>/on-pass-<step>-<attempt>.log`; the last 4000 bytes are decoded into `output_tail` in the receipt
-and `task.on_pass_finished` event. `task.on_pass_started` records each start. Step records also carry
-the one-based step number, command, cwd, owner, attempt, timestamps, exit code and timeout flag.
+Delivery takes a per-task delivery mutex before taking schedule → task locks to check and reserve
+its write set. It releases both schedule and task locks before invoking commands; unrelated launches,
+status and takeover can proceed during a slow step. Every worker launch/claim and other delivery checks
+this same persisted `delivery_reservation`, even after its controller dies. Receipt/state updates use
+short task locks and preserve current ownership/status. If ownership or status changes during a step,
+that step may finish, but later steps stop until the current owner explicitly resumes. Concurrent
+deliver calls serialize on the delivery mutex without holding the global scheduler lock.
 
-The receipt's `on_pass` list is the progress journal: it holds the latest attempt for each started step,
-while events and logs retain earlier attempts. A successful record (`exit_code: 0`) is always skipped,
-including duplicate step names. Each result is atomically written to the receipt before task state and
-before the next step. `deliver` reads this journal to recover a receipt-first commit interrupted before
-task.json was saved. A started step without a recorded result remains retryable. External side effects
-cannot be committed atomically with local files; commands must tolerate retry after a crash in that gap.
+Each attempt records its PGID and absolute deadline in the receipt before the shell is allowed to run.
+A pipe grant gates shell execution: controller death before the durable record closes the pipe and
+prevents command execution. On recovery, a live old process group refuses retry with its PGID and
+deadline; after that deadline, deliver kills the group and confirms it has no live members before retry.
+The reservation stays until completion or confirmed termination; after controller death, explicit
+`deliver` is the recovery operation (there is no independent timeout supervisor). Shell exit alone does
+not release the write set while background children remain alive. Timeout kills the entire group and
+records exit 124; an interrupted attempt whose group has exited records 125; startup errors record 127.
+Combined stdout/stderr goes to `runs/<run>/on-pass-<step>-<attempt>.log`; the last 4000 bytes are decoded
+into `output_tail` in the receipt and `task.on_pass_finished` event. `task.on_pass_started` records each
+start. Records also carry the step number, command, cwd, owner, attempt, timestamps and timeout flag.
 
-The task and receipt retain `verified`/`passed` on delivery failure, with `delivery_failed: true` and a
-task `delivery_reason` naming the failed step. Successful retry clears the flag/reason and inbox entry.
-`close` exits 1 for delivery failure while still reporting `verdict: PASS`; `deliver` exits 0 on completion,
-1 on a failed step, 2 for configuration errors, or 3 for policy refusal. Repeated close on a verified task
-with on_pass reports the existing delivery flag without re-verifying or retrying commands. Recovery or
-retry uses `deliver`, including after ownership changes. Existing close behavior is retained for tasks
-without on_pass. Auto-close uses the same owner and preserves reconcile's single JSON output.
+The receipt's `on_pass` list is the progress journal and result-event outbox. It holds the latest attempt
+for each started step, while events and logs retain earlier attempts. Recovery replays missing finished
+events using stable task/run/step/attempt event IDs, checking existing events before appending. This
+happens before skipping a success or replacing a failed attempt, so both success and failure history
+survive the receipt-first crash window without duplicate events. Successful steps are skipped, including
+duplicate step names. Commands must still tolerate retry after external side effects complete but before
+the successful local receipt is committed; those two operations cannot be atomic.
+
+The PASS commit first marks declared delivery pending in both task state and receipt. Only success
+records for **every declared step** clear `delivery_pending` / `delivery_failed`; an empty or partial
+journal is never success. Preflight refusals and configuration errors persist their concrete reason.
+The task and receipt retain `verified`/`passed`, and status, inbox and repeated close show pending delivery
+and its reason (also recovering receipt-first state). A successful retry clears the pending flags and
+inbox entry. `close` exits 1 for unfinished delivery on repeated close while still reporting `verdict: PASS`;
+initial close and `deliver` exit 0 on completion, 1 on a failed step, 2 for configuration errors, or 3 for
+policy/live-process/scope refusal. Recovery or retry uses `deliver`, including after ownership changes.
+Auto-close uses the same path and adds delivery exit code, pending flags and reason to reconcile's single
+JSON output. Existing close behavior is retained for tasks without on_pass.
+
+`report` counts human `task.approved` events as a separate `approve` intervention and includes them in
+the total, using the same machine-actor exclusions as other interventions. Delivery step events do not
+count as human decisions.
 
 ## Not yet
 

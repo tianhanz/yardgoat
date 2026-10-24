@@ -18,7 +18,7 @@ NORMAL = {"accepted", "queued", "running", "exited", "verified", "failed", "exha
           "blocked", "parked", "answered", "archived", "cancelled"}
 ALIASES = {"passed": "verified", "verifier_error": "verify_error", "canceled": "cancelled"}
 INTERVENTIONS = {"task.answered": "answer", "task.owner_changed": "takeover",
-                 "task.archived": "archive", "run.cancelled": "cancel"}
+                 "task.archived": "archive", "run.cancelled": "cancel", "task.approved": "approve"}
 METRICS = ("first_pass_count", "first_pass_rate", "avg_attempts", "avg_wall_seconds",
            "human_interventions", "abnormal", "cost")
 

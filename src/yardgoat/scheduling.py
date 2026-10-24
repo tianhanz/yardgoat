@@ -6,6 +6,7 @@ import os
 import stat
 from pathlib import Path
 
+from . import delivery
 from .contract import SpecError
 from .store import TaskDir, list_tasks
 
@@ -52,16 +53,29 @@ def validate_dependencies(spec: dict) -> None:
 
 
 def dependencies(spec: dict) -> tuple[list[str], list[str]]:
-    """Return unverified and terminal upstream task ids, in declared order."""
+    """Return unfinished (verification or delivery) and terminal upstream ids."""
     waiting, stopped = [], []
     for tid in dict.fromkeys(spec.get("depends_on", [])):
         td = TaskDir(tid)
-        status = td.state()["status"] if td.exists else "missing"
-        if status != "verified":
+        st = td.state() if td.exists else {"status": "missing"}
+        status = st["status"]
+        if status != "verified" or delivery.view(td, st, td.spec())["delivery_pending"]:
             waiting.append(tid)
         if status in ("archived", "exhausted"):
             stopped.append(tid)
     return waiting, stopped
+
+
+def wait_reason(waiting: list[str]) -> str:
+    reasons = []
+    for tid in waiting:
+        td = TaskDir(tid)
+        st = td.state() if td.exists else {"status": "missing"}
+        if st["status"] == "verified" and delivery.view(td, st, td.spec())["delivery_pending"]:
+            reasons.append(f"等待上游 {tid} 的收尾完成")
+        else:
+            reasons.append(f"等待上游 verified：{tid}")
+    return "；".join(reasons)
 
 
 def write_set(spec: dict) -> list[str]:
@@ -124,11 +138,13 @@ def scope_conflicts(task_id: str, spec: dict) -> list[dict]:
         if tid == task_id:
             continue
         td = TaskDir(tid)
-        for run in td.state()["runs"]:
+        st = td.state()
+        reservations = [r for r in st["runs"] if r["state"] in ("running", "submit_unknown")]
+        if st.get("delivery_reservation"):
+            reservations.append(st["delivery_reservation"])
+        for run in reservations:
             # An unknown remote submit may already be executing; retain its reservation
             # until its outcome is resolved, just like its existing duplicate-dispatch guard.
-            if run["state"] not in ("running", "submit_unknown"):
-                continue
             theirs = run.get("write_set")
             if theirs is None:  # pre-M2 running tasks
                 theirs = write_set(td.spec())

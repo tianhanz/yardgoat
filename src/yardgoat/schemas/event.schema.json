@@ -143,6 +143,22 @@
   },
   "timed_out": {
    "type": "boolean"
+  },
+  "event_id": {
+   "type": "string",
+   "description": "Stable task/run/step/attempt identity for replayed delivery results."
+  },
+  "pgid": {
+   "type": [
+    "integer",
+    "null"
+   ]
+  },
+  "deadline": {
+   "type": "number"
+  },
+  "interrupted": {
+   "type": "boolean"
   }
  }
 }

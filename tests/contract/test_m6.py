@@ -76,7 +76,7 @@ def test_report_pass_attempts_wall_humans_cost_and_abnormal_outcomes(env):
     assert g["first_pass_count"] == 2 and g["first_pass_rate"] == pytest.approx(2 / 5)
     assert g["avg_attempts"] == pytest.approx(7 / 5)  # launch failures consume no attempt
     assert g["avg_wall_seconds"] == 10
-    assert g["human_interventions"] == {"total": 4, "answer": 1, "takeover": 1, "archive": 1, "cancel": 1}
+    assert g["human_interventions"] == {"total": 4, "answer": 1, "takeover": 1, "archive": 1, "cancel": 1, "approve": 0}
     assert g["abnormal"] == {"lost": 0, "launch_failed": 1, "submit_unknown": 0,
                              "verify_error": 1, "provider_refused": 0, "other": 0}
     assert g["cost"] == {"usd": 1.0, "tokens": 2150, "unknown_tasks": 2}

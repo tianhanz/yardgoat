@@ -317,7 +317,7 @@ def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
 
 def _wait_for_dependencies(td: TaskDir, st: dict, run: dict, waiting: list[str], actor: str) -> None:
     changed = run["state"] != "waiting_deps" or run.get("waiting_for") != waiting
-    run.update(state="waiting_deps", waiting_for=waiting, reason="等待上游 verified：" + ", ".join(waiting))
+    run.update(state="waiting_deps", waiting_for=waiting, reason=scheduling.wait_reason(waiting))
     run.pop("scope_conflicts", None)
     st["status"] = "waiting_deps"
     if changed:
@@ -421,6 +421,8 @@ def _status_obj(td: TaskDir) -> dict:
     runs = []
     for r in st["runs"]:
         rr = dict(r)
+        if r["state"] == "waiting_deps":
+            rr["reason"] = scheduling.wait_reason(r.get("waiting_for", []))
         rr["alive"] = _alive(r) if r["state"] == "running" else False
         rec = td.run_dir(r["run_id"]) / "receipt.json"
         rr["receipt"] = json.loads(rec.read_text()) if rec.exists() else None
@@ -436,8 +438,7 @@ def _status_obj(td: TaskDir) -> dict:
         backoff = {**backoff, "pool": name}
     return {"task_id": td.task_id, "status": st["status"], "owner": st["owner"], "owner_history": st["owner_history"],
             "approval": st.get("approval"), "approval_required": bool(needs_approval),
-            "delivery_failed": st.get("delivery_failed", False), "delivery_reason": st.get("delivery_reason"),
-            "on_pass": st.get("on_pass", []),
+            **delivery.view(td, st, td.spec()),
             "pool_backoff": backoff,
             "pool_doctor": health, "pool_problem": problem,
             "verdict": st["verdict"], "question": st.get("question"), "runs": runs, "drift": changed}
@@ -522,10 +523,12 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
             return refuse(f"owner is {st['owner']}, not {who}"), None
         if st["status"] == "verified" and td.spec().get("on_pass"):
             # Verification is already durable. Retrying failed delivery is explicit via deliver.
+            progress = delivery.view(td, st, td.spec())
+            st.update(progress)
             if echo:
                 print(json.dumps({"task_id": td.task_id, "run_id": st["verdict"]["run_id"], "verdict": "PASS",
-                                  "delivery_failed": st.get("delivery_failed", False)}))
-            return (1 if st.get("delivery_failed") else 0), "PASS"
+                                  **progress}, ensure_ascii=False))
+            return (1 if progress["delivery_pending"] else 0), "PASS"
         if st["status"] in ("archived", "verified"):
             return refuse(f"task is {st['status']}"), None
         last = st["runs"][-1] if st["runs"] else None
@@ -552,6 +555,8 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
                            "checked_at": checked, "checked_by": who}
         if verdict == "PASS":
             rec["status"] = "passed"; last["state"] = "verified"; st["status"] = "verified"
+            if spec.get("on_pass"):
+                delivery.mark_pending(st, rec)
         elif verdict == "FAIL":
             rec["status"] = "failed"; last["state"] = "failed"
             used = sum(r["state"] in COUNTED for r in st["runs"])
@@ -565,34 +570,54 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
     if echo:
         result = {"task_id": td.task_id, "run_id": last["run_id"], "verdict": verdict}
         if spec.get("on_pass") and verdict == "PASS":
-            result["delivery_failed"] = td.state().get("delivery_failed", False)
+            result.update(delivery.view(td, td.state(), spec))
             result["delivery_exit_code"] = delivery_rc
         print(json.dumps(result))
     return (delivery_rc if verdict == "PASS" else (1 if verdict == "FAIL" else 2)), verdict
 
 
 def do_deliver(td: TaskDir, who: str, echo: bool = False) -> int:
-    with td.locked() as box:
-        st = box["state"]
-        if st["owner"] != who:
-            return refuse(f"owner is {st['owner']}, not {who}")
-        if st["status"] != "verified" or (st.get("verdict") or {}).get("verdict") != "PASS":
-            return refuse("deliver requires a verified task with a PASS verdict")
-        changed = checked_drift(td, st)
-        if changed:
-            return refuse(f"frozen files changed since submit: {changed}")
-        spec, cfg = td.spec(), runner.config()
-        problem = approval_problem(td, st, spec, cfg, changed)
-        if problem:
-            return refuse(problem)
+    # Delivery contenders wait outside schedule/task locks. Only the reservation needs
+    # schedule → task; the long shell command holds neither, so unrelated work can start.
+    with delivery.locked(td):
+        with pool.schedule_lock(), td.locked() as box:
+            st = box["state"]
+            if st["owner"] != who:
+                return refuse(f"owner is {st['owner']}, not {who}")
+            if st["status"] != "verified" or (st.get("verdict") or {}).get("verdict") != "PASS":
+                return refuse("deliver requires a verified task with a PASS verdict")
+            spec, cfg = td.spec(), runner.config()
+            changed = checked_drift(td, st)
+            problem = (f"frozen files changed since submit: {changed}" if changed else
+                       approval_problem(td, st, spec, cfg, changed))
+            if problem:
+                delivery.problem_locked(td, st, problem)
+                return refuse(problem)
+            try:
+                if spec.get("on_pass"):
+                    contract.positive_timeout(spec.get("on_pass_timeout", cfg.get("on_pass_timeout", 600)))
+            except (contract.SpecError, ValueError) as exc:
+                delivery.problem_locked(td, st, str(exc))
+                print(f"delivery error: {exc}", file=sys.stderr)
+                return 2
+            conflicts = scheduling.scope_conflicts(td.task_id, spec) if spec.get("on_pass") else []
+            if conflicts:
+                reason = "；".join(f"收尾撞了 {c['task_id']} 的 {c['path']}，它完成后可重试" for c in conflicts)
+                delivery.problem_locked(td, st, reason)
+                return refuse(reason)
+            if spec.get("on_pass"):
+                st["delivery_reservation"] = {"write_set": scheduling.write_set(spec), "by": who,
+                                              "run_id": st["verdict"]["run_id"], "at": now()}
         try:
             rc = delivery.run_locked(td, st, spec, who, cfg)
-        except (contract.SpecError, ValueError) as exc:
+        except (contract.SpecError, ValueError, OSError) as exc:
+            with td.locked() as box:
+                delivery.problem_locked(td, box["state"], str(exc))
             print(f"delivery error: {exc}", file=sys.stderr)
             return 2
     if echo:
         print(json.dumps({"task_id": td.task_id, "result": "delivery_failed" if rc else "delivered",
-                          "delivery_failed": st.get("delivery_failed", False), "on_pass": st.get("on_pass", [])}, ensure_ascii=False))
+                          **delivery.view(td, td.state(), spec)}, ensure_ascii=False))
     return rc
 
 
@@ -655,8 +680,9 @@ def cmd_inbox(a) -> int:
         ad = td.spec().get("adapter", {})
         if ad.get("kind") == "pool" and not pool.pools(cfg).get(ad["pool"]):
             missing_pools.add(ad["pool"])
-        if st["status"] == "verified" and st.get("delivery_failed"):
-            reason = st.get("delivery_reason") or delivery.failure_reason(st.get("on_pass", []))
+        progress = delivery.view(td, st, td.spec())
+        if st["status"] == "verified" and progress["delivery_pending"]:
+            reason = progress["delivery_reason"]
             items.append({"task_id": t, "status": "verified", "owner": st["owner"],
                           "delivery_failed": True, "reason": reason, "question": reason})
             continue
@@ -789,7 +815,10 @@ def cmd_reconcile(a) -> int:
     for td, owner in to_close:   # do_close re-checks state and run under the task lock
         rc, verdict = do_close(td, owner, actor_note="auto_close by reconcile")
         if verdict:
-            report.append({"task_id": td.task_id, "run_id": td.state()["verdict"]["run_id"], "auto_closed": verdict})
+            action = {"task_id": td.task_id, "run_id": td.state()["verdict"]["run_id"], "auto_closed": verdict}
+            if verdict == "PASS" and td.spec().get("on_pass"):
+                action.update(delivery.view(td, td.state(), td.spec()), delivery_exit_code=rc)
+            report.append(action)
     notified = notify.notify_pending(cfg)
     print(json.dumps({"reconciled_at": now(), "actions": report, "notified": notified}, ensure_ascii=False))
     return 0
