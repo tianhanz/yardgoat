@@ -43,3 +43,14 @@ def test_workdir_equal_to_the_pool_root_is_allowed(tmp_path, env):
     s = json.loads(spec.read_text()); s.update(workdir=str(tmp_path / "root"), adapter={"kind": "pool", "pool": "p"}); spec.write_text(json.dumps(s))
     yg(env, "submit", str(spec), "--as", "A")
     assert json.loads(yg(env, "dispatch", "t-root", "--as", "A")[1])["result"] == "queued"
+
+
+def test_spawn_per_queued_keeps_a_small_batch_on_one_station(tmp_path, env):
+    pool_cfg(env, tmp_path, max_stations=5, spawn_per_queued=3)
+    c = json.loads(Path(env["YARDGOAT_CONFIG"]).read_text()); c["pools"]["p"]["command"] = "sleep 5"
+    Path(env["YARDGOAT_CONFIG"]).write_text(json.dumps(c))
+    started = []
+    for t in ("t-s1", "t-s2", "t-s3", "t-s4"):
+        pool_task(tmp_path, env, t)
+        started += json.loads(yg(env, "dispatch", t, "--as", "A")[1])["stations_started"]
+    assert len(started) == 2          # ceil(4 / 3) = 2 stations for 4 waiting cards, not 4

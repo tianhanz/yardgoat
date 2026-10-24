@@ -39,7 +39,8 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     mailbox inside the pool root and are executed by the station wrapper outside any sandbox; the wrapper also cuts a
     card off at its `max_wall_min`, ending the station's whole process group.) A task with `adapter.kind = "pool"` is only queued at dispatch. Stations
     (one agent CLI session each, started by Yardgoat within `max_stations` per pool and `max_concurrent` per machine)
-    run a loop prompt: `claim` the oldest card → do it → `finish` → claim again, until `EMPTY` or
+    run a loop prompt: `claim` the oldest card → do it → `finish` → claim again (a pool adds one station per `spawn_per_queued` waiting
+    cards, default 1, so small batches stay on one warm station), until `EMPTY` or
     `max_tasks_per_station`. Warm sessions are reused across cards; nothing is ever typed into a station. A card whose
     station dies is marked `lost`. Task workdirs must live under the pool's `root` (the station's writable root).
 13. **The accepted spec and frozen hashes have an authoritative copy** outside the task store

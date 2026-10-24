@@ -168,7 +168,9 @@ def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
         with pool_lock(name):
             q = len(queued_cards(name))
             live = live_stations(name)
-            want = min(q, int(c.get("max_stations", 1))) - len(live)
+            # one more station per `spawn_per_queued` waiting cards: small batches stay on one warm station
+            k = max(1, int(c.get("spawn_per_queued", 1)))
+            want = min(-(-q // k), int(c.get("max_stations", 1))) - len(live)
             while want > 0:
                 if cap is not None and direct_in_use + all_live_stations(cfg) >= int(cap):
                     break
