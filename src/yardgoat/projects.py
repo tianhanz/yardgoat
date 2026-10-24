@@ -1,6 +1,6 @@
-"""Project controllers, epoch fencing and recoverable handoff. No task permissions yet.
+"""Project controllers, epoch fencing and recoverable handoff.
 
-Lock order for future task integration: delivery -> schedule -> pool -> project -> task.
+Lock order for task integration: delivery -> schedule -> pool -> project -> task.
 Use locked(project_id), then recheck_locked(state, sid, epoch) at the task commit point.
 Never call the locking wrappers again while holding the same project lock.
 No subprocess, model, tmux, or network operation executes under a project lock.

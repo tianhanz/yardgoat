@@ -64,7 +64,8 @@ an active session. A nonzero worker exit still goes to the verifier; a failed ve
 add automatic retries to ordinary tasks. Set `"auto_close": false` for manual `close`. Configured
 `review` retains its existing automatic verification policy, including execution and repairs.
 `quick --no-auto-close` selects manual close; `quick --auto-close` remains a supported spelling of
-the default. These two switches are mutually exclusive.
+the default. These two switches are mutually exclusive. An explicit `auto_close`
+must be a JSON boolean; `"false"` as a string is a spec error.
 
 Retry prompts append the latest FAIL judgment and the last 4000 characters
 of its verifier output, with truncation and log location indicated; engineering-review goal
@@ -79,13 +80,14 @@ Accepted specs, hashes and frozen files are not rewritten. See the
 ## Sessions and project controllers
 
 Session registration identifies a local agent process; project control is a separate
-explicit grant. These commands do not change task ownership or task permissions.
+explicit grant. Tasks opt into that role through `owner` or an explicit one-card bind;
+registering a project alone leaves existing string-owned tasks unchanged.
 
 ```bash
 yardgoat whoami --json
 yardgoat session register --label "Planning session"
 yardgoat session list --json
-# Administrative inventory (requires project_admins in local config):
+# Administrative inventory (project_admins; target must have the same OS user):
 yardgoat session register --pid 12345 --as operator --reason "Session inventory"
 
 yardgoat project add example --label "Example" --root /path/to/work --claim open
@@ -118,8 +120,8 @@ Optional local configuration:
 When supplied, `sessions.agents` completely replaces the default exact names
 `claude`, `codex`, `kimi`. Each rule supports exact `exe`, `comm` or `argv0` names;
 generic interpreters are not recognized by default. The closest matching agent is
-the caller. Other users' ancestors are skipped using their public UID and parent
-metadata; their environments are not read. Ambiguous or unreadable required
+the caller. Other users' ancestors are skipped using accessible UID and parent
+metadata (`hidepid` can restrict these too); their environments are not read. Ambiguous or unreadable required
 evidence (including same-user ancestry) is unknown (exit 3), and pool stations
 cannot register. `--session ID` asserts the caller identity; it cannot
 select somebody else's identity. `project assign --session` instead names its target.
@@ -128,7 +130,9 @@ process entry cannot by itself establish death.
 Tmux endpoints and project roots are display/routing metadata, never permission.
 
 `project_admins` is separate from l3 `approvers` and fails closed when absent.
-Administrator `--as` is a cooperative identity, not OS-user authentication. Claims
+Administrator `--as` is a cooperative identity, not OS-user authentication.
+Administrator registration only accepts processes belonging to the caller's same
+OS user; even root cannot use it to register another user's agent. Claims
 work only for open projects at epoch 0; controller death requires admin recovery.
 Epoch comparisons fence stale calls even after A→B→A. Transfer commit is replayable;
 tokens are stored only as hashes. New tokens have a `yg-` prefix so they work as
@@ -148,6 +152,36 @@ reports only the pool's launch chain. Both modes print the same report they save
 Caught station launch failures are included in the error summary and retain the
 previous error-free completion time.
 This record never grants or revokes project control.
+
+## Project-owned cards
+
+New specs can include `"owner": {"project": "example"}`. From the project's current
+registered controller session:
+
+```bash
+yardgoat submit spec.json --project-owned --as planning  # use spec.project as owner role
+# Or explicitly migrate one legacy card (both conditions are checked):
+yardgoat project bind task-id --project example --as current-string-owner
+```
+
+Submission stores a stable `owner_ref` and a display `owner` containing the original
+controller label. Bind changes task state and events only; accepted specs, hashes
+and frozen files stay intact. Review children and follow-ups inherit the role.
+Project handoff changes all these cards' control without rewriting any card.
+Use project handoff/transfer for these cards; task `takeover` is refused (exit 3).
+
+Dispatch, manual close, park, archive, deliver, confirm-review-channel and cancel
+require the current controller session. Reusing its `--as` text does not grant
+permission; unknown callers are refused. Each operation rechecks its original epoch
+at commit or execution grant, including A→B→A handoffs. Already accepted runs and
+started delivery steps finish normally; the old controller cannot start the next
+step. The reconciler continues automatic verification, review, repair and delivery
+as `reconciler`, recording `{project, epoch}` in `on_behalf_of`. Station claim/finish,
+answer and approval keep their existing rules.
+
+Status and inbox show the project, current controller/epoch and transfer state.
+`whoami` includes per-project unfinished-card counts and a total. Reports grouped
+by project use the role reference. See the [operation permission table](docs/design.md#project-owned-tasks-and-operation-permissions).
 
 ## Approval and delivery
 
@@ -283,7 +317,8 @@ rounds by answering; submit a new task for further work.
 `answer` refuses completed round budgets and keeps the task visible in `inbox`.
 `status` shows the retained review write set until verification or archive releases it.
 
-Take over the parent to transfer its review children too. Repeated close/reconcile does not
+For legacy cards, take over the parent to transfer its review children too.
+Project cards and their descendants instead share the project role. Repeated close/reconcile does not
 duplicate children, answers or repair rounds. Receipts include round numbers, each round's
 finding count and the validated findings used to decide the result.
 If follow-up submission or result recording fails, the round remains pending and its write
@@ -349,8 +384,20 @@ For independent routes, `notify` also accepts a list:
 ]}
 ```
 
+Project routes can use `{controller}`, `{controller_session}` and `{endpoint}` in
+both command and recipient templates. The endpoint is compact JSON containing
+`socket` and `pane_id`. Use `recipient: "{controller_session}"` to send a pending
+question once to each current controller after handoff. Such a route waits without
+recording success if the controller is not alive or its endpoint is unverified;
+a fixed human route still sends. These three values are empty for legacy tasks.
+
+Unknown placeholders or malformed formatting disable only the affected route.
+JSON status reports `notify_errors`; non-pool doctor reports `notify_config`.
+An unchanged invalid template logs once, and fixing it restores the route at the
+next reconcile. External command failures/timeouts retain ordinary retry behavior.
+
 Each route has its own optional `on` list. `name` defaults to `"default"`; names must be unique within
-the list, including omitted names. Invalid configuration rejects the entire list and logs a warning.
+the list, including omitted names. Structural errors, including duplicate names, reject the entire list and log a warning.
 `recipient` is a string template using the same placeholders as `command`; it identifies the destination
 for deduplication, while the command remains responsible for delivery. Missing `recipient` means an
 empty destination. Success is remembered by route name, status, full question hash and formatted

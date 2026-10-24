@@ -41,7 +41,8 @@
     "task.on_pass_finished",
     "task.delivery_assumed_stopped",
     "task.review_processed",
-    "task.review_channel_confirmed"
+    "task.review_channel_confirmed",
+    "task.project_bound"
    ]
   },
   "actor": {
@@ -221,6 +222,52 @@
     "pass",
     "pass_with_followups"
    ]
+  },
+  "owner_ref": {
+   "type": "object",
+   "required": [
+    "project"
+   ],
+   "additionalProperties": false,
+   "properties": {
+    "project": {
+     "type": "string",
+     "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+    }
+   },
+   "description": "Stable project controller role; handoff never rewrites cards."
+  },
+  "actor_session": {
+   "type": "string",
+   "pattern": "^s-[0-9a-f]{64}$",
+   "description": "Mechanically identified manual controller."
+  },
+  "epoch": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "on_behalf_of": {
+   "type": "object",
+   "required": [
+    "project",
+    "epoch"
+   ],
+   "additionalProperties": false,
+   "properties": {
+    "project": {
+     "type": "string",
+     "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+    },
+    "epoch": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "description": "System executor's project/term; actor is reconciler, without an impersonated actor_session."
+  },
+  "execution_control": {
+   "type": "object",
+   "description": "Original execution grant audit when the reconciler replays a prior session's delivery result."
   }
  }
 }

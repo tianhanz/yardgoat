@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote
 
-from . import health, pool, runner
+from . import health, notify, pool, runner
 from .store import home, now, read_json, write_json
 
 PROBE_TIMEOUT = 20
@@ -113,10 +113,14 @@ def run(cfg: dict, name: str | None = None, host: str = "codex", lane: str = "",
             report = _failed(request, "startup timed out before the probe returned")
     except (OSError, RuntimeError, ValueError) as e:
         report = _failed(request, str(e))
+    report["notify_errors"] = notify.configuration_errors(cfg)
     if not name:
         # Reconcile health is global, not a pool launch/admission result. Finish
         # the non-pool report before persisting it; the CLI only renders it.
         report["checks"].append(health.check(cfg))
+        notify_errors = report["notify_errors"]
+        report["checks"].append({"name": "notify_config", "ok": not notify_errors,
+                                 "reason": "; ".join(p["error"] for p in notify_errors) or "notification templates valid"})
         report["ok"] = all(c["ok"] for c in report["checks"])
         report["reason"] = "; ".join(c["name"] + ": " + c["reason"] for c in report["checks"] if not c["ok"])
     path = record_path(key, "pool" if name else "direct")

@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import contract, runner
+from . import contract, control, runner, sessions
 from .store import TaskDir, now, read_json, write_json
 
 UNKNOWN_REASON = "旧版本留下的收尾记录，进程状态未知；确认旧进程已停止后用 deliver --assume-stopped 继续"
@@ -190,13 +190,14 @@ class Journal:
                     self.save(UNKNOWN_REASON, reserve=True)
                     return UNKNOWN_REASON
                 # Log the human assertion BEFORE it enables any retry or release.
-                with self.td.locked() as box:
+                with control.locked(self.td) as box:
                     owner = box["state"]["owner"]
-                    if owner == who:
+                    permitted = control.allowed(box["state"], who)
+                    if permitted:
                         self.td.event("task.delivery_assumed_stopped", who, run_id=self.run_id,
                                       step=record["step"], attempt=record["attempt"], assume_stopped=True,
                                       reason=UNKNOWN_REASON)
-                if owner != who:
+                if not permitted:
                     reason = f"owner is {owner}, not {who}；{UNKNOWN_REASON}"
                     self.save(reason, reserve=True)
                     return reason
@@ -253,16 +254,20 @@ def run_locked(td: TaskDir, st: dict, spec: dict, who: str, cfg: dict, assume_st
             continue
         # All old attempts have now been proved stopped. Recheck and replace the
         # union only when actually preparing a fresh attempt, under the schedule lock.
-        with pool.schedule_lock(), td.locked() as box:
-            fresh = box["state"]
-            if fresh["owner"] != who or fresh["status"] != "verified":
-                reason = f"收尾暂停：当前 owner={fresh['owner']}，status={fresh['status']}"
-            else:
-                conflicts = scheduling.scope_conflicts(td.task_id, spec)
-                reason = "；".join(f"收尾撞了 {c['task_id']} 的 {c['path']}，它完成后可重试" for c in conflicts)
-            if not reason:
-                reserve_locked(fresh, spec, who, replace=True)
-                paths = fresh["delivery_reservation"]["write_set"]
+        try:
+            with pool.schedule_lock(), control.locked(td) as box:
+                fresh = box["state"]
+                if not control.allowed(fresh, who) or fresh["status"] != "verified":
+                    reason = f"收尾暂停：当前 owner={fresh['owner']}，status={fresh['status']}"
+                else:
+                    conflicts = scheduling.scope_conflicts(td.task_id, spec)
+                    reason = "；".join(f"收尾撞了 {c['task_id']} 的 {c['path']}，它完成后可重试" for c in conflicts)
+                if not reason:
+                    reserve_locked(fresh, spec, who, replace=True)
+                    paths = fresh["delivery_reservation"]["write_set"]
+        except sessions.Refused as exc:
+            journal.save(str(exc), release=True)
+            return 3
         if reason:
             journal.save(reason, release=True)
             return 3
@@ -271,7 +276,8 @@ def run_locked(td: TaskDir, st: dict, spec: dict, who: str, cfg: dict, assume_st
                   "attempt": (previous or {}).get("attempt", 0) + 1,
                   "exit_code": None, "output_tail": "", "timed_out": False,
                   "launch_protocol": 2, "process_identity": None, "write_set": paths,
-                  "pgid": None, "deadline": time.time() + timeout}
+                  "pgid": None, "deadline": time.time() + timeout,
+                  **{k: v for k, v in control.audit(st).items() if k != "actor"}}
         if previous is None:
             records.append(record)
         else:
@@ -282,6 +288,7 @@ def run_locked(td: TaskDir, st: dict, spec: dict, who: str, cfg: dict, assume_st
         log_path = journal.rd / f"on-pass-{index + 1}-{record['attempt']}.log"
         env = {**os.environ, "YARDGOAT_TASK_ID": td.task_id,
                "YARDGOAT_RUN_DIR": str(journal.rd), "YARDGOAT_OWNER": who}
+        grant_refused = None
         with log_path.open("wb") as log:
             try:
                 process = subprocess.Popen([sys.executable, str(Path(__file__).with_name("delivery_worker.py")),
@@ -295,11 +302,17 @@ def run_locked(td: TaskDir, st: dict, spec: dict, who: str, cfg: dict, assume_st
                         raise OSError("cannot identify delivery group leader; execution grant withheld")
                     journal.save()
                     # No shell runs before identity + deadline + write set are durable.
-                    with td.locked() as box:
-                        fresh = box["state"]
-                        if fresh["owner"] == who and fresh["status"] == "verified":
-                            process.stdin.write(b"1")
-                            process.stdin.flush()
+                    try:
+                        with control.locked(td) as box:
+                            fresh = box["state"]
+                            if control.allowed(fresh, who) and fresh["status"] == "verified":
+                                # The one-byte execution grant is the commit point.
+                                process.stdin.write(b"1")
+                                process.stdin.flush()
+                            else:
+                                grant_refused = "task or owner changed before delivery grant"
+                    except sessions.Refused as exc:
+                        grant_refused = str(exc)
                 finally:
                     process.stdin.close()
                 try:
@@ -321,8 +334,10 @@ def run_locked(td: TaskDir, st: dict, spec: dict, who: str, cfg: dict, assume_st
         record["finished_at"] = now()
         # The terminal result and release land together, before result-event replay.
         terminal = record["exit_code"] != 0 or index == len(actions) - 1
-        journal.save(release=terminal)
+        journal.save(grant_refused, release=terminal)
         journal.replay()
+        if grant_refused:
+            return 3
         if record["exit_code"] != 0:
             return 1
     journal.save(release=True)

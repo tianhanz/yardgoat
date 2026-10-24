@@ -55,6 +55,14 @@ def normalize(spec: dict, base: Path, metadata_defaults: bool = True) -> dict:
             raise SpecError(f"missing required field: {k}")
     if not TASK_ID_RE.match(str(s["task_id"])):
         raise SpecError("task_id must match " + TASK_ID_RE.pattern)
+    if "auto_close" in s and type(s["auto_close"]) is not bool:
+        raise SpecError("auto_close must be a boolean")
+    if "owner" in s:
+        owner = s["owner"]
+        if (not isinstance(owner, dict) or set(owner) != {"project"}
+                or not isinstance(owner["project"], str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", owner["project"])):
+            raise SpecError('owner must be {"project": "<project id>"}')
     s["card"] = _abs(base, s["card"])
     s["workdir"] = _abs(base, s["workdir"])
     ex = s["executor"]

@@ -148,7 +148,7 @@
   "auto_close": {
    "type": "boolean",
    "default": true,
-   "description": "Defaults to true, including previously accepted specs omitting this field. reconcile runs the frozen verifier as the current owner after exit. Explicit false keeps manual close; configured review retains its automatic verification policy."
+   "description": "Boolean only. Defaults to true. Reconcile runs the frozen verifier as the legacy owner or as reconciler on behalf of a project role. False keeps manual close; configured review retains automatic verification."
   },
   "scope": {
    "type": "array",
@@ -224,10 +224,22 @@
     "channel": {
      "type": "object",
      "description": "Owner-resolved review pool host/lane, frozen at submission and compared with actual run/station channels.",
-     "required": ["host", "lane"],
+     "required": [
+      "host",
+      "lane"
+     ],
      "properties": {
-      "host": {"enum": ["codex", "claude", "kimi", "shell"]},
-      "lane": {"type": "string"}
+      "host": {
+       "enum": [
+        "codex",
+        "claude",
+        "kimi",
+        "shell"
+       ]
+      },
+      "lane": {
+       "type": "string"
+      }
      }
     },
     "pool": {
@@ -294,6 +306,20 @@
   "review_followup": {
    "type": "object",
    "description": "Generated follow-up provenance; accepted tasks appear in inbox without automatic dispatch."
+  },
+  "owner": {
+   "type": "object",
+   "required": [
+    "project"
+   ],
+   "additionalProperties": false,
+   "properties": {
+    "project": {
+     "type": "string",
+     "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+    }
+   },
+   "description": "Stable project controller role; handoff never rewrites cards."
   }
  }
 }

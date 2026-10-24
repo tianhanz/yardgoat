@@ -20,7 +20,7 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 ## Invariants (each one has a contract test)
 
 1. **Immutable task ids.** Submitting identical content again is a no-op; different content under the same id is refused.
-2. **One owner.** Only the current owner can dispatch or close. Ownership moves only through `takeover --from <current owner>`, which records whether a run was in flight.
+2. **One owner.** Legacy cards use the current string owner and `takeover --from <current owner>`. Project cards use the current controller session/epoch through a stable `owner_ref`; control moves through project handoff. System continuation is explicitly attributed to the reconciler.
 3. **No duplicate dispatch.** While a run is alive, `dispatch` returns the existing run. A run that exited must be verified before another attempt.
 4. **Frozen verification.** The card and every file listed in `verifier.freeze` are hashed at submit; any drift blocks both dispatch and close.
 5. **Exited ≠ verified.** A normal worker exit only writes a receipt with `status: exited`. `close` runs the verifier: exit 0 → `passed` (or `reviewing` when review is configured), exit 1 → `failed` (retry allowed within `budget.max_attempts`), anything else → `verifier_error` (a crashing verifier is not a failing deliverable).
@@ -228,9 +228,11 @@ ownership; `close` verifies. The old owner can no longer dispatch or close.
 
 ### Automatic verification and upgrades
 
-An omitted `auto_close` is interpreted as true when reconciling, rather than inserted into an accepted
+`submit` requires an explicit `auto_close` to be a JSON boolean (strings such as
+`"false"` are rejected). An omitted `auto_close` is interpreted as true when reconciling, rather than inserted into an accepted
 spec. Exited runs use the existing `do_close` path outside the scheduling lock, attributed to the
-current task owner. The owner's interactive session is not required. `do_close` rechecks ownership,
+current string owner for legacy cards or the explicit reconciler for project cards.
+The owner's interactive session is not required. `do_close` rechecks ownership,
 task state and run state under the task lock, so two reconcilers observing the same exit execute the
 verifier only once. Frozen-file drift still refuses verification. Worker exit codes do not bypass
 the verifier: exit 0 and nonzero exits receive the same frozen acceptance check.
@@ -349,9 +351,9 @@ gates, leases for multi-host stores, and richer evaluation data. See the roadmap
 
 ## 会话与项目主控 (sessions and project control)
 
-M8a adds project-side infrastructure only. Existing task owners, `--as`, dispatch,
-takeover, verification, approval and delivery permissions retain their existing meaning.
-Registering a project does not migrate tasks whose spec happens to use the same project string.
+M8b connects opt-in tasks to the stable project controller role. Registering a project
+alone does not migrate tasks whose spec happens to use the same project string.
+Legacy tasks without `owner_ref` retain their string-owner permissions.
 
 ### Session identity and trust boundary
 
@@ -365,14 +367,20 @@ Identity inspection starts at the CLI's parent, skipping Yardgoat's own interpre
 The first matching agent is the caller, including nested agent invocations. Inspection
 continues up to PID 1 to reject station ancestors, without substituting an outer agent.
 PID 1 is the root boundary and only its stat is required. An unreadable, vanished,
-cyclic, reparented or ambiguous chain returns unknown and a reason, never a guessed
-identity. Each ancestor's real UID comes from `/proc/<pid>/status` and is compared
+cyclic or ambiguous chain returns unknown and a reason, never a guessed identity.
+Reparenting normally fails closed; the bounded foreign-ancestor exception below
+re-inspects the complete current chain. Each ancestor's real UID comes from `/proc/<pid>/status` and is compared
 with the caller's `getuid()`. Other users' processes cannot be this user's agents
-or stations: only their public stat/status are read, skipping environ, cmdline and
+or stations: only their stat/status are read when accessible, skipping environ, cmdline and
 exe while continuing through their parents. Same-user ancestors above them are
 still inspected for station markers. An unreadable same-user process or unreadable
-UID evidence remains unknown with the read error. Ancestry, UIDs and boot identity
-are checked again before returning.
+UID evidence remains unknown with the read error. `stat` and `status` are not always
+public: a `/proc` mount with `hidepid` can restrict them too. UID read errors mention
+this possibility. Ancestry, UIDs, start ticks and boot identity are checked again
+before returning. If an observed foreign ancestor disappears during revalidation,
+its absence carries no authority: walk the current ancestry again, at most once.
+The nearest agent identity must remain unchanged; UID/start-time changes and
+unreadable same-user evidence still return unknown.
 
 `sessions.agents` is an array of rules such as `{"name":"custom","exe":"custom-cli"}`.
 `exe` and `argv0` match exact basenames; `comm` matches an exact process name. Selectors
@@ -407,8 +415,12 @@ Administrator registration uses the target process's endpoint environment.
 time, and append-only registration provenance (operator, reason, identity evidence).
 Self-registration is idempotent; a supplied label can update the display label.
 `session register --pid` checks that exact live PID against agent rules and uses
-`project_admins` for administrator authorization. `whoami --json` returns `session_id`,
+`project_admins` for administrator authorization. **Administrator registration can
+only register processes belonging to the caller's same OS user**, including when
+the administrator is root; it cannot inventory another user's agent as itself. `whoami --json` returns `session_id`,
 identity evidence, endpoint, registration state, label and controlled project IDs.
+`project_task_counts` maps those IDs to unfinished task counts; `unfinished_tasks`
+is their total (verified, archived and exhausted tasks are excluded).
 Unknown identification exits 3. `--session` is an assertion against mechanical
 identity, never impersonation; conflicts also exit 3. It may precede the command or
 follow a session/project leaf command. On `project assign`, the leaf `--session`
@@ -474,9 +486,9 @@ reprinted: the old controller can abort without it and begin again, or an admin 
 assign if that controller also exited. This deliberate recovery path avoids storing
 plaintext/recoverable tokens. The store does not provide distributed leases.
 
-### Locks and library interface for M8b
+### Locks and library interface
 
-Total lock order, when a future operation needs multiple domains, is:
+Total lock order when an operation needs multiple domains is:
 **delivery mutex → schedule → pool → project → task** (parent task before review
 child). Multiple project locks must be acquired by sorted project ID. Session
 registration and reconcile-health locks are standalone and never nest into this
@@ -489,11 +501,65 @@ model call or network request runs while a project lock is held.
 or raises `sessions.Refused` with the missing-project/identity/registration/control/
 transfer reason. `projects.recheck(project_id, session_id, epoch)` rejects stale
 epochs, including A→B→A. Both wrappers hold a short project lock and are point-in-time
-checks, not durable grants. At a task commit, M8b must acquire the project lock **before**
+checks, not durable grants. At a task commit, control operations acquire the project lock **before**
 the task lock and keep it through the task write, using `projects.locked(id)` plus
 `authorize_control_locked(state, caller)` / `recheck_locked(state, sid, epoch)`.
 Do not reacquire the same flock through a wrapper while already holding it. These
-helpers are not connected to task commands in M8a.
+helpers are used by `control.operation` / `control.locked`. A context-local ticket
+retains the original session/epoch across nested manual steps. A distinct internal
+system context authorizes the reconciler; an `--as reconciler` label grants nothing.
+Verification has its own per-task mutex before project/task locks. The frozen
+verifier runs outside both locks; the verdict commit reacquires them, checks the
+original ticket and the same exited run, and refuses stale results.
+
+### Project-owned tasks and operation permissions
+
+A new spec opts in with `"owner": {"project": "example"}`. `submit --project-owned`
+uses the spec's `project` value for that object. The project must exist and the
+mechanically identified, registered caller must be its current controller.
+Submission freezes the spec normally, stores `owner_ref = {"project": id}` in task
+state, and stores the controller's submission-time label in the existing `owner`
+string. That string is display/compatibility data only for project cards.
+
+`project bind TASK --project ID --as LEGACY_OWNER` requires both the exact current
+string owner and a caller session controlling ID. It binds one previously unbound
+card and records `task.project_bound`; it never rewrites the accepted spec,
+content hash or frozen materials. A project handoff updates only project state;
+it never scans or edits individual cards. Generated review children and follow-ups
+inherit the parent's state `owner_ref`, including from bound legacy parents.
+`takeover` always refuses a project-owned card with exit 3 and directs the caller
+to project handoff/transfer.
+
+| Operation on a project card | Authority |
+|---|---|
+| submit / bind | Current project controller; bind also requires the legacy owner string |
+| dispatch, manual close, park, archive, deliver, confirm-review-channel, cancel | Current registered controller session; unknown is refused, with no `--as` fallback |
+| Automatic verification, answered-task resume, review/repair/retry, delivery continuation and recovery | Internal `reconciler` executor, independent of controller liveness |
+| Station claim / finish | Existing station/mailbox identity |
+| answer | Existing answer rules; need not be the owner |
+| approve | Existing approver list and frozen-content rules |
+
+All policy refusals exit 3. Manual control events include `actor_session` and
+`epoch`. Reconciliation events use `actor: reconciler` and
+`on_behalf_of: {project, epoch}`, never an invented active session identity.
+When replaying a prior session's delivery result, `execution_control` retains the
+original grant's session/epoch as provenance.
+A control entry point captures its ticket before waiting; task commits and delivery
+pipe grants recheck the original epoch. A→B→A therefore cannot revive an old call.
+
+Handoff does not revoke an already accepted queued/running execution or a delivery
+step that received its pipe grant. Stations can finish after any handoff. A running
+delivery step commits its outcome using its original audit data, but the next step
+needs another check of the original ticket; a stale manual controller stops with
+exit 3. The new controller can `deliver` to resume, skipping persisted successes.
+System continuation uses the same ordinary approval, dependency, review and drift
+gates without impersonating a controller. A pending transfer blocks new manual
+control; it does not stop these previously authorized system actions.
+
+`status` and `inbox` expose `owner_ref`, the role project, current controller label,
+session, epoch and liveness, and `transferring`. These projections are read-only;
+`owner` remains its original display string. `report --by project` groups project
+cards by `owner_ref.project`, falling back to the legacy spec project otherwise.
 
 ### Reconcile health
 
@@ -721,14 +787,34 @@ destination or transport. Validate every route before sending any: each requires
 list, an optional list of status strings (`on`), an optional nonempty string `name` (default `default`),
 and an optional string `recipient` template. Duplicate names, including duplicate defaults, invalidate
 the entire configuration and produce a warning. Empty lists disable notifications.
-The placeholders are `{task_id}`, `{status}`, `{owner}`, `{question}` (first 500 characters), and `{hint}`.
+The placeholders are `{task_id}`, `{status}`, `{owner}`, `{question}` (first 500 characters),
+`{hint}`, `{controller}`, `{controller_session}` and `{endpoint}`. The last three
+resolve to the current project controller's registered label, session ID and a compact
+JSON object `{"socket":"...","pane_id":"..."}`. For legacy cards all three are empty.
+A project route referencing any of these fields is skipped when the current controller
+is not confirmed alive or its registered endpoint is unverified/missing; it records
+no sent key, and a later reconcile retries. Routes without these placeholders still
+send to their configured human destination. The controller is resolved afresh for
+each send attempt, outside project locks; the selected snapshot defines that send's
+recipient. A handoff after the send starts cannot retract it; the next reconcile
+resolves the new controller. Never guess a terminal/window.
+Use `recipient: "{controller_session}"` to deliver the same pending question once
+to each new controller; a fixed human recipient does not resend just for handoff.
 Both command and recipient use these placeholders. Missing recipient is an empty string; formatting
 uses the current owner read under the notification lock. A literal recipient stays unchanged after
 takeover, while `{owner}` resolves to the new owner. The recipient is a deduplication identity, not an
 implicit argument or transport: the command must still address its own destination. Commands run without
 a shell, with closed stdin, captured output and a 30-second timeout. Errors only log to stderr, leaving
 other reconciliation actions and its single JSON output intact. Each route has independent status
-selection and retry: a command/formatting error or timeout does not prevent the remaining routes.
+selection and retry: a command error or timeout does not prevent the remaining routes. Unknown placeholders,
+malformed formatting and invalid format specs are configuration errors: disable just
+that route, emit one warning per unchanged invalid configuration, and expose
+`notify_errors` in JSON status and doctor reports, plus `notify_config` in non-pool doctor.
+Pool admission remains based only on launch checks; notification diagnostics do not
+prevent workers from starting. The route
+recovers automatically when its configuration is fixed; failed formatting is never
+retried as a delivery. Structural errors such as duplicate route names still reject
+the entire configuration.
 
 `$YARDGOAT_HOME/notified/<task_id>.json` retains its `sent` map. For a list, or a single object containing
 `recipient`, keys are `v2:` followed by a compact JSON array of `[name, status, question_hash, recipient]`.

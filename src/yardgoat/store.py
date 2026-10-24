@@ -92,7 +92,16 @@ class TaskDir:
         return read_json(self.path / "spec.json")
 
     def event(self, kind: str, actor: str, **data) -> dict:
-        ev = {"at": now(), "task_id": self.task_id, "kind": kind, "actor": actor, **data}
+        from . import control
+        audit = control.event_fields(self)
+        if audit.get("actor") == "reconciler":
+            # Receipt replay is a system action. Preserve the original grant as
+            # provenance, rather than impersonating the session that issued it.
+            origin = {k: data.pop(k) for k in ("actor_session", "epoch", "on_behalf_of") if k in data}
+            if origin and origin != {k: v for k, v in audit.items() if k != "actor"}:
+                data["execution_control"] = origin
+        ev = {"at": now(), "task_id": self.task_id, "kind": kind, "actor": actor,
+              **audit, **data}
         ev["dedupe_key"] = hashlib.sha256(json.dumps(ev, sort_keys=True).encode()).hexdigest()[:16]
         with open(self.path / "events.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")

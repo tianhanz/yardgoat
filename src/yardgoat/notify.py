@@ -7,11 +7,49 @@ import json
 import logging
 import shlex
 import subprocess
+from string import Formatter
+
+from . import projects, sessions
+from .statefile import locked_json
 
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 DEFAULT_ON = ("parked", "exhausted", "submit_unknown", "verify_error", "provider_refused")
 LOG = logging.getLogger(__name__)
+CONTROLLER_FIELDS = {"controller", "controller_session", "endpoint"}
+FIELDS = {"task_id", "status", "owner", "question", "hint"} | CONTROLLER_FIELDS
+
+
+def template_fields(template):
+    fields = set()
+    for _, field, format_spec, _ in Formatter().parse(template):
+        if field is not None:
+            if field not in FIELDS:
+                raise ValueError(f"unknown notification placeholder: {field!r}")
+            fields.add(field)
+            fields.update(template_fields(format_spec))
+    template.format_map(dict.fromkeys(FIELDS, ""))
+    return fields
+
+
+def controller_values(state):
+    values = dict.fromkeys(CONTROLLER_FIELDS, "")
+    project = (state.get("owner_ref") or {}).get("project")
+    if not project:
+        return values
+    ps = projects.show(project)
+    sid = ps["controller"]["session_id"]
+    rec = sessions.record(sid)
+    if not rec or sessions.liveness(rec) != "alive" or not rec.get("endpoint", {}).get("verified"):
+        return None
+    endpoint = rec["endpoint"]
+    if not endpoint.get("socket") or not endpoint.get("pane_id"):
+        return None
+    values.update(controller=rec["label"], controller_session=sid,
+                  endpoint=json.dumps({k: endpoint[k] for k in ("socket", "pane_id")},
+                                      ensure_ascii=False, separators=(",", ":")))
+    return values
+
 
 
 def _status(state, on):
@@ -37,7 +75,7 @@ def _hint(task_id, status, owner):
     return f"yardgoat status {task} --json"
 
 
-def _notify_one(task_id, command, on, *, name="default", recipient=None, legacy=True, errors=None):
+def _notify_one(task_id, command, on, *, name="default", recipient=None, legacy=True, errors=None, controller_route=False, config_error=None):
     directory = home() / "notified"
     directory.mkdir(parents=True, exist_ok=True)
     # A separate per-task lock serializes concurrent reconcilers without holding schedule/task locks
@@ -56,6 +94,13 @@ def _notify_one(task_id, command, on, *, name="default", recipient=None, legacy=
         owner = str(state.get("owner") or "")
         values = {"task_id": task_id, "status": status, "owner": owner, "question": question[:500],
                   "hint": _hint(task_id, status, owner)}
+        if controller_route:
+            current = controller_values(state)
+            if current is None:
+                return None  # no guessed endpoint and no sent key; try next reconcile
+            values.update(current)
+        else:
+            values.update(dict.fromkeys(CONTROLLER_FIELDS, ""))
         destination = recipient.format_map(values) if recipient is not None else ""
         # Preserve old single-object records byte for byte. JSON framing keeps route names
         # and destinations containing colons/braces from colliding in the new key space.
@@ -115,9 +160,38 @@ def _routes(settings):
             raise ValueError("notify.on must be a list of status strings")
         if "recipient" in item and not isinstance(item["recipient"], str):
             raise ValueError("notify.recipient must be a string template")
-        routes.append({"name": name, "command": command, "on": on, "recipient": item.get("recipient"),
+        fields, problem = set(), None
+        try:
+            for template in [*command, item.get("recipient", "")]:
+                fields.update(template_fields(template))
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            problem = str(exc)
+        routes.append({"controller_route": bool(fields & CONTROLLER_FIELDS), "config_error": problem,
+                       "name": name, "command": command, "on": on, "recipient": item.get("recipient"),
                        "legacy": single and "recipient" not in item})
     return routes
+
+
+def configuration_errors(cfg):
+    """Read-only diagnostics; fixed templates take effect without a reset command."""
+    if cfg.get("notify") is None:
+        return []
+    try:
+        return [{"route": r["name"], "error": r["config_error"], "disabled": True}
+                for r in _routes(cfg["notify"]) if r["config_error"]]
+    except ValueError as exc:
+        return [{"route": None, "error": str(exc), "disabled": True}]
+
+
+def record_config_errors(cfg, problems):
+    # One warning per unchanged invalid configuration, across CLI invocations.
+    signature = hashlib.sha256(json.dumps(cfg.get("notify"), sort_keys=True).encode()).hexdigest()
+    with locked_json(home() / "notify-config-errors.json") as box:
+        if box["state"] == {"signature": signature, "errors": problems}:
+            return
+        box["state"] = {"signature": signature, "errors": problems}
+        for problem in problems:
+            LOG.warning("notify %s configuration error (route disabled): %s", problem["route"], problem["error"])
 
 
 def notify_pending(cfg: dict, errors=None) -> list[dict]:
@@ -128,6 +202,12 @@ def notify_pending(cfg: dict, errors=None) -> list[dict]:
         if settings is None:
             return delivered
         routes = _routes(settings)
+        problems = configuration_errors(cfg)
+        if problems or (home() / "notify-config-errors.json").exists():
+            record_config_errors(cfg, problems)
+        if errors is not None:
+            errors.extend(f"notify {p['route']}: configuration error: {p['error']}" for p in problems)
+        routes = [r for r in routes if not r["config_error"]]
         for task_id in list_tasks():
             for route in routes:
                 try:

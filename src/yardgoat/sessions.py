@@ -43,9 +43,15 @@ class ProcFS:
         return parse_stat((self.root / str(pid) / "stat").read_text())
 
     def uid(self, pid):
-        # status is public even when another user's environ/exe is unreadable.
+        # stat/status are often readable across users, but hidepid can restrict both.
         # Compare real UIDs, matching os.getuid(), not proc directory ownership.
-        for line in (self.root / str(pid) / "status").read_text().splitlines():
+        try:
+            status = (self.root / str(pid) / "status").read_text()
+        except OSError as exc:
+            # Preserve the exception type: ENOENT may also mean a foreign ancestor
+            # exited between the walk and recheck, which permits one fresh walk.
+            raise type(exc)(f"cannot read uid for process {pid}: {exc}; /proc may be mounted with hidepid") from exc
+        for line in status.splitlines():
             if line.startswith("Uid:"):
                 values = [int(value) for value in line.split()[1:]]
                 if len(values) == 4 and all(value >= 0 for value in values):
@@ -161,7 +167,8 @@ def identify(cfg, *, pid=None, explicit=None, proc=None, env=None, lookup=None, 
 
     exact=True is for administrator inventory: the supplied PID itself must match.
     Only same-user processes can be agents or stations. Foreign ancestors need
-    public stat/status only; inaccessible same-user or changing ancestry fails closed.
+    stat/status only when readable; hidepid may restrict even these. Inaccessible
+    same-user or changing identity fails closed.
     """
     proc = proc or ProcFS()
     env = dict(os.environ if env is None else env)
@@ -178,36 +185,58 @@ def identify(cfg, *, pid=None, explicit=None, proc=None, env=None, lookup=None, 
         current = int(os.getppid() if pid is None else pid)
         if current <= 1:
             raise Refused("PID must identify a running agent, not the system root")
-        seen, chain, candidate, agent = set(), [], None, None
-        while current != 1:
-            if current <= 0 or current in seen or len(seen) >= 1024:
-                raise Refused("broken or cyclic parent process chain")
-            seen.add(current)
-            uid = proc.uid(current)
-            same_user = uid == caller_uid
-            process = proc.process(current) if same_user else proc.stat(current)
-            chain.append({**process, "uid": uid})
-            if process["state"] in ("Z", "X", "x"):
-                raise Refused(f"process {current} is not running")
-            if same_user and station_marker(process):
-                raise Refused(f"station process in ancestry: pid {current}")
-            if candidate is None:
-                agent = matches(process, agents) if same_user else None
-                if agent:
-                    candidate = process
-                elif exact:
-                    if not same_user:
-                        raise Refused(f"pid {current} belongs to a different user")
-                    raise Refused(f"pid {current} does not match an agent rule")
-            current = process["ppid"]
-        # Check that the chain did not disappear, reparent or reuse a PID as we walked.
-        proc.stat(1)
-        for process in chain:
-            # Scheduling state can change between R and S without changing identity.
-            fresh = proc.stat(process["pid"])
-            if (any(fresh[k] != process[k] for k in ("pid", "comm", "ppid", "start_ticks"))
-                    or fresh["state"] in ("Z", "X", "x") or proc.uid(process["pid"]) != process["uid"]):
-                raise Refused("parent process chain changed during inspection")
+        start = current
+        previous = None
+        for attempt in range(2):
+            current = start
+            seen, chain, candidate, agent = set(), [], None, None
+            while current != 1:
+                if current <= 0 or current in seen or len(seen) >= 1024:
+                    raise Refused("broken or cyclic parent process chain")
+                seen.add(current)
+                uid = proc.uid(current)
+                same_user = uid == caller_uid
+                process = proc.process(current) if same_user else proc.stat(current)
+                chain.append({**process, "uid": uid})
+                if process["state"] in ("Z", "X", "x"):
+                    raise Refused(f"process {current} is not running")
+                if same_user and station_marker(process):
+                    raise Refused(f"station process in ancestry: pid {current}")
+                if candidate is None:
+                    agent = matches(process, agents) if same_user else None
+                    if agent:
+                        candidate = process
+                    elif exact:
+                        if not same_user:
+                            raise Refused(f"pid {current} belongs to a different user")
+                        raise Refused(f"pid {current} does not match an agent rule")
+                current = process["ppid"]
+            proc.stat(1)
+            # Check foreign entries first. A same-user child may already have
+            # reparented when its foreign parent vanishes; inspect the new chain
+            # once rather than rejecting evidence that carried no authority.
+            vanished = False
+            for process in sorted(chain, key=lambda row: row["uid"] == caller_uid):
+                try:
+                    fresh = proc.stat(process["pid"])
+                    fresh_uid = proc.uid(process["pid"])
+                except FileNotFoundError:
+                    if process["uid"] != caller_uid and attempt == 0:
+                        vanished = True
+                        continue
+                    raise
+                if (any(fresh[k] != process[k] for k in ("pid", "comm", "start_ticks"))
+                        or fresh["state"] in ("Z", "X", "x") or fresh_uid != process["uid"]):
+                    raise Refused("parent process chain changed during inspection")
+                if not vanished and fresh["ppid"] != process["ppid"]:
+                    raise Refused("parent process chain changed during inspection")
+            if previous is not None:
+                # A retry cannot substitute another nearest agent or reused PID.
+                if candidate is None or any(candidate[k] != previous[k] for k in ("pid", "comm", "start_ticks")):
+                    raise Refused("agent changed during inspection")
+            if not vanished:
+                break
+            previous = candidate
         if proc.boot_id() != boot:
             raise Refused("boot changed during inspection")
         if candidate is None:

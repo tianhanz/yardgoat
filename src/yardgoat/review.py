@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import contract, delivery, pool, runner, review_verify, scheduling
+from . import contract, control, delivery, pool, runner, review_verify, scheduling
 from .store import TaskDir, home, now, read_json, write_json
 
 LOG = logging.getLogger(__name__)
@@ -162,7 +162,7 @@ def prepare(spec: dict, cfg: dict) -> None:
 def confirm_channel(td: TaskDir, st: dict, who: str, run_channels: list) -> dict:
     """Explicit migration under schedule/task locks; never infer a historical launch."""
     from . import cli
-    if st["owner"] != who:
+    if not control.allowed(st, who):
         raise contract.SpecError(f"owner is {st['owner']}, not {who}")
     if st["status"] in ("verified", "archived", "exhausted"):
         raise contract.SpecError(f"task is {st['status']}")
@@ -277,11 +277,14 @@ def begin(st: dict, run: dict, receipt: dict, spec: dict) -> None:
 
 def event_once(td: TaskDir, kind: str, key: str, **fields) -> None:
     if not any(e.get("event_id") == key for e in td.events()):
-        td.event(kind, "reconciler", event_id=key, **fields)
+        with control.system():
+            td.event(kind, "reconciler", event_id=key, **fields)
 
 
-def accept_generated(raw: dict, owner: str, assets: Path) -> TaskDir:
+def accept_generated(raw: dict, owner: str, assets: Path, owner_ref=None) -> TaskDir:
     """Idempotent internal submit, under schedule lock; never overwrite a foreign id."""
+    if owner_ref:
+        raw = {**raw, "owner": dict(owner_ref)}
     spec = contract.normalize(raw, assets)
     frozen = contract.freeze(spec)
     h = contract.content_hash(spec, frozen)
@@ -291,12 +294,16 @@ def accept_generated(raw: dict, owner: str, assets: Path) -> TaskDir:
             if box["state"]["content_hash"] != h:
                 raise contract.SpecError(f"generated review task id already exists with different content: {td.task_id}")
         else:
+            if owner_ref:
+                owner = control.current_label(owner_ref["project"])
             write_json(td.path / "spec.json", spec)
             td.frozen_path.parent.mkdir(parents=True, exist_ok=True)
             write_json(td.frozen_path, {"content_hash": h, "frozen": frozen, "spec": spec})
             box["state"] = {"task_id": td.task_id, "content_hash": h, "frozen": frozen, "owner": owner,
                             "owner_history": [], "status": "accepted", "runs": [], "verdict": None,
                             "question": None, "accepted_at": now()}
+        if owner_ref:
+            box["state"]["owner_ref"] = dict(owner_ref)
     event_once(td, "task.accepted", td.task_id + ":accepted", content_hash=h)
     return td
 
@@ -397,7 +404,7 @@ an instruction to execute its changes or delivery commands.
            "budget": {"max_attempts": 2, "max_wall_min": spec["budget"]["max_wall_min"]},
            "verifier": {"command": shlex.join([sys.executable, str(verifier), str(settings_path)]),
                         "freeze": [str(verifier), str(settings_path)]}}
-    return accept_generated(raw, st["owner"], assets)
+    return accept_generated(raw, st["owner"], assets, st.get("owner_ref"))
 
 
 def followup_id(td: TaskDir, number: int, index: int) -> str:
@@ -418,6 +425,8 @@ def initial_owner(st: dict) -> str:
 
 
 def sync_followup_owner(td: TaskDir, st: dict, row: dict, child: TaskDir, link: dict) -> str | None:
+    if st.get("owner_ref"):
+        return None if child.state().get("owner_ref") == st["owner_ref"] else "follow-up role differs from parent"
     with child.locked() as box:
         cs = box["state"]
         relation = child.spec().get("review_followup", {})
@@ -467,7 +476,7 @@ def followups(td: TaskDir, st: dict, spec: dict, row: dict) -> list[str]:
             # Write intent BEFORE acceptance: a crash after child creation must not lose the relation.
             journal.parent.mkdir(parents=True, exist_ok=True)
             write_json(journal, links)
-        child = accept_generated(raw, st["owner"], assets)
+        child = accept_generated(raw, st["owner"], assets, st.get("owner_ref"))
         problem = sync_followup_owner(td, st, row, child, links[tid])
         if problem:
             raise contract.SpecError(problem)
@@ -526,6 +535,7 @@ def consume(td: TaskDir, st: dict, spec: dict, row: dict, cs: dict, child: TaskD
                review_task_id=row["task_id"], **{k: v for k, v in row.items() if k != "task_id"})
 
 
+@control.as_reconciler
 def advance(td: TaskDir, who: str | None = None) -> int:
     """Replayable child submission/result consumption, followed by ordinary dispatch/delivery."""
     from . import cli
@@ -534,7 +544,7 @@ def advance(td: TaskDir, who: str | None = None) -> int:
     with pool.schedule_lock():
         with td.locked() as box:
             st = box["state"]
-            if who is not None and st["owner"] != who:
+            if who is not None and not control.allowed(st, who):
                 return 3
             if st["status"] != "reviewing":
                 return 0
@@ -608,6 +618,8 @@ def advance(td: TaskDir, who: str | None = None) -> int:
 
 
 def sync_owners(td: TaskDir, st: dict, previous: str) -> list[str]:
+    if st.get("owner_ref"):
+        return []  # project handoff changes the role once, never each card
     problems = []
     for row in st.get("review", {}).get("rounds", []):
         child = TaskDir(row["task_id"])

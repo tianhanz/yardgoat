@@ -474,6 +474,7 @@ def mixed_uid_proc(tmp_path, monkeypatch):
     denied.chmod(0)
     reads = []
     read_bytes = Path.read_bytes
+    readlink = os.readlink
 
     def inspect(path):
         reads.append(path)
@@ -482,7 +483,12 @@ def mixed_uid_proc(tmp_path, monkeypatch):
             raise PermissionError(13, "Permission denied", str(path))
         return read_bytes(path)
 
+    def inspect_link(path, *args, **kwargs):
+        reads.append(Path(path))
+        return readlink(path, *args, **kwargs)
+
     monkeypatch.setattr(Path, "read_bytes", inspect)
+    monkeypatch.setattr(os, "readlink", inspect_link)
     cfg = {"sessions": {"agents": [{"name": "fixture", "exe": "fake"}]}}
     return SimpleNamespace(root=root, proc=sessions.ProcFS(root), cfg=cfg, reads=reads)
 
@@ -495,7 +501,8 @@ def test_foreign_unreadable_ancestor_keeps_nearest_agent(mixed_uid_proc):
     assert result["identity"]["pid"] == 12
     assert result["session_id"] == sessions.session_id(
         {"boot_id": "fixture-boot", "pid": 12, "start_ticks": "120"})
-    assert not any(path.parent == fixture.root / "10" for path in fixture.reads)
+    for private in ("cmdline", "environ", "exe"):
+        assert fixture.root / "10" / private not in fixture.reads
     assert fixture.root / "11/environ" in fixture.reads
 
 
@@ -510,7 +517,8 @@ def test_foreign_ancestor_does_not_hide_same_user_station(mixed_uid_proc, marker
     result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc, env={})
     assert result["status"] == "unknown" and result["session_id"] is None
     assert "station" in result["reason"] and "11" in result["reason"]
-    assert not any(path.parent == fixture.root / "10" for path in fixture.reads)
+    for private in ("cmdline", "environ", "exe"):
+        assert fixture.root / "10" / private not in fixture.reads
 
 
 def test_same_user_unreadable_ancestor_is_unknown(mixed_uid_proc):
@@ -546,7 +554,8 @@ def test_foreign_agent_is_skipped_and_exact_pid_is_refused(mixed_uid_proc):
     result = sessions.identify(fixture.cfg, pid=10, proc=fixture.proc, env={}, exact=True)
     assert result["status"] == "unknown" and result["session_id"] is None
     assert "10" in result["reason"]
-    assert not any(path.parent == fixture.root / "10" for path in fixture.reads)
+    for private in ("cmdline", "environ", "exe"):
+        assert fixture.root / "10" / private not in fixture.reads
 
 
 def test_proc_ambiguity_station_ancestor_and_no_outer_fallback():
@@ -784,3 +793,92 @@ def test_hidden_proc_pid_is_unknown_not_dead(monkeypatch):
         raise ProcessLookupError("no such process")
     monkeypatch.setattr(sessions.os, "kill", absent)
     assert sessions.liveness(rec, proc) == "dead"
+
+
+@pytest.mark.parametrize("missing", ["stat", "uid"])
+def test_foreign_ancestor_vanishing_during_recheck_rewalks_once(mixed_uid_proc, monkeypatch, missing):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    original = getattr(fixture.proc, missing)
+    count = 0
+    def disappear(pid):
+        nonlocal count
+        if pid == 10:
+            count += 1
+            if count == 2:
+                shutil.rmtree(fixture.root / "10")
+                path = fixture.root / "12/stat"
+                path.write_text(path.read_text().replace(") S 10 ", ") S 11 "))
+        return original(pid)
+    monkeypatch.setattr(fixture.proc, missing, disappear)
+    result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc, env={})
+    assert result["status"] == "identified" and result["identity"]["pid"] == 12, result
+    for private in ("cmdline", "environ", "exe"):
+        assert fixture.root / "10" / private not in fixture.reads
+
+
+def test_uid_change_during_recheck_fails_closed(mixed_uid_proc, monkeypatch):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    original = fixture.proc.uid
+    calls = {}
+    def changed(pid):
+        calls[pid] = calls.get(pid, 0) + 1
+        value = original(pid)
+        return value + 1 if pid == 12 and calls[pid] == 2 else value
+    monkeypatch.setattr(fixture.proc, "uid", changed)
+    result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc, env={})
+    assert result["session_id"] is None and "changed during inspection" in result["reason"]
+
+
+def test_start_ticks_only_change_during_recheck_fails_closed(mixed_uid_proc, monkeypatch):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    original = fixture.proc.stat
+    calls = {}
+    def changed(pid):
+        calls[pid] = calls.get(pid, 0) + 1
+        value = original(pid)
+        # process() reads stat twice; the third read is chain revalidation.
+        if pid == 12 and calls[pid] == 3:
+            value["start_ticks"] = "999"
+        return value
+    monkeypatch.setattr(fixture.proc, "stat", changed)
+    result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc, env={})
+    assert result["session_id"] is None and "changed during inspection" in result["reason"]
+
+
+def test_unreadable_uid_mentions_hidepid(mixed_uid_proc, monkeypatch):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    original = Path.read_text
+    def denied(path, *args, **kwargs):
+        if path == fixture.root / "10/status":
+            raise PermissionError("fixture access denied")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", denied)
+    result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc, env={})
+    assert result["session_id"] is None and "hidepid" in result["reason"]
+
+
+def test_foreign_ancestor_retry_is_bounded(mixed_uid_proc, monkeypatch):
+    from yardgoat import sessions
+    fixture = mixed_uid_proc
+    (fixture.root / "14").mkdir()
+    for name in ("stat", "status"):
+        text = (fixture.root / "10" / name).read_text()
+        (fixture.root / "14" / name).write_text(text.replace("10 (", "14 ("))
+    original = fixture.proc.stat
+    counts = {10: 0, 14: 0}
+    def disappearing(pid):
+        if pid in counts:
+            counts[pid] += 1
+            if counts[pid] == 2:
+                shutil.rmtree(fixture.root / str(pid))
+                if pid == 10:
+                    path = fixture.root / "12/stat"
+                    path.write_text(path.read_text().replace(") S 10 ", ") S 14 "))
+        return original(pid)
+    monkeypatch.setattr(fixture.proc, "stat", disappearing)
+    result = sessions.identify(fixture.cfg, pid=13, proc=fixture.proc, env={})
+    assert result["session_id"] is None and counts == {10: 2, 14: 2}

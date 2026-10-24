@@ -34,7 +34,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import adapters, contract, control_cli, delivery, doctor, health, notify, pool, report, review, runner, scheduling
+from . import adapters, contract, control, control_cli, delivery, doctor, health, notify, pool, report, review, runner, scheduling, sessions
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 REFUSED = 3
@@ -53,38 +53,49 @@ def adapter_kind(spec: dict) -> str:
 def cmd_submit(a) -> int:
     try:
         spec = contract.load_spec_file(a.spec)
-        review.prepare(spec, runner.config())
-        frozen = contract.freeze(spec)
+        if getattr(a, "project_owned", False):
+            spec["owner"] = {"project": spec["project"]}
+        project = (spec.get("owner") or {}).get("project")
+        with control.operation(project):
+            review.prepare(spec, runner.config())
+            frozen = contract.freeze(spec)
+            return accept_submission(a, spec, frozen, project)
+    except sessions.Refused as exc:
+        return refuse(str(exc))
     except (contract.SpecError, OSError, ValueError, RuntimeError) as e:
         print(f"spec error: {e}", file=sys.stderr)
         return 2
+
+
+def accept_submission(a, spec, frozen, project):
     h = contract.content_hash(spec, frozen)
     td = TaskDir(spec["task_id"])
-    with pool.schedule_lock(), td.locked() as box:
+    with pool.schedule_lock(), control.locked(td, project) as box:
         if box["state"] is not None:
             old_hash = box["state"]["content_hash"]
-            # Pre-M1 specs omitted metadata defaults. Compare the original input shape only;
-            # explicit scope/risk (even default values) remain content changes. Never rewrite frozen data.
-            legacy_hash = contract.content_hash(contract.load_spec_file(a.spec, metadata_defaults=False), frozen)
+            legacy = contract.load_spec_file(a.spec, metadata_defaults=False)
+            if getattr(a, "project_owned", False):
+                legacy["owner"] = spec["owner"]
+            legacy_hash = contract.content_hash(legacy, frozen)
             if old_hash in (h, legacy_hash):
                 print(json.dumps({"task_id": td.task_id, "result": "already-accepted", "status": box["state"]["status"]}))
                 return 0
             return refuse(f"{td.task_id} already exists with different content (task ids are immutable)")
-        try:
-            if "review_of" in spec or "review_followup" in spec:
-                raise contract.SpecError("review_of and review_followup are reserved for generated review tasks")
-            scheduling.validate_dependencies(spec)
-        except contract.SpecError as e:
-            print(f"spec error: {e}", file=sys.stderr)
-            return 2
+        if "review_of" in spec or "review_followup" in spec:
+            raise contract.SpecError("review_of and review_followup are reserved for generated review tasks")
+        scheduling.validate_dependencies(spec)
+        owner = control.owner_label(project) if project else a.as_
         write_json(td.path / "spec.json", spec)
-        (home() / "frozen").mkdir(parents=True, exist_ok=True)   # authoritative copy, outside what stations may write
+        (home() / "frozen").mkdir(parents=True, exist_ok=True)
         write_json(home() / "frozen" / f"{td.task_id}.json", {"content_hash": h, "frozen": frozen, "spec": spec})
-        box["state"] = {"task_id": td.task_id, "content_hash": h, "frozen": frozen, "owner": a.as_,
-                        "owner_history": [], "status": "accepted", "runs": [], "verdict": None,
-                        "question": None, "accepted_at": now()}
-    td.event("task.accepted", a.as_, content_hash=h)
-    print(json.dumps({"task_id": td.task_id, "result": "accepted", "owner": a.as_}))
+        st = {"task_id": td.task_id, "content_hash": h, "frozen": frozen, "owner": owner,
+              "owner_history": [], "status": "accepted", "runs": [], "verdict": None,
+              "question": None, "accepted_at": now()}
+        if project:
+            st["owner_ref"] = {"project": project}
+        box["state"] = st
+        td.event("task.accepted", a.as_, content_hash=h, **control.audit(st))
+    print(json.dumps({"task_id": td.task_id, "result": "accepted", "owner": owner}))
     return 0
 
 
@@ -215,18 +226,24 @@ def lane_problem(spec: dict, cfg: dict) -> str | None:
     return None
 
 
+@control.guard()
 def do_dispatch(td: TaskDir, who: str, actor_note: str = "", echo: bool = True) -> int:
     """Accept a new attempt as a queued run; start it at once if capacity allows (all under the schedule lock)."""
     with pool.schedule_lock():
         return do_dispatch_locked(td, who, actor_note, echo)
 
 
+@control.guard()
 def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -> int:
     cfg = runner.config()
+    who = control.actor(td.state(), who)
+    with control.locked(td):
+        pass  # fence before granting outcome recovery as well as the new attempt
     if True:  # (kept the block shape of the pre-lock version; the schedule lock is held by the caller)
         last = (td.state()["runs"] or [None])[-1]
         if last and _receipt_waiting(td, last):      # a writer died between receipt and state: finish its commit
-            runner.record_outcome(td, last["run_id"], replay=True)
+            with control.system():
+                runner.record_outcome(td, last["run_id"], replay=True)
         elif last and last["state"] == "running" and not _alive(last):
             spec = td.spec()
             if adapter_kind(spec) == "pool":
@@ -235,10 +252,11 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
             else:
                 outcome = adapters.get(adapter_kind(spec), cfg).poll(td, last, spec, cfg)
             if outcome:
-                runner.record_outcome(td, last["run_id"], outcome)
-        with td.locked() as box:
+                with control.system():
+                    runner.record_outcome(td, last["run_id"], outcome)
+        with control.locked(td) as box:
             st = box["state"]
-            if st["owner"] != who:
+            if not control.allowed(st, who):
                 return refuse(f"owner is {st['owner']}, not {who}")
             if st["status"] in ("verified", "exhausted", "archived"):
                 return refuse(f"task is {st['status']}")
@@ -472,6 +490,7 @@ def _status_obj(td: TaskDir) -> dict:
     if backoff:
         backoff = {**backoff, "pool": name}
     return {"task_id": td.task_id, "status": st["status"], "owner": st["owner"], "owner_history": st["owner_history"],
+            **control.view(st), "notify_errors": notify.configuration_errors(cfg),
             "approval": st.get("approval"), "approval_required": bool(needs_approval),
             "review": st.get("review"),
             "review_reservation": st.get("review_reservation") if st["status"] not in ("verified", "archived") else None,
@@ -505,12 +524,15 @@ def cmd_status(a) -> int:
         rows = out + unlisted_pools
         for row in rows:
             row["reconcile_health"] = health.read()
+            row["notify_errors"] = notify.configuration_errors(runner.config())
         if not rows:
-            rows = [{"reconcile_health": health.read()}]
+            rows = [{"reconcile_health": health.read(), "notify_errors": notify.configuration_errors(runner.config())}]
         print(json.dumps(rows if not a.task_id else rows[0], ensure_ascii=False, indent=1))
         return 0
     for o in out:
         print(f"{o['task_id']}: {o['status']}  owner={o['owner']}  verdict={(o['verdict'] or {}).get('verdict')}")
+        if o.get("owner_ref"):
+            print(control.describe(o))
         if o["approval_required"]:
             print("  等审批：需要 approve")
         if o["delivery_reason"]:
@@ -540,10 +562,14 @@ def cmd_takeover(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
         return refuse(f"unknown task {a.task_id}")
+    if control.project_of(td.state()):
+        return refuse("project-owned task: use project handoff/transfer")
     if td.spec().get("review_of"):
         return refuse(f"take over the review parent {td.spec()['review_of']['task_id']} instead")
     with pool.schedule_lock(), td.locked() as box:
         st = box["state"]
+        if control.project_of(st):
+            return refuse("project-owned task: use project handoff/transfer")
         if st["owner"] != a.from_:
             return refuse(f"current owner is {st['owner']}, not {a.from_}")
         st["owner_history"].append({"from": a.from_, "to": a.as_, "at": now(),
@@ -565,9 +591,12 @@ def cmd_close(a) -> int:
     return rc
 
 
+@control.guard(close=True)
 def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -> tuple[int, str | None]:
-    result = _do_close(td, who, actor_note, echo)
-    if td.spec().get("review_of") and td.state()["owner"] == who and result[1] != "PASS":
+    who = control.actor(td.state(), who)
+    with control.verification_lock(td):
+        result = _do_close(td, who, actor_note, echo)
+    if td.spec().get("review_of") and control.allowed(td.state(), who) and result[1] != "PASS":
         review.advance(TaskDir(td.spec()["review_of"]["task_id"]))
     return result
 
@@ -576,15 +605,17 @@ def _do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -
     # Repeated close can recover an interrupted child submit without rerunning verification.
     before = td.state()
     if before["status"] == "reviewing":
-        if before["owner"] != who:
+        if not control.allowed(before, who):
             return refuse(f"owner is {before['owner']}, not {who}"), None
+        with control.locked(td):
+            pass  # authorize this continuation before switching to the system executor
         rc = review.advance(td, who)
         if echo:
             print(json.dumps({"task_id": td.task_id, "status": td.state()["status"], "verdict": "PASS"}))
         return rc, "PASS"
-    with td.locked() as box:
+    with control.locked(td) as box:
         st = box["state"]
-        if st["owner"] != who:
+        if not control.allowed(st, who):
             return refuse(f"owner is {st['owner']}, not {who}"), None
         if st["status"] == "verified" and td.spec().get("on_pass"):
             # Verification is already durable. Retrying failed delivery is explicit via deliver.
@@ -604,35 +635,47 @@ def _do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -
             return refuse(f"frozen files changed since submit: {d}"), None
         spec = td.spec()
         rd = td.run_dir(last["run_id"])
-        env = {**os.environ, "YARDGOAT_TASK_ID": td.task_id, "YARDGOAT_RUN_DIR": str(rd)}
+        verifying_run = last["run_id"]
+    # The verifier is external work. Handoff stays available while it runs;
+    # commit below rechecks the original session and epoch, including ABA.
+    env = {**os.environ, "YARDGOAT_TASK_ID": td.task_id, "YARDGOAT_RUN_DIR": str(rd)}
+    try:
+        p = subprocess.run(spec["verifier"]["command"], shell=True, cwd=spec["verifier"]["cwd"],
+                           capture_output=True, text=True, timeout=1800, env=env)
+        rc = p.returncode
+        (rd / "verify.out").write_text(p.stdout + ("\n--- stderr ---\n" + p.stderr if p.stderr else ""))
+    except subprocess.TimeoutExpired as exc:
+        rc = 124
+        # TimeoutExpired may carry bytes even when subprocess.run uses text=True.
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
+        output = stdout + ("\n--- stderr ---\n" + stderr if stderr else "")
+        reason = f"Verifier timed out after {exc.timeout} seconds and was terminated."
+        if not output.strip():
+            reason += " No output was received."
+        (rd / "verify.out").write_text(reason + "\n" + output, encoding="utf-8")
+    except OSError as exc:
+        rc = 127
+        (rd / "verify.out").write_text(f"Verifier could not start: {exc}\n")
+    verdict = {0: "PASS", 1: "FAIL"}.get(rc, "ERROR")
+    review_findings = None
+    if verdict == "PASS" and spec.get("review_of"):
         try:
-            p = subprocess.run(spec["verifier"]["command"], shell=True, cwd=spec["verifier"]["cwd"],
-                               capture_output=True, text=True, timeout=1800, env=env)
-            rc = p.returncode
-            (rd / "verify.out").write_text(p.stdout + ("\n--- stderr ---\n" + p.stderr if p.stderr else ""))
-        except subprocess.TimeoutExpired as exc:
-            rc = 124
-            # TimeoutExpired may carry bytes even when subprocess.run uses text=True.
-            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
-            stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
-            output = stdout + ("\n--- stderr ---\n" + stderr if stderr else "")
-            reason = f"Verifier timed out after {exc.timeout} seconds and was terminated."
-            if not output.strip():
-                reason += " No output was received."
-            (rd / "verify.out").write_text(reason + "\n" + output, encoding="utf-8")
-        except OSError as exc:
-            rc = 127
-            (rd / "verify.out").write_text(f"Verifier could not start: {exc}\n")
-        verdict = {0: "PASS", 1: "FAIL"}.get(rc, "ERROR")
-        review_findings = None
-        if verdict == "PASS" and spec.get("review_of"):
-            try:
-                review_findings = json.loads(p.stdout)["findings"]
-                if not isinstance(review_findings, list):
-                    raise ValueError("review verifier did not return an array")
-            except (ValueError, KeyError, TypeError):
-                verdict, rc = "ERROR", 2
-        checked = now()
+            review_findings = json.loads(p.stdout)["findings"]
+            if not isinstance(review_findings, list):
+                raise ValueError("review verifier did not return an array")
+        except (ValueError, KeyError, TypeError):
+            verdict, rc = "ERROR", 2
+    checked = now()
+    with control.locked(td) as box:
+        st = box["state"]
+        last = st["runs"][-1] if st["runs"] else None
+        if (not control.allowed(st, who) or st["status"] in ("archived", "verified")
+                or not last or last["run_id"] != verifying_run or last["state"] not in ("exited", "verify_error")):
+            return refuse("task or owner changed during verification"), None
+        changed = checked_drift(td, st)
+        if changed:
+            return refuse(f"frozen files changed during verification: {changed}"), None
         rec_p = rd / "receipt.json"
         rec = json.loads(rec_p.read_text())
         rec["verifier"] = {"command": spec["verifier"]["command"], "exit_code": rc, "result": verdict,
@@ -672,12 +715,14 @@ def _do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -
     return (delivery_rc if verdict == "PASS" else (1 if verdict == "FAIL" else 2)), verdict
 
 
+@control.guard()
 def do_deliver(td: TaskDir, who: str, echo: bool = False, assume_stopped: bool = False) -> int:
     # Delivery contenders wait outside schedule/task locks. Only the reservation needs
     # schedule → task; the long shell command holds neither, so unrelated work can start.
+    who = control.actor(td.state(), who)
     with delivery.locked(td):
         current = td.state()
-        if current["owner"] != who:
+        if not control.allowed(current, who):
             return refuse(f"owner is {current['owner']}, not {who}")
         if current["status"] == "archived":
             # Old archives can contain orphan reservations. This path only cleans
@@ -701,9 +746,9 @@ def do_deliver(td: TaskDir, who: str, echo: bool = False, assume_stopped: bool =
                         print(json.dumps({"task_id": td.task_id, "result": "delivery_failed",
                                           **delivery.view(td, td.state(), spec)}, ensure_ascii=False))
                     return refuse(reason)
-        with pool.schedule_lock(), td.locked() as box:
+        with pool.schedule_lock(), control.locked(td) as box:
             st = box["state"]
-            if st["owner"] != who:
+            if not control.allowed(st, who):
                 return refuse(f"owner is {st['owner']}, not {who}")
             if st["status"] != "verified" or (st.get("verdict") or {}).get("verdict") != "PASS":
                 return refuse("deliver requires a verified task with a PASS verdict")
@@ -730,6 +775,8 @@ def do_deliver(td: TaskDir, who: str, echo: bool = False, assume_stopped: bool =
                 delivery.reserve_locked(st, spec, who)
         try:
             rc = delivery.run_locked(td, st, spec, who, cfg, assume_stopped=assume_stopped)
+        except sessions.Refused as exc:
+            return refuse(str(exc))
         except (contract.SpecError, ValueError, OSError) as exc:
             with td.locked() as box:
                 delivery.problem_locked(td, box["state"], str(exc))
@@ -747,13 +794,14 @@ def cmd_deliver(a) -> int:
         if td.exists else refuse(f"unknown task {a.task_id}")
 
 
+@control.guard(command=True)
 def cmd_park(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
         return refuse(f"unknown task {a.task_id}")
-    with td.locked() as box:
+    with control.locked(td) as box:
         st = box["state"]
-        if st["owner"] != a.as_:
+        if not control.allowed(st, a.as_):
             return refuse(f"owner is {st['owner']}, not {a.as_}")
         if st["status"] in ("archived", "verified", "exhausted", "parked", "answered", "reviewing"):
             return refuse(f"task is {st['status']}; it cannot be parked")
@@ -815,11 +863,12 @@ def cmd_answer(a) -> int:
     return 0
 
 
+@control.guard(command=True)
 def cmd_confirm_review_channel(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
         return refuse(f"unknown task {a.task_id}")
-    with pool.schedule_lock(), td.locked() as box:
+    with pool.schedule_lock(), control.locked(td) as box:
         try:
             record = review.confirm_channel(td, box["state"], a.as_, a.run_channel or [])
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
@@ -869,10 +918,15 @@ def cmd_inbox(a) -> int:
         message = doctor.failure_message(name, doctor.pool_report(name))
         if message:
             items.append({"pool": name, "task_id": None, "owner": None, "status": "doctor_failed", "question": message})
+    for item in items:
+        if item.get("task_id"):
+            item.update(control.view(TaskDir(item["task_id"]).state()))
     if a.json:
         print(json.dumps(items, ensure_ascii=False, indent=1))
     else:
         for i in items:
+            if i.get("owner_ref"):
+                print(control.describe(i))
             if "until" in i:
                 print(_backoff_text(i))
             else:
@@ -881,6 +935,7 @@ def cmd_inbox(a) -> int:
     return 0
 
 
+@control.as_reconciler
 def _reconcile(a, errors):
     """Server-side upkeep, safe to run concurrently: every state change re-checks under the task lock."""
     cfg = runner.config()
@@ -1050,6 +1105,7 @@ def cmd_reconcile(a) -> int:
     return rc
 
 
+@control.guard(command=True)
 def cmd_archive(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
@@ -1058,7 +1114,7 @@ def cmd_archive(a) -> int:
     # until their deadline. A legacy unknown process must first be acknowledged.
     with delivery.locked(td):
         st = td.state()
-        if st["owner"] != a.as_:
+        if not control.allowed(st, a.as_):
             return refuse(f"owner is {st['owner']}, not {a.as_}")
         if _active_run(st):
             return refuse("a run is in flight")
@@ -1066,9 +1122,9 @@ def cmd_archive(a) -> int:
         if reason:
             return refuse(reason)
         # Archiving revokes verified dependencies; serialize with gate → start.
-        with pool.schedule_lock(), td.locked() as box:
+        with pool.schedule_lock(), control.locked(td) as box:
             st = box["state"]
-            if st["owner"] != a.as_:
+            if not control.allowed(st, a.as_):
                 return refuse(f"owner is {st['owner']}, not {a.as_}")
             if _active_run(st):
                 return refuse("a run is in flight")
@@ -1303,13 +1359,14 @@ def cmd_finish(a) -> int:
     return rc
 
 
+@control.guard(command=True)
 def cmd_cancel(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
         return refuse(f"unknown task {a.task_id}")
-    with td.locked() as box:
+    with control.locked(td) as box:
         st = box["state"]
-        if st["owner"] != a.as_:
+        if not control.allowed(st, a.as_):
             return refuse(f"owner is {st['owner']}, not {a.as_}")
         run = st["runs"][-1] if st["runs"] else None
         if not run or run["state"] not in ("queued", "waiting_deps"):
@@ -1336,6 +1393,8 @@ def cmd_doctor(a) -> int:
     if a.json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
     else:
+        for problem in report.get("notify_errors", []):
+            print(f"CONFIG notify {problem['route']}: {problem['error']}")
         for c in report["checks"]:
             print(f"{'PASS' if c['ok'] else 'FAIL'} {c['name']}: {c['reason']}")
     return 0 if report["ok"] else 1
@@ -1352,6 +1411,7 @@ def main(argv=None) -> int:
     s.add_argument("--lane"); s.add_argument("--acct"); s.add_argument("--json", action="store_true")
     s = sub.add_parser("_doctor"); s.add_argument("run_dir")
     s = sub.add_parser("submit"); s.add_argument("spec"); s.add_argument("--as", dest="as_", required=True)
+    s.add_argument("--project-owned", action="store_true", help="own this task through its registered project")
     s = sub.add_parser("dispatch"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s = sub.add_parser("status"); s.add_argument("task_id", nargs="?"); s.add_argument("--json", action="store_true")
     s = sub.add_parser("takeover"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)

@@ -1,9 +1,10 @@
-"""Session/project CLI, deliberately separate from task ownership commands."""
+"""Session/project CLI and explicit legacy-task binding."""
 import argparse
 import json
 import sys
 
-from . import projects, runner, sessions
+from . import control, projects, runner, sessions
+from .store import TaskDir, list_tasks
 
 
 def caller(args, cfg):
@@ -14,8 +15,14 @@ def describe(identity):
     rec = sessions.record(identity["session_id"]) if identity["session_id"] else None
     controlled = [p["project_id"] for p in projects.list_projects()
                   if identity["session_id"] and p["controller"]["session_id"] == identity["session_id"]]
+    counts = dict.fromkeys(controlled, 0)
+    for task_id in list_tasks():
+        state = TaskDir(task_id).state()
+        project = control.project_of(state)
+        if project in counts and state["status"] not in ("verified", "archived", "exhausted"):
+            counts[project] += 1
     return {**identity, "registered": rec is not None, "label": rec["label"] if rec else None,
-            "projects": controlled}
+            "projects": controlled, "unfinished_tasks": sum(counts.values()), "project_task_counts": counts}
 
 
 def execute(a):
@@ -33,6 +40,8 @@ def execute(a):
                                        administrator=a.as_, reason=a.reason)
         else:
             result = sessions.register(caller(a, cfg), a.label)
+    elif a.action == "bind":
+        result = control.bind(TaskDir(a.task_id), a.project_id, a.as_, caller(a, cfg))
     elif a.action == "add":
         result = projects.add(a.project_id, a.label, a.root, a.claim)
     elif a.action == "list":
@@ -112,6 +121,12 @@ def register(sub):
             p.add_argument("--as", dest="as_", help="compatibility label; never grants project control")
         p.add_argument("--json", action="store_true")
         p.set_defaults(handler=command)
+    bind = actions.add_parser("bind", help="bind one legacy task to the project controller role")
+    bind.add_argument("task_id")
+    bind.add_argument("--project", dest="project_id", required=True)
+    bind.add_argument("--as", dest="as_", required=True)
+    assertion(bind)
+    bind.set_defaults(handler=command)
     transfer = actions.add_parser("transfer")
     moves = transfer.add_subparsers(dest="transfer_action", required=True)
     for name in ("begin", "commit", "abort"):

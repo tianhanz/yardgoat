@@ -66,6 +66,53 @@
    "type": "number",
    "exclusiveMinimum": 0,
    "default": 10
+  },
+  "notify": {
+   "oneOf": [
+    {
+     "$ref": "#/$defs/notify_route"
+    },
+    {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/notify_route"
+     }
+    }
+   ],
+   "description": "Route names must be unique. Controller fields require a live controller and verified endpoint for project-owned cards. Endpoint is compact JSON with socket and pane_id; controller fields are empty for legacy cards."
+  }
+ },
+ "$defs": {
+  "notify_route": {
+   "type": "object",
+   "required": [
+    "command"
+   ],
+   "properties": {
+    "name": {
+     "type": "string",
+     "minLength": 1,
+     "default": "default"
+    },
+    "recipient": {
+     "type": "string",
+     "description": "Destination dedupe template. Supported fields: task_id, status, owner, question, hint, controller, controller_session, endpoint. Use controller_session to resend after handoff."
+    },
+    "command": {
+     "type": "array",
+     "minItems": 1,
+     "items": {
+      "type": "string"
+     },
+     "description": "Argv templates, no shell. Unknown placeholders disable this route until fixed."
+    },
+    "on": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    }
+   }
   }
  }
 }

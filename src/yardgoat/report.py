@@ -106,7 +106,7 @@ def _group_name(by, state, spec, receipts):
         adapter = spec.get("adapter") or {}
         value = run.get("pool") or adapter.get("pool") or adapter.get("kind") or "direct"  # cards without a pool run through their adapter
     elif by == "project":
-        value = spec.get("project") or receipt.get("project")
+        value = (state.get("owner_ref") or {}).get("project") or spec.get("project") or receipt.get("project")
     elif by == "model":
         value = receipt.get("actual_model") or run.get("actual_model")
     elif by == "account":

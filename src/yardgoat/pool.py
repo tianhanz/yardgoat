@@ -159,8 +159,7 @@ def all_live_stations(cfg: dict) -> int:
 def schedule_lock():
     """One machine-wide lock for every 'check capacity, then start' decision (direct runs and stations).
     Lock order: delivery (if needed) -> schedule -> pool -> project (if needed) -> task.
-    Never acquire an earlier lock while holding a later one. Project control is not
-    yet wired into task commands; this reserves its order for M8b."""
+    Never acquire an earlier lock while holding a later one. Task controls acquire the project lock only for short commit/grant sections."""
     home().mkdir(parents=True, exist_ok=True)
     with open(home() / ".schedule.lock", "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
