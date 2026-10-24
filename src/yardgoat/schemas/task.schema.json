@@ -123,7 +123,7 @@
    "properties": {
     "kind": {
      "type": "string",
-     "description": "direct (default), file-pool, or a plugin kind"
+     "description": "direct (default), pool (Yardgoat pool with pulling stations), file-pool, or a plugin kind"
     },
     "pool": {
      "type": "string"
@@ -144,6 +144,10 @@
   "blocked_file": {
    "type": "string",
    "description": "Relative to workdir; if the worker writes it, the task is parked with its content as the question. Default out/BLOCKED.md."
+  },
+  "auto_close": {
+   "type": "boolean",
+   "description": "reconcile runs the frozen verifier on the owner's behalf once a run exits"
   }
  }
 }

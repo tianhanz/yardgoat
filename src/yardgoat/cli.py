@@ -13,6 +13,8 @@
   yardgoat archive <task_id> --as <controller> --reason R  close out a task that will not continue (kept, hidden from inbox)
   yardgoat quick "<card text>" --verify CMD --as <who> [--pool P | --host H] [...]   one-line submit + dispatch
   yardgoat cancel <task_id> --as <controller>            cancel a queued run
+  yardgoat claim --pool P --station S                    (stations) take the oldest queued card of pool P, or EMPTY
+  yardgoat finish <task_id> --run R --station S          (stations) report a claimed card as done (or blocked)
   yardgoat events <task_id>                              print the event log
 
 Direct runs are capped by the local config "max_concurrent" (default unlimited). Beyond the cap a dispatch is
@@ -27,10 +29,11 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from . import adapters, contract, runner
-from .store import TaskDir, list_tasks, now, write_json
+from . import adapters, contract, pool, runner
+from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 REFUSED = 3
 COUNTED = ("exited", "failed", "verified", "lost", "verify_error")  # blocked / launch_failed don't use the budget
@@ -61,6 +64,8 @@ def cmd_submit(a) -> int:
                 return 0
             return refuse(f"{td.task_id} already exists with different content (task ids are immutable)")
         write_json(td.path / "spec.json", spec)
+        (home() / "frozen").mkdir(parents=True, exist_ok=True)   # authoritative copy, outside what stations may write
+        write_json(home() / "frozen" / f"{td.task_id}.json", {"content_hash": h, "frozen": frozen})
         box["state"] = {"task_id": td.task_id, "content_hash": h, "frozen": frozen, "owner": a.as_,
                         "owner_history": [], "status": "accepted", "runs": [], "verdict": None,
                         "question": None, "accepted_at": now()}
@@ -69,9 +74,27 @@ def cmd_submit(a) -> int:
     return 0
 
 
+def frozen_of(td: TaskDir, st: dict) -> dict:
+    f = home() / "frozen" / f"{td.task_id}.json"
+    if f.exists():
+        auth = read_json(f)["frozen"]
+        if auth != st["frozen"]:
+            return {**auth, "<task.json frozen hashes were altered>": ""}
+        return auth
+    return st["frozen"]
+
+
 def _alive(run: dict) -> bool:
     if run.get("mode") == "file-pool":
         return run["state"] == "running"
+    if run.get("mode") == "pool":
+        if run["state"] == "queued":
+            return True
+        rec = home() / "pools" / run.get("pool", "") / "stations" / f"{run.get('station', '')}.json"
+        if not rec.exists():
+            return False
+        r = read_json(rec)
+        return r.get("state") == "running" and (runner.pid_alive(r.get("pid")) or runner.pid_alive(r.get("launcher_pid")))
     return runner.pid_alive(run.get("worker_pid")) or runner.pid_alive(run.get("pid"))
 
 
@@ -96,6 +119,8 @@ def lane_problem(spec: dict, cfg: dict) -> str | None:
     lane = spec["executor"].get("lane", "")
     if adapter_kind(spec) == "file-pool":
         lane = cfg.get("adapters", {}).get("file-pool", {}).get("pools", {}).get(spec["adapter"]["pool"], {}).get("lane", lane)
+    if adapter_kind(spec) == "pool":
+        lane = pool.pool_conf(cfg, spec["adapter"]["pool"]).get("lane", lane)
     allowed = spec.get("allowed_lanes")
     if allowed is not None and lane not in allowed:
         return f"lane {lane!r} is not in this task's allowed_lanes {allowed}"
@@ -138,7 +163,17 @@ def do_dispatch(td: TaskDir, who: str, actor_note: str = "", echo: bool = True) 
         st["status"] = "queued"
         st["question"] = None
         cap = cfg.get("max_concurrent")
-        must_wait = adapter_kind(spec) == "direct" and cap is not None and direct_slots_in_use() >= int(cap)
+        must_wait = adapter_kind(spec) == "direct" and cap is not None and \
+            direct_slots_in_use() + pool.all_live_stations(cfg) >= int(cap)
+        if adapter_kind(spec) == "pool":
+            st["runs"][-1].update(mode="pool", pool=spec["adapter"]["pool"])
+    if adapter_kind(spec) == "pool":
+        td.event("run.queued", who, run_id=run_id, pool=spec["adapter"]["pool"], note=actor_note)
+        started = pool.schedule(cfg, direct_slots_in_use())
+        if echo:
+            print(json.dumps({"task_id": td.task_id, "result": "queued", "run_id": run_id, "pool": spec["adapter"]["pool"],
+                              "stations_started": started}))
+        return 0
     if must_wait:
         td.event("run.queued", who, run_id=run_id, cap=cap, note=actor_note)
         if echo:
@@ -149,9 +184,16 @@ def do_dispatch(td: TaskDir, who: str, actor_note: str = "", echo: bool = True) 
 
 
 def _launch_problem(td: TaskDir, st: dict, spec: dict, cfg: dict) -> str | None:
-    d = contract.drift(st["frozen"])
+    d = contract.drift(frozen_of(td, st))
     if d:
         return f"frozen files changed since submit: {d}"
+    if adapter_kind(spec) == "pool":
+        try:
+            w = pool.workdir_problem(spec, cfg)
+        except RuntimeError as e:
+            return str(e)
+        if w:
+            return w
     return lane_problem(spec, cfg)
 
 
@@ -200,7 +242,7 @@ def _status_obj(td: TaskDir) -> dict:
         rr["receipt"] = json.loads(rec.read_text()) if rec.exists() else None
         runs.append(rr)
     return {"task_id": td.task_id, "status": st["status"], "owner": st["owner"], "owner_history": st["owner_history"],
-            "verdict": st["verdict"], "question": st.get("question"), "runs": runs, "drift": contract.drift(st["frozen"])}
+            "verdict": st["verdict"], "question": st.get("question"), "runs": runs, "drift": contract.drift(frozen_of(td, st))}
 
 
 def cmd_status(a) -> int:
@@ -244,16 +286,21 @@ def cmd_close(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
         return refuse(f"unknown task {a.task_id}")
+    rc, _ = do_close(td, a.as_)
+    return rc
+
+
+def do_close(td: TaskDir, who: str, actor_note: str = "") -> tuple[int, str | None]:
     with td.locked() as box:
         st = box["state"]
-        if st["owner"] != a.as_:
-            return refuse(f"owner is {st['owner']}, not {a.as_}")
+        if st["owner"] != who:
+            return refuse(f"owner is {st['owner']}, not {who}"), None
         last = st["runs"][-1] if st["runs"] else None
         if not last or last["state"] != "exited":
-            return refuse("no exited run waiting for verification")
-        d = contract.drift(st["frozen"])
+            return refuse("no exited run waiting for verification"), None
+        d = contract.drift(frozen_of(td, st))
         if d:
-            return refuse(f"frozen files changed since submit: {d}")
+            return refuse(f"frozen files changed since submit: {d}"), None
         spec = td.spec()
         rd = td.run_dir(last["run_id"])
         env = {**os.environ, "YARDGOAT_TASK_ID": td.task_id, "YARDGOAT_RUN_DIR": str(rd)}
@@ -269,7 +316,7 @@ def cmd_close(a) -> int:
         rec_p = rd / "receipt.json"
         rec = json.loads(rec_p.read_text())
         rec["verifier"] = {"command": spec["verifier"]["command"], "exit_code": rc, "result": verdict,
-                           "checked_at": checked, "checked_by": a.as_}
+                           "checked_at": checked, "checked_by": who}
         if verdict == "PASS":
             rec["status"] = "passed"; last["state"] = "verified"; st["status"] = "verified"
         elif verdict == "FAIL":
@@ -277,12 +324,12 @@ def cmd_close(a) -> int:
             used = sum(r["state"] in COUNTED for r in st["runs"])
             st["status"] = "failed" if used < spec["budget"]["max_attempts"] else "exhausted"
         else:  # a crashing verifier is not a failing deliverable; leave the run waiting for a human
-            rec["status"] = "verifier_error"
+            rec["status"] = "verifier_error"; last["state"] = "verify_error"
         write_json(rec_p, rec)
-        st["verdict"] = {"run_id": last["run_id"], "verdict": verdict, "by": a.as_, "at": checked}
-    td.event("run.verified", a.as_, run_id=last["run_id"], verdict=verdict)
+        st["verdict"] = {"run_id": last["run_id"], "verdict": verdict, "by": who, "at": checked}
+    td.event("run.verified", who, run_id=last["run_id"], verdict=verdict, note=actor_note)
     print(json.dumps({"task_id": td.task_id, "run_id": last["run_id"], "verdict": verdict}))
-    return 0 if verdict == "PASS" else (1 if verdict == "FAIL" else 2)
+    return (0 if verdict == "PASS" else (1 if verdict == "FAIL" else 2)), verdict
 
 
 def cmd_park(a) -> int:
@@ -347,6 +394,16 @@ def cmd_reconcile(a) -> int:
         st = td.state()
         spec = td.spec()
         last = st["runs"][-1] if st["runs"] else None
+        if last and last["state"] == "running" and adapter_kind(spec) == "pool":
+            if not _alive(last):
+                runner.record_outcome(td, last["run_id"], {"state": "lost", "reason": f"station {last.get('station')} is gone",
+                                                           "worker": last.get("station")})
+                report.append({"task_id": t, "run_id": last["run_id"], "observed": "lost"})
+            continue
+        if last and last["state"] == "exited" and spec.get("auto_close"):
+            rc, verdict = do_close(td, st["owner"], actor_note="auto_close by reconcile")
+            report.append({"task_id": t, "run_id": last["run_id"], "auto_closed": verdict})
+            continue
         if last and last["state"] == "running":
             try:
                 outcome = adapters.get(adapter_kind(spec), cfg).poll(td, last, spec, cfg)
@@ -371,10 +428,14 @@ def cmd_reconcile(a) -> int:
     for _, t in sorted(queued):
         td = TaskDir(t)
         spec = td.spec()
-        if adapter_kind(spec) == "direct" and cap is not None and direct_slots_in_use() >= int(cap):
+        if adapter_kind(spec) == "pool":
+            continue  # stations claim pool cards themselves
+        if adapter_kind(spec) == "direct" and cap is not None and direct_slots_in_use() + pool.all_live_stations(cfg) >= int(cap):
             continue
         rc = start_queued(td, "reconciler", actor_note="started from the queue", echo=False)
         report.append({"task_id": t, "started_from_queue": rc == 0})
+    for name in pool.schedule(cfg, direct_slots_in_use()):
+        report.append({"station_started": name})
     print(json.dumps({"reconciled_at": now(), "actions": report}, ensure_ascii=False))
     return 0
 
@@ -419,7 +480,12 @@ def cmd_quick(a) -> int:
         print(f"spec error: {card_dir} exists but the task does not", file=sys.stderr); return 2
     card_dir.mkdir(parents=True, exist_ok=True)
     text = a.text if a.text != "-" else sys.stdin.read()
-    pool_conf = cfg.get("adapters", {}).get("file-pool", {}).get("pools", {}).get(a.pool, {}) if a.pool else {}
+    yg_pool = bool(a.pool) and a.pool in pool.pools(cfg)
+    pool_conf = cfg.get("adapters", {}).get("file-pool", {}).get("pools", {}).get(a.pool, {}) if a.pool and not yg_pool else {}
+    if yg_pool and not a.workdir:  # a pool only runs cards whose workdir is under its root
+        wd = Path(os.path.expanduser(pool.pool_conf(cfg, a.pool).get("root", str(card_dir)))) / tid
+        wd.mkdir(parents=True, exist_ok=True)
+        a.workdir = str(wd)
     workdir = a.workdir or pool_conf.get("workdir") or str(card_dir)
     blocked = a.blocked_file or "out/BLOCKED.md"
     (card_dir / "CARD.md").write_text(text.strip() + QUICK_FOOTER.format(blocked=blocked, verify=a.verify), encoding="utf-8")
@@ -429,7 +495,13 @@ def cmd_quick(a) -> int:
             "verifier": {"command": f"bash {card_dir / 'verify.sh'}", "cwd": workdir, "freeze": ["verify.sh"]},
             "budget": {"max_attempts": a.attempts, "max_wall_min": a.wall},
             "authority": a.authority or "Only what the card says; anything else needs a human."}
-    if a.pool:
+    if yg_pool:
+        pc = pool.pool_conf(cfg, a.pool)
+        spec["adapter"] = {"kind": "pool", "pool": a.pool}
+        spec["executor"] = {"host": pc.get("host", "codex"), "lane": pc.get("lane", ""), "acct": pc.get("acct", "")}
+        if pc.get("lane"):
+            spec["allowed_lanes"] = [pc["lane"]]
+    elif a.pool:
         lane = pool_conf.get("lane", "")
         spec["adapter"] = {"kind": "file-pool", "pool": a.pool, "worker_verify": a.verify}
         spec["executor"] = {"host": pool_conf.get("host", "claude"), "lane": lane}
@@ -445,6 +517,63 @@ def cmd_quick(a) -> int:
     if rc != 0 or a.no_dispatch:
         return rc
     return do_dispatch(TaskDir(tid), a.as_)
+
+
+def cmd_claim(a) -> int:
+    """A station takes the oldest queued card of its pool. Prints the card location, or result=EMPTY."""
+    cfg = runner.config()
+    c = pool.pool_conf(cfg, a.pool)
+    rec_f = pool.pool_dir(a.pool) / "stations" / f"{a.station}.json"
+    if not rec_f.exists():
+        return refuse(f"unknown station {a.station}")
+    srec = read_json(rec_f)
+    if len(srec.get("tasks", [])) >= int(c.get("max_tasks_per_station", 5)):
+        print(json.dumps({"result": "EMPTY", "reason": "this station reached max_tasks_per_station"})); return 0
+    with pool.pool_lock(a.pool):
+        for _, t in pool.queued_cards(a.pool):
+            td = TaskDir(t)
+            with td.locked() as box:
+                st = box["state"]
+                run = st["runs"][-1]
+                if run["state"] != "queued":
+                    continue
+                spec = td.spec()
+                problem = _launch_problem(td, st, spec, cfg)
+                if problem:
+                    run.update(state="launch_failed", reason=problem); st["status"] = "accepted"
+                    continue
+                rd = td.run_dir(run["run_id"]); rd.mkdir(parents=True, exist_ok=True)
+                (rd / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
+                run.update(state="running", station=a.station, started_at=now(), claimed_epoch=time.time())
+                st["status"] = "running"
+                out = {"result": "CLAIMED", "task_id": t, "run_id": run["run_id"], "workdir": spec["workdir"],
+                       "prompt": str(rd / "prompt.md"), "blocked_file": spec.get("blocked_file", "out/BLOCKED.md"),
+                       "outputs": spec["outputs"]}
+            td.event("run.claimed", a.station, run_id=out["run_id"], pool=a.pool)
+            srec = read_json(rec_f); srec.setdefault("tasks", []).append(f"{t}/{out['run_id']}"); write_json(rec_f, srec)
+            print(json.dumps(out, ensure_ascii=False)); return 0
+    print(json.dumps({"result": "EMPTY"})); return 0
+
+
+def cmd_finish(a) -> int:
+    td = TaskDir(a.task_id)
+    if not td.exists:
+        return refuse(f"unknown task {a.task_id}")
+    st = td.state()
+    run = next((r for r in st["runs"] if r["run_id"] == a.run), None)
+    if not run or run["state"] != "running" or run.get("station") != a.station:
+        return refuse(f"{a.run} is not a running card claimed by {a.station}")
+    spec = td.spec()
+    c = pool.pool_conf(runner.config(), run["pool"])
+    out = {"state": "exited", "exit_code": 0, "host": c.get("host", ""), "lane": c.get("lane", ""), "worker": a.station,
+           "actual_model": pool.station_model(run["pool"], a.station), "model_source": "station-log",
+           "cost_basis": "shared-station"}
+    bf = Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")
+    if bf.is_file() and bf.stat().st_mtime >= run.get("claimed_epoch", 0):
+        out.update(state="blocked", question=bf.read_text(encoding="utf-8", errors="replace").strip()[:2000])
+    runner.record_outcome(td, a.run, out)
+    print(json.dumps({"task_id": td.task_id, "run_id": a.run, "result": out["state"]}))
+    return 0
 
 
 def cmd_cancel(a) -> int:
@@ -493,6 +622,9 @@ def main(argv=None) -> int:
     s.add_argument("--output", action="append"); s.add_argument("--blocked-file"); s.add_argument("--authority")
     s.add_argument("--attempts", type=int, default=2); s.add_argument("--wall", type=int, default=60)
     s.add_argument("--no-dispatch", action="store_true")
+    s = sub.add_parser("claim"); s.add_argument("--pool", required=True); s.add_argument("--station", required=True)
+    s = sub.add_parser("finish"); s.add_argument("task_id"); s.add_argument("--run", required=True); s.add_argument("--station", required=True)
+    s = sub.add_parser("_station"); s.add_argument("pool_name"); s.add_argument("station")
     s = sub.add_parser("cancel"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s = sub.add_parser("archive"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s.add_argument("--reason", required=True)
@@ -501,9 +633,11 @@ def main(argv=None) -> int:
     a = P.parse_args(argv)
     if a.cmd == "_run":
         return runner.run_and_receipt(TaskDir(a.task_id), a.run_id)
+    if a.cmd == "_station":
+        return pool.run_station(a.pool_name, a.station)
     return {"submit": cmd_submit, "dispatch": cmd_dispatch, "status": cmd_status, "takeover": cmd_takeover,
             "close": cmd_close, "park": cmd_park, "answer": cmd_answer, "inbox": cmd_inbox,
-            "reconcile": cmd_reconcile, "archive": cmd_archive, "cancel": cmd_cancel, "quick": cmd_quick, "events": cmd_events}[a.cmd](a)
+            "reconcile": cmd_reconcile, "archive": cmd_archive, "cancel": cmd_cancel, "quick": cmd_quick, "claim": cmd_claim, "finish": cmd_finish, "events": cmd_events}[a.cmd](a)
 
 
 if __name__ == "__main__":

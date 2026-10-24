@@ -30,7 +30,8 @@
     "run.launch_failed",
     "task.archived",
     "run.queued",
-    "run.cancelled"
+    "run.cancelled",
+    "run.claimed"
    ]
   },
   "actor": {

@@ -1,4 +1,4 @@
-# Design (P0 + P1)
+# Design (P0 + P1 + pools)
 
 Yardgoat puts one dispatch contract in front of the agent fleets you already run. P0 is the smallest
 piece that makes the contract real: a file-backed task store, a CLI, and a direct runner.
@@ -34,6 +34,15 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     fewer than `max_concurrent` direct runs are alive (local config); otherwise they wait and `reconcile` starts them
     oldest first, re-checking drift and lane policy at launch. A queued run counts as in flight (no duplicates) but
     not as an attempt; `cancel` removes it. Adapter runs are capped by the fleet they go to.
+
+12. **Pools: queue first, stations pull.** A task with `adapter.kind = "pool"` is only queued at dispatch. Stations
+    (one agent CLI session each, started by Yardgoat within `max_stations` per pool and `max_concurrent` per machine)
+    run a loop prompt: `claim` the oldest card → do it → `finish` → claim again, until `EMPTY` or
+    `max_tasks_per_station`. Warm sessions are reused across cards; nothing is ever typed into a station. A card whose
+    station dies is marked `lost`. Task workdirs must live under the pool's `root` (the station's writable root).
+13. **Frozen hashes have an authoritative copy** outside the directories stations may write
+    (`$YARDGOAT_HOME/frozen/`); a task whose `task.json` hashes disagree with it is treated as drifted.
+14. **`auto_close`** in a spec lets `reconcile` run the frozen verifier on the owner's behalf once a run exits.
 
 ## Adapters
 

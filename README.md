@@ -42,6 +42,16 @@ yardgoat quick "Write the 200 smallest primes to out/primes.txt" --verify "test 
 yardgoat quick "Fix the flaky test in tests/test_io.py" --verify "pytest -q tests/test_io.py" --pool research --as me
 ```
 
+Pools reuse a warm agent session across cards — every card is queued first, and a station claims one after another:
+
+```json
+"pools": {"codex": {"host": "codex", "lane": "codex", "root": "~/work/yardgoat-tasks", "max_stations": 3, "max_tasks_per_station": 5}}
+```
+
+```bash
+yardgoat quick "Summarise CHANGELOG.md into out/summary.md" --verify "test -s out/summary.md" --pool codex --as me
+```
+
 A task spec names the prompt file (`card`), the working directory, the expected `outputs`, the `executor`
 (`host`, plus optional `lane`/`acct` that your local launcher understands), the `verifier`, and a `budget`.
 Schemas: [task](src/yardgoat/schemas/task.schema.json) · [receipt](src/yardgoat/schemas/receipt.schema.json) · [event](src/yardgoat/schemas/event.schema.json).
@@ -67,7 +77,7 @@ With `tmux_session` set, each run gets its own window (handy for watching); othe
 | Phase | Scope | Status |
 |---|---|---|
 | P0 | contract, file store, CLI, direct runner, contract tests | done |
-| P1 | lane allowlist, park/answer/resume, `file-pool` adapter, plugin adapters, reconciler, launch-failure accounting, `quick`, queue-first dispatch with a concurrency cap | **here** |
+| P1 | lane allowlist, park/answer/resume, `file-pool` adapter, plugin adapters, reconciler, launch-failure accounting, `quick`, queue-first dispatch with a concurrency cap, pools with pulling stations | **here** |
 | P2 | issue-driven and queue-file adapters, agent-host skill and MCP entry points, cost budget gates, dashboard projection | planned |
 | P3 | per-task evaluation data (actual model, rework, human interventions) — facts first, no rankings | planned |
 
