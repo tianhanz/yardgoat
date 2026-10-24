@@ -2,10 +2,23 @@
 from __future__ import annotations
 
 import glob
+import os
+import stat
 from pathlib import Path
 
 from .contract import SpecError
 from .store import TaskDir, list_tasks
+
+WRITE_SET_SCAN_LIMIT = 50_000
+
+
+def _canonical_prefix(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        # A symlink-only cycle has no resolvable target. Keep its absolute prefix;
+        # stat/scandir below will skip it, while other reachable targets still count.
+        return Path(os.path.realpath(path))
 
 
 def validate_dependencies(spec: dict) -> None:
@@ -54,9 +67,9 @@ def dependencies(spec: dict) -> tuple[list[str], list[str]]:
 def write_set(spec: dict) -> list[str]:
     """Canonical absolute path prefixes, including files that have not been created yet.
 
-    A glob reserves its literal directory prefix before the first wildcard component. We do
-    not enumerate current matches: that would leave future files unprotected. Literal paths
-    are whole path components, so 'src' never overlaps 'src-other'.
+    Keep directory/glob prefixes for future files, and add targets of existing symlinks
+    reachable below them. Directory identities break cycles; the entry budget bounds work.
+    Literal paths are whole path components, so 'src' never overlaps 'src-other'.
     """
     prefixes = set()
     for scope in spec.get("scope", []):
@@ -65,7 +78,40 @@ def write_set(spec: dict) -> list[str]:
             if glob.has_magic(part):
                 break
             literal.append(part)
-        prefixes.add(str(Path(spec["workdir"]).joinpath(*literal).resolve()))
+        prefixes.add(str(_canonical_prefix(Path(spec["workdir"]).joinpath(*literal))))
+    pending = list(map(Path, sorted(prefixes)))
+    seen_dirs = set()
+    scanned = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            info = directory.stat()
+            identity = (info.st_dev, info.st_ino)
+            if not stat.S_ISDIR(info.st_mode) or identity in seen_dirs:
+                continue
+            seen_dirs.add(identity)
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if scanned >= WRITE_SET_SCAN_LIMIT:
+                        if spec.get("task_id"):
+                            td = TaskDir(spec["task_id"])
+                            if td.exists:
+                                td.event("task.scope_scan_limited", "scheduler", limit=WRITE_SET_SCAN_LIMIT,
+                                         scanned=scanned, reason="Scope symlink scan limit reached; continuing with "
+                                         "collected prefixes. Unvisited symlink targets may be unreserved.")
+                        return sorted(prefixes)
+                    scanned += 1
+                    try:
+                        path = Path(entry.path)
+                        if entry.is_symlink():
+                            path = _canonical_prefix(path)
+                            prefixes.add(str(path))
+                        if entry.is_dir():
+                            pending.append(path)
+                    except OSError:
+                        continue  # broken/cyclic links or entries removed during the scan
+        except OSError:
+            continue  # nonexistent or unreadable directories retain their prefix
     return sorted(prefixes)
 
 

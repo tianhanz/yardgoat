@@ -51,7 +51,10 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 15. **Concurrency.** Every "check capacity, then start" decision (dispatch, reconcile, station scheduling) holds one
     machine-wide schedule lock; lock order is schedule → pool → task. Outcomes are committed exactly once, receipt and
     state together under the task lock; a late or duplicate outcome is ignored, and a receipt whose state never got
-    written is replayed by `reconcile`.
+    written is replayed by `reconcile`. Archive also takes schedule → task locks, so it cannot revoke a verified
+    dependency between the final dependency check and start/claim. Other mutation paths either refuse verified
+    tasks or preserve their status; verifier failure/exhaustion starts from an unverified task and does not revoke
+    eligibility. The potentially slow verifier remains outside the schedule lock.
 16. **Process groups.** A direct worker runs in its own process group; a timeout ends the whole group, and liveness is
     judged by the group, so a worker that outlives its runner still blocks a retry.
 17. **Unknown submits are not retried blindly.** If an adapter's submit fails, Yardgoat asks the adapter whether the
@@ -66,7 +69,8 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 
 20. **Dependencies require verification.** `depends_on` lists accepted upstream task ids. Submission validates
     self-references, missing ids and cycles by traversing authoritative accepted specs, under the schedule lock.
-    Dispatch creates one `waiting_deps` run if any upstream is not `verified`. Waiting counts only as in flight:
+    Dispatch uses the same dependency gate as queue release and claim: terminated upstreams immediately park the
+    task; otherwise it creates one `waiting_deps` run if any upstream is not `verified`. Waiting counts only as in flight:
     it prevents duplicate dispatch and survives takeover, but uses no attempt, direct slot or pool station.
     `status` names the unverified upstreams; `cancel` can cancel the wait without spending an attempt.
     Reconcile moves the same run to `queued` once all upstreams are verified, then applies ordinary capacity,
@@ -117,12 +121,26 @@ M2 uses `scope` for scheduling; metadata does not grant permissions. Each litera
 canonical absolute prefix (`Path.resolve`, including existing symlinks). A glob reserves the directory before
 its first wildcard component: `src/**/*.py` reserves `workdir/src`, and `*.md` reserves the entire workdir.
 This is deliberately conservative and covers future files as well as existing matches; it does not enumerate
-only files that currently exist. Prefix comparison respects path-component boundaries, so `src/a` and `src/b`
+only files that currently exist. Existing symlinks below these prefixes add their resolved absolute target
+prefixes, including targets outside workdir and dangling links to future files. Directory targets are scanned
+too, so nested aliases cannot escape the reservation. Directory device/inode identities prevent traversal
+cycles; symlink-only loops keep an absolute prefix and are skipped when they cannot be traversed.
+Prefix comparison respects path-component boundaries, so `src/a` and `src/b`
 or `src` and `src-other` can run together. The reservation is saved on the running record until its outcome.
 Omitted or empty `scope` opts out for backwards compatibility. `risk` and `acceptance` remain descriptive.
 
 `depends_on: ["prepare-data", "build-tool"]` requires both upstream tasks to be verified before starting.
 The accepted dependency graph is immutable just like the rest of the spec; changing dependencies needs a new id.
+
+### Known limitations of scope scans
+
+Each write-set calculation inspects at most 50,000 directory entries across all scope roots and linked
+directories (one extra entry may be read to detect truncation). On truncation it emits a
+`task.scope_scan_limited` task event with the limit, scanned count and explanation, then continues scheduling
+with the prefixes collected so far. Checks and reservation can each emit this event. Unvisited symlink
+targets may therefore be unreserved; the original prefixes still protect future ordinary files. Unreadable
+directories retain their prefix but their links cannot be inspected. Scanning is not a filesystem snapshot:
+links created or retargeted after the scan are not covered by the saved reservation.
 
 ## Adapters
 

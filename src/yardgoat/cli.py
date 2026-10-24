@@ -217,11 +217,7 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
             st["runs"].append(run)
             st["status"] = "queued"
             st["question"] = None
-            waiting, _ = scheduling.dependencies(spec)
-            if waiting:
-                _wait_for_dependencies(td, st, run, waiting, who)
-            else:
-                _queue_gate(td, st, run, spec, who)
+            _queue_gate(td, st, run, spec, who)
         if run["state"] in ("waiting_deps", "blocked_deps"):
             if echo:
                 print(json.dumps({"task_id": td.task_id, "result": st["status"], "run_id": run_id,
@@ -645,7 +641,8 @@ def cmd_archive(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
         return refuse(f"unknown task {a.task_id}")
-    with td.locked() as box:
+    # Archiving revokes verified dependencies; serialize it with gate → reserve → start.
+    with pool.schedule_lock(), td.locked() as box:
         st = box["state"]
         if st["owner"] != a.as_:
             return refuse(f"owner is {st['owner']}, not {a.as_}")
