@@ -66,3 +66,13 @@ def test_a_busy_station_does_not_hold_back_a_new_card(tmp_path, env):
     Path(env["YARDGOAT_CONFIG"]).write_text(json.dumps(c))
     pool_task(tmp_path, env, "t-new")
     assert json.loads(yg(env, "dispatch", "t-new", "--as", "A")[1])["stations_started"] == ["p-st-2"]
+
+
+def test_quick_passes_depends_on_and_auto_close_into_the_spec(tmp_path, env):
+    wd = tmp_path / "wd"; wd.mkdir()
+    assert yg(env, "quick", "a", "--verify", "true", "--as", "A", "--id", "q-up", "--workdir", str(wd), "--no-dispatch")[0] == 0
+    rc, _, err = yg(env, "quick", "b", "--verify", "true", "--as", "A", "--id", "q-down", "--workdir", str(wd),
+                    "--depends-on", "q-up", "--auto-close", "--no-dispatch")
+    assert rc == 0, err
+    spec = json.loads((Path(env["YARDGOAT_HOME"]) / "cards/q-down/spec.json").read_text())
+    assert spec["depends_on"] == ["q-up"] and spec["auto_close"] is True

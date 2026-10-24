@@ -712,6 +712,10 @@ def cmd_quick(a) -> int:
             "verifier": {"command": f"bash {card_dir / 'verify.sh'}", "cwd": workdir, "freeze": ["verify.sh"]},
             "budget": {"max_attempts": a.attempts, "max_wall_min": a.wall}, "scope": a.scope or [], "risk": a.risk,
             "authority": a.authority or "Only what the card says; anything else needs a human."}
+    if a.depends_on:
+        spec["depends_on"] = list(a.depends_on)
+    if a.auto_close:
+        spec["auto_close"] = True
     if a.acceptance is not None:
         spec["acceptance"] = a.acceptance
     if yg_pool:
@@ -926,6 +930,8 @@ def main(argv=None) -> int:
     s.add_argument("--scope", action="append"); s.add_argument("--risk", choices=("l1", "l2", "l3"), default="l2")
     s.add_argument("--acceptance")
     s.add_argument("--attempts", type=int, default=2); s.add_argument("--wall", type=int, default=60)
+    s.add_argument("--depends-on", action="append", help="task id that must be verified first (repeatable)")
+    s.add_argument("--auto-close", action="store_true", help="reconcile verifies on the owner's behalf when the run exits")
     s.add_argument("--no-dispatch", action="store_true")
     s = sub.add_parser("claim"); s.add_argument("--pool", required=True); s.add_argument("--station", required=True)
     s = sub.add_parser("finish"); s.add_argument("task_id"); s.add_argument("--run", required=True); s.add_argument("--station", required=True)
