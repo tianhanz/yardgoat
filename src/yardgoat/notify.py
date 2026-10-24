@@ -61,8 +61,19 @@ def _notify_one(task_id, command, on):
         values = {"task_id": task_id, "status": status, "owner": owner, "question": question[:500],
                   "hint": _hint(task_id, status, owner)}
         argv = [arg.format_map(values) for arg in command]
-        result = subprocess.run(argv, shell=False, stdin=subprocess.DEVNULL, capture_output=True,
-                                text=True, encoding="utf-8", errors="replace", timeout=30)
+        # own process group: a timeout ends the hook *and* anything it spawned, so a half-finished send cannot
+        # complete later and then be repeated by the next retry
+        p = subprocess.Popen(argv, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", errors="replace", start_new_session=True)
+        try:
+            p.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            from .runner import kill_group
+            kill_group(p.pid, grace=3)
+            p.communicate()
+            LOG.warning("notify timed out for %s (%s); its process group was ended; retry next reconcile", task_id, status)
+            return None
+        result = p
         if result.returncode:
             LOG.warning("notify failed for %s (%s): exit %s; retry next reconcile", task_id, status, result.returncode)
             return None

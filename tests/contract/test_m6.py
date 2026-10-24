@@ -263,14 +263,24 @@ def test_notify_timeout_is_30_seconds_and_runs_outside_schedule_lock(env, tmp_pa
     fake_hook(tmp_path, env)
     calls = []
 
-    def timeout(argv, **kwargs):
-        calls.append(argv)
-        assert kwargs["timeout"] == 30 and kwargs.get("shell", False) is False
-        with open(Path(env["YARDGOAT_HOME"]) / ".schedule.lock", "a") as lk:
-            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        raise subprocess.TimeoutExpired(argv, 30)
+    real_popen = notify.subprocess.Popen
 
-    monkeypatch.setattr(notify.subprocess, "run", timeout)
+    class TimingOut(real_popen):
+        """Behavioural check: 30-second timeout, no shell, schedule lock free while the hook runs."""
+        def __init__(self, argv, **kwargs):
+            assert kwargs.get("shell", False) is False
+            calls.append(argv)
+            super().__init__(["sleep", "5"], **{k: v for k, v in kwargs.items() if k != "shell"})
+
+        def communicate(self, input=None, timeout=None):
+            if timeout is not None:
+                assert timeout == 30
+                with open(Path(env["YARDGOAT_HOME"]) / ".schedule.lock", "a") as lk:
+                    fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                raise subprocess.TimeoutExpired(self.args, 30)
+            return super().communicate(input=input)
+
+    monkeypatch.setattr(notify.subprocess, "Popen", TimingOut)
     assert cli.main(["reconcile"]) == 0
     assert cli.main(["reconcile"]) == 0
     assert len(calls) == 2
@@ -291,3 +301,37 @@ def test_notify_failure_keeps_auto_close_actions_and_single_json(env, tmp_path):
     out = reconciled(env)
     assert out["notified"] == []
     assert out["actions"] == [{"task_id": "t-demo", "run_id": "r1", "auto_closed": "PASS"}]
+
+
+def test_review_F1_hook_timeout_ends_the_spawned_sender_too(tmp_path, env):
+    """Review of M6, F1: a hook that spawns a delayed sender and then blocks must not send after its timeout."""
+    import os, sys, time
+    import subprocess as sp
+    sys.path.insert(0, SRC)
+    spec = make_task(tmp_path)
+    yg(env, "submit", str(spec), "--as", "A")
+    assert yg(env, "park", "t-demo", "--as", "A", "--question", "q?")[0] == 0
+    os.environ["YARDGOAT_HOME"] = env["YARDGOAT_HOME"]
+    from yardgoat import notify
+    sink = tmp_path / "sink"
+    hook = tmp_path / "hook.sh"
+    hook.write_text(f"(sleep 2; echo sent >> {sink}) & sleep 120\n")
+    real = sp.Popen.communicate
+    def short(self, input=None, timeout=None):
+        return real(self, input=input, timeout=1 if timeout == 30 else timeout)
+    sp.Popen.communicate = short
+    try:
+        assert notify._notify_one("t-demo", ["bash", str(hook)], ["parked"]) is None
+    finally:
+        sp.Popen.communicate = real
+    time.sleep(3)
+    assert not sink.exists()
+
+
+def test_review_F2_absurd_cost_makes_that_field_unknown_not_the_report_fail():
+    import sys
+    sys.path.insert(0, SRC)
+    from yardgoat import report
+    assert report._cost("usd=1e9999999999999999999999999 tokens=12")[1] == 12
+    assert report._cost("tokens=" + "9" * 5000)[2] is True
+    assert report._cost("usd=0.5 tokens=10")[:2] == (report.Decimal("0.5"), 10)

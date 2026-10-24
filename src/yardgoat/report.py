@@ -54,17 +54,23 @@ def _cost(basis) -> tuple[Decimal, int, bool]:
             if not sep or key not in ("usd", "tokens"):
                 continue
             value = value.rstrip(",")
-            if key == "usd" and re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value):
-                amount = Decimal(value)
-                # JSON numbers must remain finite, even for malformed extreme exponents.
-                if amount.is_finite() and amount <= Decimal("1e300"):
+            # Bound the text before converting: one absurd receipt must make that field "unknown", never break the report.
+            if key == "usd" and len(value) <= 40 and re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d{1,3})?", value):
+                try:
+                    amount = Decimal(value)
+                except (ArithmeticError, ValueError):
+                    amount = None
+                if amount is not None and amount.is_finite() and amount <= Decimal("1e300"):
                     usd += amount
                     parsed = True
                     continue
-            elif key == "tokens" and re.fullmatch(r"(?:\d+|\d{1,3}(?:,\d{3})+)", value):
-                tokens += int(value.replace(",", ""))
-                parsed = True
-                continue
+            elif key == "tokens" and len(value) <= 24 and re.fullmatch(r"(?:\d+|\d{1,3}(?:,\d{3})+)", value):
+                try:
+                    tokens += int(value.replace(",", ""))
+                    parsed = True
+                    continue
+                except ValueError:
+                    pass
             invalid = True
     return usd, tokens, invalid or not parsed
 
