@@ -1,0 +1,356 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "type": "object",
+ "title": "Yardgoat project control document (one atomic commit)",
+ "required": [
+  "project_id",
+  "label",
+  "root",
+  "claim",
+  "created_at",
+  "status",
+  "controller",
+  "transfer",
+  "last_transfer_id",
+  "transfers",
+  "history"
+ ],
+ "properties": {
+  "project_id": {
+   "type": "string",
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+  },
+  "label": {
+   "type": "string"
+  },
+  "root": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "claim": {
+   "enum": [
+    "open",
+    "admin"
+   ]
+  },
+  "created_at": {
+   "type": "string"
+  },
+  "status": {
+   "enum": [
+    "normal",
+    "transferring"
+   ]
+  },
+  "controller": {
+   "type": "object",
+   "required": [
+    "session_id",
+    "epoch",
+    "since",
+    "how"
+   ],
+   "properties": {
+    "session_id": {
+     "anyOf": [
+      {
+       "type": "string",
+       "pattern": "^s-[0-9a-f]{64}$"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "epoch": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "since": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "how": {
+     "enum": [
+      null,
+      "claim",
+      "handoff",
+      "transfer",
+      "assign"
+     ]
+    }
+   }
+  },
+  "transfer": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "last_transfer_id": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "transfers": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "object",
+    "required": [
+     "transfer_id",
+     "status",
+     "from",
+     "epoch",
+     "begun_at",
+     "token_hash"
+    ],
+    "properties": {
+     "transfer_id": {
+      "type": "string"
+     },
+     "status": {
+      "enum": [
+       "pending",
+       "committed",
+       "aborted",
+       "cancelled"
+      ]
+     },
+     "from": {
+      "type": "string",
+      "pattern": "^s-[0-9a-f]{64}$"
+     },
+     "epoch": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "begun_at": {
+      "type": "string"
+     },
+     "token_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "completed_at": {
+      "type": "string"
+     },
+     "result": {
+      "type": "object",
+      "required": [
+       "project_id",
+       "transfer_id",
+       "result",
+       "controller"
+      ],
+      "properties": {
+       "project_id": {
+        "type": "string"
+       },
+       "transfer_id": {
+        "type": "string"
+       },
+       "result": {
+        "enum": [
+         "committed",
+         "aborted"
+        ]
+       },
+       "controller": {
+        "type": "object",
+        "required": [
+         "session_id",
+         "epoch",
+         "since",
+         "how"
+        ],
+        "properties": {
+         "session_id": {
+          "anyOf": [
+           {
+            "type": "string",
+            "pattern": "^s-[0-9a-f]{64}$"
+           },
+           {
+            "type": "null"
+           }
+          ]
+         },
+         "epoch": {
+          "type": "integer",
+          "minimum": 0
+         },
+         "since": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "how": {
+          "enum": [
+           null,
+           "claim",
+           "handoff",
+           "transfer",
+           "assign"
+          ]
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "history": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": [
+     "sequence",
+     "at",
+     "kind",
+     "actor",
+     "old_controller",
+     "new_controller",
+     "old_status",
+     "new_status",
+     "old_transfer",
+     "reason"
+    ],
+    "properties": {
+     "sequence": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "at": {
+      "type": "string"
+     },
+     "actor": {
+      "type": "string"
+     },
+     "kind": {
+      "enum": [
+       "project.claimed",
+       "project.handed_off",
+       "project.assigned",
+       "project.transfer_begun",
+       "project.transfer_committed",
+       "project.transfer_aborted"
+      ]
+     },
+     "old_controller": {
+      "type": "object",
+      "required": [
+       "session_id",
+       "epoch",
+       "since",
+       "how"
+      ],
+      "properties": {
+       "session_id": {
+        "anyOf": [
+         {
+          "type": "string",
+          "pattern": "^s-[0-9a-f]{64}$"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "epoch": {
+        "type": "integer",
+        "minimum": 0
+       },
+       "since": {
+        "type": [
+         "string",
+         "null"
+        ]
+       },
+       "how": {
+        "enum": [
+         null,
+         "claim",
+         "handoff",
+         "transfer",
+         "assign"
+        ]
+       }
+      }
+     },
+     "new_controller": {
+      "type": "object",
+      "required": [
+       "session_id",
+       "epoch",
+       "since",
+       "how"
+      ],
+      "properties": {
+       "session_id": {
+        "anyOf": [
+         {
+          "type": "string",
+          "pattern": "^s-[0-9a-f]{64}$"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "epoch": {
+        "type": "integer",
+        "minimum": 0
+       },
+       "since": {
+        "type": [
+         "string",
+         "null"
+        ]
+       },
+       "how": {
+        "enum": [
+         null,
+         "claim",
+         "handoff",
+         "transfer",
+         "assign"
+        ]
+       }
+      }
+     },
+     "reason": {
+      "type": "string"
+     },
+     "old_status": {
+      "enum": [
+       "normal",
+       "transferring"
+      ]
+     },
+     "new_status": {
+      "enum": [
+       "normal",
+       "transferring"
+      ]
+     },
+     "old_transfer": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "transfer_id": {
+      "type": "string"
+     }
+    }
+   }
+  }
+ }
+}

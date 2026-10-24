@@ -34,7 +34,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import adapters, contract, delivery, doctor, notify, pool, report, review, runner, scheduling
+from . import adapters, contract, control_cli, delivery, doctor, health, notify, pool, report, review, runner, scheduling
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 REFUSED = 3
@@ -502,7 +502,12 @@ def cmd_status(a) -> int:
             if message and name not in represented:
                 unlisted_pools.append({"pool": name, "status": "doctor_failed", "reason": message})
     if a.json:
-        print(json.dumps(out + unlisted_pools if not a.task_id else out[0], ensure_ascii=False, indent=1))
+        rows = out + unlisted_pools
+        for row in rows:
+            row["reconcile_health"] = health.read()
+        if not rows:
+            rows = [{"reconcile_health": health.read()}]
+        print(json.dumps(rows if not a.task_id else rows[0], ensure_ascii=False, indent=1))
         return 0
     for o in out:
         print(f"{o['task_id']}: {o['status']}  owner={o['owner']}  verdict={(o['verdict'] or {}).get('verdict')}")
@@ -868,7 +873,7 @@ def cmd_inbox(a) -> int:
     return 0
 
 
-def cmd_reconcile(a) -> int:
+def _reconcile(a, errors):
     """Server-side upkeep, safe to run concurrently: every state change re-checks under the task lock."""
     cfg = runner.config()
     report = []
@@ -899,6 +904,8 @@ def cmd_reconcile(a) -> int:
                 if st["status"] == "answered":   # parked before its first run (e.g. migrated in with a question)
                     rc = do_dispatch_locked(td, st["owner"], "resumed by reconcile after an answer")
                     report.append({"task_id": t, "resumed": rc == 0})
+                    if rc:
+                        errors.append(f"{t}: resume exited {rc}")
                 continue
             if _receipt_waiting(td, last):                   # writer died between receipt and state
                 if runner.record_outcome(td, last["run_id"], replay=True):
@@ -928,15 +935,21 @@ def cmd_reconcile(a) -> int:
                 try:
                     outcome = adapters.get(adapter_kind(spec), cfg).poll(td, last, spec, cfg)
                 except Exception as e:
-                    report.append({"task_id": t, "error": repr(e)}); continue
+                    report.append({"task_id": t, "error": repr(e)})
+                    errors.append(f"{t}: poll: {e}")
+                    continue
                 if outcome and runner.record_outcome(td, last["run_id"], outcome):
                     report.append({"task_id": t, "run_id": last["run_id"], "observed": outcome["state"]})
             elif st["status"] == "answered":
                 rc = do_dispatch_locked(td, st["owner"], "resumed by reconcile after an answer")
                 report.append({"task_id": t, "resumed": rc == 0})
+                if rc:
+                    errors.append(f"{t}: resume exited {rc}")
             elif st["status"] == "failed" and spec.get("review"):
                 rc = do_dispatch_locked(td, st["owner"], "automatic retry within review failure budget")
                 report.append({"task_id": t, "retried": rc == 0})
+                if rc:
+                    errors.append(f"{t}: retry exited {rc}")
         # Poll all workers before releasing dependency waits or scope reservations. A verifier
         # runs outside this lock; its downstream tasks become eligible on the following tick.
         # Release dependency waits before sorting the queue, so their new queued_at participates
@@ -978,6 +991,8 @@ def cmd_reconcile(a) -> int:
             if adapter_kind(td.spec()) == "direct" and ((cap is not None and machine_load(cfg) >= int(cap)) or not pool.resources_ok(cfg)[0]):
                 continue
             rc = start_queued(td, "reconciler", actor_note="started from the queue", echo=False)
+            if rc:
+                errors.append(f"{t}: queue start exited {rc}")
             run = td.state()["runs"][-1]
             action = {"task_id": t, "started_from_queue": rc == 0 and bool(run.get("started_at"))}
             if run["state"] in ("queued", "waiting_deps", "blocked_deps") and run.get("reason"):
@@ -987,6 +1002,8 @@ def cmd_reconcile(a) -> int:
             report.append({"station_started": name})
     for td, owner in to_close:   # do_close re-checks state and run under the task lock
         rc, verdict = do_close(td, owner, actor_note="auto_close by reconcile")
+        if rc:
+            errors.append(f"{td.task_id}: auto-close exited {rc} ({verdict or 'refused'})")
         if verdict:
             action = {"task_id": td.task_id, "run_id": td.state()["verdict"]["run_id"], "auto_closed": verdict}
             if verdict == "PASS" and td.spec().get("on_pass") and td.state()["status"] == "verified":
@@ -996,10 +1013,32 @@ def cmd_reconcile(a) -> int:
         td = TaskDir(t)
         if td.state()["status"] == "reviewing":
             rc = review.advance(td)
+            if rc:
+                errors.append(f"{t}: review exited {rc}")
             report.append({"task_id": t, "review_status": td.state()["status"], "review_exit_code": rc})
-    notified = notify.notify_pending(cfg)
-    print(json.dumps({"reconciled_at": now(), "actions": report, "notified": notified}, ensure_ascii=False))
-    return 0
+    for name in pool.pools(cfg):
+        problem = doctor.failure_message(name, doctor.pool_report(name))
+        if problem:
+            errors.append(problem)
+    notified = notify.notify_pending(cfg, errors=errors)
+    return {"reconciled_at": now(), "actions": report, "notified": notified}
+
+
+def cmd_reconcile(a) -> int:
+    errors = []
+    health.start()
+    rc = 0
+    try:
+        result = _reconcile(a, errors)
+    except Exception as exc:
+        errors.append(f"reconcile: {type(exc).__name__}: {exc}")
+        result = {"reconciled_at": now(), "actions": [], "notified": [], "error": str(exc)}
+        rc = 2
+    finally:
+        record = health.finish(errors)
+    result["reconcile_health"] = record
+    print(json.dumps(result, ensure_ascii=False))
+    return rc
 
 
 def cmd_archive(a) -> int:
@@ -1280,7 +1319,12 @@ def cmd_events(a) -> int:
 
 def cmd_doctor(a) -> int:
     try:
-        report = doctor.run(runner.config(), name=a.pool, host=a.host or "codex", lane=a.lane or "", acct=a.acct)
+        cfg = runner.config()
+        report = doctor.run(cfg, name=a.pool, host=a.host or "codex", lane=a.lane or "", acct=a.acct)
+        report["checks"].append(health.check(cfg))
+        report["ok"] = all(c["ok"] for c in report["checks"])
+        report["reconcile_health"] = health.read()
+        report["reason"] = "; ".join(c["reason"] for c in report["checks"] if not c["ok"])
     except (RuntimeError, OSError, ValueError) as e:
         print(f"doctor error: {e}", file=sys.stderr)
         return 2
@@ -1294,8 +1338,10 @@ def cmd_doctor(a) -> int:
 
 def main(argv=None) -> int:
     P = argparse.ArgumentParser(prog="yardgoat", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    control_cli.assertion(P)
     sub = P.add_subparsers(dest="cmd", required=True)
     report.register(sub)
+    control_cli.register(sub)
     s = sub.add_parser("doctor")
     g = s.add_mutually_exclusive_group(); g.add_argument("--pool"); g.add_argument("--host", choices=contract.HOSTS)
     s.add_argument("--lane"); s.add_argument("--acct"); s.add_argument("--json", action="store_true")
@@ -1346,6 +1392,10 @@ def main(argv=None) -> int:
     s = sub.add_parser("events"); s.add_argument("task_id")
     s = sub.add_parser("_run"); s.add_argument("task_id"); s.add_argument("run_id")
     a = P.parse_args(argv)
+    if getattr(a, "caller_session", None) is not None and a.cmd != "whoami":
+        identity = control_cli.caller(a, runner.config())
+        if identity["session_id"] is None:
+            return refuse(identity["reason"])
     if hasattr(a, "handler"):
         return a.handler(a)
     if a.cmd == "_run":

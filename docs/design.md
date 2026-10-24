@@ -318,6 +318,158 @@ count as human decisions.
 Issue-driven and queue-file adapters (beyond `file-pool`), an MCP entry point, cost/model-call budget
 gates, leases for multi-host stores, and richer evaluation data. See the roadmap in the README.
 
+## 会话与项目主控 (sessions and project control)
+
+M8a adds project-side infrastructure only. Existing task owners, `--as`, dispatch,
+takeover, verification, approval and delivery permissions retain their existing meaning.
+Registering a project does not migrate tasks whose spec happens to use the same project string.
+
+### Session identity and trust boundary
+
+A session is one local Linux agent CLI process instance, identified by
+`(boot_id, pid, start_ticks)`. Its deterministic ID is `s-` plus the SHA-256 of the
+compact JSON array `[boot_id, pid, start_ticks]` (PID integer, ticks string).
+No process-group-leader assumption is made. `/proc/<pid>/stat` is parsed after its
+last `)`, so spaces and parentheses in comm do not shift field 22.
+
+Identity inspection starts at the CLI's parent, skipping Yardgoat's own interpreter.
+The first matching agent is the caller, including nested agent invocations. Inspection
+continues up to PID 1 to reject station ancestors, without substituting an outer agent.
+PID 1 is the root boundary and only its stat is required. An unreadable, vanished,
+cyclic, reparented or ambiguous chain returns unknown and a reason, never a guessed
+identity. Ancestry and boot identity are checked again before returning.
+
+`sessions.agents` is an array of rules such as `{"name":"custom","exe":"custom-cli"}`.
+`exe` and `argv0` match exact basenames; `comm` matches an exact process name. Selectors
+within one rule are alternatives. Two rules matching the same nearest process are
+ambiguous, even if they have the same name. Setting the array replaces all defaults;
+an empty array recognizes nobody. The default rules match only explicit `claude`,
+`codex` and `kimi` names. Generic `node` and `python` interpreters are not defaults.
+Configure an explicit suitable name when an installation does not expose those names.
+
+`YARDGOAT_STATION`, `YARDGOAT_MAILBOX`, `YARDGOAT_MAILBOX_HOME`, or an ancestor
+`yardgoat _station` / `python -m yardgoat.cli _station` invocation reject session
+identification, including administrator PID inventory. Changing the target store
+does not remove the station restriction. Permission failures are unknown, including
+restricted proc mounts. A session list reports `alive`, `dead`, or `unknown`:
+boot/start-time mismatch, confirmed PID absence, or a zombie is dead; inability to
+read the evidence is unknown. Neither status automatically changes project control.
+
+The endpoint comes from `TMUX` and `TMUX_PANE`. A bounded read-only tmux lookup
+checks whether the pane PID is the agent itself or an ancestor of it. Mismatch,
+missing tmux or lookup failure leaves it unverified. The endpoint never contributes
+to identity or permissions. The lookup is injectable in tests; no message is sent.
+Administrator registration uses the target process's endpoint environment.
+
+`sessions/<session_id>.json` records the identity, label, endpoint, initial registration
+time, and append-only registration provenance (operator, reason, identity evidence).
+Self-registration is idempotent; a supplied label can update the display label.
+`session register --pid` checks that exact live PID against agent rules and uses
+`project_admins` for administrator authorization. `whoami --json` returns `session_id`,
+identity evidence, endpoint, registration state, label and controlled project IDs.
+Unknown identification exits 3. `--session` is an assertion against mechanical
+identity, never impersonation; conflicts also exit 3. It may precede the command or
+follow a session/project leaf command. On `project assign`, the leaf `--session`
+selects the **target**; an optional caller assertion must precede `project`.
+
+Keep three separate states in mind:
+
+| State | Meaning |
+|---|---|
+| Registered | A process identity is recorded; it has no project permission yet. |
+| Controller | A project's control record names that session and current epoch. |
+| Managed by an external handover tool | An external tool manages session startup/exit; registration and controller status imply no such management. |
+
+`project_admins` is independent of l3 `approvers`. Missing, empty or malformed admin
+configuration grants no administrator permission. Administrator `--as` and reason
+are cooperative assertions, just like existing owner identities. This is **not**
+security isolation between mutually hostile processes under the same OS user:
+that user can modify config, process names, environments and store files. Transfer
+tokens are bearer credentials. No tmux endpoint, project root, session label, health
+record or external handover label grants control.
+
+### Project state, epochs and crash recovery
+
+Each `projects/<id>/project.json` holds immutable ID and creation metadata, display
+label/root, claim policy (`open` by default), controller `{session_id, epoch, since,
+how}`, current transfer ID, transfer records and append-only history. IDs are never
+reused by a delete/rename command. Root is display information only. History records
+actor/time, old/new controller (including epoch), old/new status, old transfer and
+reason. The controller starts at null with epoch 0.
+
+Claim requires an identified, registered caller, open policy and epoch 0. Every
+claim/handoff/assign compares `--expect-epoch` under the project lock. Handoff also
+requires the current controller and a registered, confirmed-alive target. Success
+advances epoch exactly once. A dead controller never reopens claim; an administrator
+uses assign to initialize or recover control. Assign also cancels a pending transfer
+and records the previous state and recovery reason.
+
+Transfer begin requires the current controller and expected epoch. It saves a random
+transfer ID and only the SHA-256 of a 256-bit token, returning the token once to the
+caller. The project is `transferring`; claim, handoff, another begin and control
+authorization are refused. The old controller's epoch is retained until commit.
+Commit authenticates the token and moves to a live registered target (default: the
+identified caller), incrementing epoch once. An explicit `--to` permits a token
+holder to finish for that target. The saved result makes duplicate commit return
+exactly the same result without another event or epoch increment. A changed target,
+cancelled/aborted transfer, or any later handoff/assign/transfer rejects an old commit.
+A replay of an already completed result does not perform another liveness-dependent
+assignment. Abort accepts the token or current controller, restores normal status
+and retains epoch. Repeating that abort is also harmless until control changes.
+
+The state, token hash, saved result and history are in **one atomic document**.
+The writer uses a unique temporary file, flush/fsync, atomic rename and directory
+fsync under an independent project lock. Crashes before rename leave the old state;
+after rename leave the complete new state. Partial temporary files are never read.
+Thus commit/abort can replay without a separate event-file reconciliation window.
+An interrupted begin can be inspected with project show. If the begin committed but
+the process died before its one-time token reached the caller, the token cannot be
+reprinted: the old controller can abort without it and begin again, or an admin can
+assign if that controller also exited. This deliberate recovery path avoids storing
+plaintext/recoverable tokens. The store does not provide distributed leases.
+
+### Locks and library interface for M8b
+
+Total lock order, when a future operation needs multiple domains, is:
+**delivery mutex → schedule → pool → project → task** (parent task before review
+child). Multiple project locks must be acquired by sorted project ID. Session
+registration and reconcile-health locks are standalone and never nest into this
+chain; project operations only read atomic session snapshots. Existing paths that
+do not touch projects keep their current locks. No external command, tmux lookup,
+model call or network request runs while a project lock is held.
+
+`sessions.identify(config)` produces the caller object for
+`projects.authorize_control(project_id, caller)`, which returns `(session_id, epoch)`
+or raises `sessions.Refused` with the missing-project/identity/registration/control/
+transfer reason. `projects.recheck(project_id, session_id, epoch)` rejects stale
+epochs, including A→B→A. Both wrappers hold a short project lock and are point-in-time
+checks, not durable grants. At a task commit, M8b must acquire the project lock **before**
+the task lock and keep it through the task write, using `projects.locked(id)` plus
+`authorize_control_locked(state, caller)` / `recheck_locked(state, sid, epoch)`.
+Do not reacquire the same flock through a wrapper while already holding it. These
+helpers are not connected to task commands in M8a.
+
+### Reconcile health
+
+Every reconcile round writes `$YARDGOAT_HOME/reconcile-health.json` at start and end,
+under its own short lock: `last_started_at`, `last_finished_at`, `last_success_at`,
+and `errors: {count, first}` (up to five bounded summaries). Only a round with no
+action errors advances last_success_at. Adapter exceptions, failed command results,
+review/delivery/auto-close refusals, failed pool probes and notification failures
+are included. A fatal action exception records the end/error and exits 2; existing
+best-effort errors keep their original command exit behavior. SIGKILL leaves a
+start without its finish. Concurrent rounds merge fields under the health lock;
+the most recent completion supplies its error summary and does not erase a newer
+start. This is observational bookkeeping, not a lock on reconciliation.
+
+`status --json` preserves the existing task/list shapes and adds `reconcile_health`
+to each row (a health-only row for an otherwise empty list). Explicit `doctor` adds
+a freshness check: a recorded round with no end, an unreadable record, or an end
+older than `reconcile_stale_min` (default 10 minutes) alarms. A new store with no
+record reports that no round has run yet. This check is not added to the cached
+launch probe or automatic station admission. Health is never read by project
+authorization and is never treated as a controller heartbeat.
+
 ## Engineering review loop
 
 The accepted `review` object names `pool`, optional `path` (default `.` relative to workdir),

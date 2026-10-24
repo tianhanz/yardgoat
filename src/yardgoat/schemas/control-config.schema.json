@@ -1,0 +1,71 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "type": "object",
+ "title": "Yardgoat control settings (other local config fields allowed)",
+ "properties": {
+  "sessions": {
+   "type": "object",
+   "properties": {
+    "agents": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "name"
+      ],
+      "anyOf": [
+       {
+        "required": [
+         "exe"
+        ]
+       },
+       {
+        "required": [
+         "comm"
+        ]
+       },
+       {
+        "required": [
+         "argv0"
+        ]
+       }
+      ],
+      "properties": {
+       "name": {
+        "type": "string",
+        "minLength": 1
+       },
+       "exe": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[^/]+$"
+       },
+       "comm": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[^/]+$"
+       },
+       "argv0": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[^/]+$"
+       }
+      }
+     }
+    }
+   }
+  },
+  "project_admins": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "minLength": 1
+   }
+  },
+  "reconcile_stale_min": {
+   "type": "number",
+   "exclusiveMinimum": 0,
+   "default": 10
+  }
+ }
+}

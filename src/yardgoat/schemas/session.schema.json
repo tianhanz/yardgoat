@@ -1,0 +1,124 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "type": "object",
+ "title": "Yardgoat registered session",
+ "required": [
+  "session_id",
+  "identity",
+  "evidence",
+  "endpoint",
+  "label",
+  "registered_at",
+  "registrations"
+ ],
+ "properties": {
+  "session_id": {
+   "type": "string",
+   "pattern": "^s-[0-9a-f]{64}$"
+  },
+  "identity": {
+   "type": "object",
+   "required": [
+    "boot_id",
+    "pid",
+    "start_ticks"
+   ],
+   "properties": {
+    "boot_id": {
+     "type": "string",
+     "minLength": 1
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 2
+    },
+    "start_ticks": {
+     "type": "string",
+     "pattern": "^[0-9]+$"
+    }
+   }
+  },
+  "evidence": {
+   "type": "object"
+  },
+  "endpoint": {
+   "type": "object",
+   "required": [
+    "socket",
+    "pane_id",
+    "verified",
+    "reason"
+   ],
+   "properties": {
+    "socket": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "pane_id": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "verified": {
+     "type": "boolean"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "pane_pid": {
+     "type": "integer",
+     "minimum": 1
+    }
+   }
+  },
+  "label": {
+   "type": "string"
+  },
+  "registered_at": {
+   "type": "string"
+  },
+  "liveness": {
+   "enum": [
+    "alive",
+    "dead",
+    "unknown"
+   ]
+  },
+  "registrations": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": [
+     "at",
+     "by",
+     "how",
+     "reason",
+     "evidence"
+    ],
+    "properties": {
+     "at": {
+      "type": "string"
+     },
+     "by": {
+      "type": "string"
+     },
+     "how": {
+      "enum": [
+       "self",
+       "administrator"
+      ]
+     },
+     "reason": {
+      "type": "string"
+     },
+     "evidence": {
+      "type": "object"
+     }
+    }
+   }
+  }
+ }
+}

@@ -37,7 +37,7 @@ def _hint(task_id, status, owner):
     return f"yardgoat status {task} --json"
 
 
-def _notify_one(task_id, command, on, *, name="default", recipient=None, legacy=True):
+def _notify_one(task_id, command, on, *, name="default", recipient=None, legacy=True, errors=None):
     directory = home() / "notified"
     directory.mkdir(parents=True, exist_ok=True)
     # A separate per-task lock serializes concurrent reconcilers without holding schedule/task locks
@@ -77,10 +77,14 @@ def _notify_one(task_id, command, on, *, name="default", recipient=None, legacy=
             kill_group(p.pid, grace=3)
             p.communicate()
             LOG.warning("notify %s timed out for %s (%s); its process group was ended; retry next reconcile", name, task_id, status)
+            if errors is not None:
+                errors.append(f"notify {name}: {task_id} timed out")
             return None
         result = p
         if result.returncode:
             LOG.warning("notify %s failed for %s (%s): exit %s; retry next reconcile", name, task_id, status, result.returncode)
+            if errors is not None:
+                errors.append(f"notify {name}: {task_id} exited {result.returncode}")
             return None
         record["sent"][key] = {"status": status, "question_hash": question_hash, "at": now()}
         if not legacy:
@@ -116,7 +120,7 @@ def _routes(settings):
     return routes
 
 
-def notify_pending(cfg: dict) -> list[dict]:
+def notify_pending(cfg: dict, errors=None) -> list[dict]:
     """Best effort: config, command or bookkeeping failures never change reconcile's result."""
     delivered = []
     try:
@@ -130,11 +134,15 @@ def notify_pending(cfg: dict) -> list[dict]:
                     # Do not create bookkeeping files for tasks that have no pending decision.
                     if _status(TaskDir(task_id).state(), route["on"]) is None:
                         continue
-                    item = _notify_one(task_id, **route)
+                    item = _notify_one(task_id, **route, errors=errors)
                     if item:
                         delivered.append(item)
                 except Exception as exc:
                     LOG.warning("notify %s failed for %s: %s; retry next reconcile", route["name"], task_id, exc)
+                    if errors is not None:
+                        errors.append(f"notify {route['name']}: {task_id}: {exc}")
     except Exception as exc:
         LOG.warning("notify failed: %s; retry next reconcile", exc)
+        if errors is not None:
+            errors.append(f"notify: {exc}")
     return delivered

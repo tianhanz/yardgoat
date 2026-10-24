@@ -71,6 +71,69 @@ exited runs will advance on the next reconcile, potentially running their frozen
 Accepted specs, hashes and frozen files are not rewritten. See the
 [upgrade behavior](docs/design.md#automatic-verification-and-upgrades) before enabling reconciliation.
 
+## Sessions and project controllers
+
+Session registration identifies a local agent process; project control is a separate
+explicit grant. These commands do not change task ownership or task permissions.
+
+```bash
+yardgoat whoami --json
+yardgoat session register --label "Planning session"
+yardgoat session list --json
+# Administrative inventory (requires project_admins in local config):
+yardgoat session register --pid 12345 --as operator --reason "Session inventory"
+
+yardgoat project add example --label "Example" --root /path/to/work --claim open
+yardgoat project list --json
+yardgoat project show example --json
+yardgoat project claim example --expect-epoch 0
+yardgoat project handoff example --to SESSION_ID --expect-epoch 1
+
+# Old session begins; retain the printed transfer_id and one-time token:
+yardgoat project transfer begin example --expect-epoch 2
+# New registered session completes (or supply --to SESSION_ID):
+yardgoat project transfer commit example --transfer TRANSFER_ID --token TOKEN
+yardgoat project transfer abort example --transfer TRANSFER_ID --token TOKEN
+# The current controller can also abort without a token.
+
+# Administrator initialization or recovery; also cancels an unfinished transfer:
+yardgoat project assign example --session SESSION_ID --expect-epoch 3 --as operator --reason "Recovery"
+```
+
+Optional local configuration:
+
+```json
+{
+  "sessions": {"agents": [{"name": "custom", "exe": "custom-agent"}]},
+  "project_admins": ["operator"],
+  "reconcile_stale_min": 10
+}
+```
+
+When supplied, `sessions.agents` completely replaces the default exact names
+`claude`, `codex`, `kimi`. Each rule supports exact `exe`, `comm` or `argv0` names;
+generic interpreters are not recognized by default. The closest matching agent is
+the caller. Ambiguous or inaccessible process ancestry is unknown (exit 3), and
+pool stations cannot register. `--session ID` asserts the caller identity; it cannot
+select somebody else's identity. `project assign --session` instead names its target.
+Tmux endpoints and project roots are display/routing metadata, never permission.
+
+`project_admins` is separate from l3 `approvers` and fails closed when absent.
+Administrator `--as` is a cooperative identity, not OS-user authentication. Claims
+work only for open projects at epoch 0; controller death requires admin recovery.
+Epoch comparisons fence stale calls even after A→B→A. Transfer commit is replayable;
+tokens are stored only as hashes. If a begin committed but its token output was lost,
+the current controller can abort and begin again, or an administrator can assign.
+Details and library APIs: [design](docs/design.md#会话与项目主控-sessions-and-project-control).
+Schemas: [session](src/yardgoat/schemas/session.schema.json),
+[project](src/yardgoat/schemas/project.schema.json),
+[control configuration](src/yardgoat/schemas/control-config.schema.json).
+
+Each `reconcile` records start/end, last error-free completion and an error summary
+in `reconcile-health.json`. JSON status includes `reconcile_health`; doctor alarms
+when a recorded completion is older than `reconcile_stale_min` (default 10 minutes).
+This record never grants or revokes project control.
+
 ## Approval and delivery
 
 Tasks with `"risk": "l3"` need explicit approval before dispatch. They appear in `inbox` as `等审批`;
