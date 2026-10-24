@@ -39,7 +39,8 @@
     "task.approval_invalidated",
     "task.on_pass_started",
     "task.on_pass_finished",
-    "task.delivery_assumed_stopped"
+    "task.delivery_assumed_stopped",
+    "task.review_processed"
    ]
   },
   "actor": {
@@ -196,6 +197,29 @@
   },
   "assume_stopped": {
    "type": "boolean"
+  },
+  "review_task_id": {
+   "type": "string"
+  },
+  "round": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "findings_count": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "blocking_count": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "decision": {
+   "enum": [
+    "repair",
+    "park",
+    "pass",
+    "pass_with_followups"
+   ]
   }
  }
 }

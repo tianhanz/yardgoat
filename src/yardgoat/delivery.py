@@ -89,7 +89,7 @@ def view(td: TaskDir, st: dict, spec: dict) -> dict:
             receipt = read_json(path)
             records = receipt.get("on_pass", [])
             reason = receipt.get("delivery_reason", reason)
-    pending = bool(spec.get("on_pass") and st.get("verdict", {})
+    pending = bool(st.get("status") == "verified" and spec.get("on_pass") and st.get("verdict", {})
                    and st["verdict"]["verdict"] == "PASS" and not complete(spec["on_pass"], records))
     uncertain = pending and any(unknown(r) for r in records)
     return {"on_pass": records, "delivery_failed": pending, "delivery_pending": pending,

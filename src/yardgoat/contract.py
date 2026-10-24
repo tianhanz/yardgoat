@@ -20,7 +20,7 @@ TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,79}$")
 
 # Task lifecycle. "exited" means the process ended; only a passing frozen verifier makes it "verified".
 STATES = ("accepted", "waiting_deps", "queued", "running", "exited", "verified", "failed", "exhausted",
-          "parked", "answered", "archived", "submit_unknown", "provider_refused")
+          "parked", "answered", "archived", "submit_unknown", "provider_refused", "reviewing")
 
 
 class SpecError(ValueError):
@@ -118,6 +118,8 @@ def normalize(spec: dict, base: Path, metadata_defaults: bool = True) -> dict:
     s.setdefault("outputs", [])
     s.setdefault("authority", "")
     s.setdefault("escalate_when", [])
+    from . import review
+    review.validate(s)
     return s
 
 

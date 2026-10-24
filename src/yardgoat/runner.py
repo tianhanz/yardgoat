@@ -38,7 +38,7 @@ def prompt_text(td: TaskDir, spec: dict) -> str:
     text = Path(spec["card"]).read_text(encoding="utf-8")
     answers = sorted((td.path / "answers").glob("*.md")) if (td.path / "answers").exists() else []
     if answers:
-        text += "\n\n## Answers from a human (given while this task was parked)\n"
+        text += "\n\n## Answers and engineering review feedback\n"
         for a in answers:
             text += f"\n### {a.stem}\n{a.read_text(encoding='utf-8').strip()}\n"
     return text
@@ -381,6 +381,12 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | Callable[[dict], di
             }
             if run.get("approval"):
                 receipt["approval"] = run["approval"]
+            if run.get("review_round") or spec.get("review_of"):
+                receipt["review_round"] = run.get("review_round") or spec["review_of"]["round"]
+            if spec.get("review_of"):
+                receipt["review_of"] = spec["review_of"]
+            if st.get("review"):
+                receipt["review"] = st["review"]
             if state == "blocked":
                 receipt["question"] = outcome.get("question", "")
             if state in ("lost", "launch_failed", "provider_refused"):

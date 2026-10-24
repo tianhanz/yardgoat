@@ -1,0 +1,56 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "Yardgoat engineering review findings",
+ "type": "array",
+ "items": {
+  "type": "object",
+  "required": [
+   "id",
+   "severity",
+   "file",
+   "line",
+   "title",
+   "scenario",
+   "fix"
+  ],
+  "properties": {
+   "id": {
+    "type": "string",
+    "minLength": 1,
+    "pattern": "\\S"
+   },
+   "file": {
+    "type": "string",
+    "minLength": 1,
+    "pattern": "\\S"
+   },
+   "title": {
+    "type": "string",
+    "minLength": 1,
+    "pattern": "\\S"
+   },
+   "scenario": {
+    "type": "string",
+    "minLength": 1,
+    "pattern": "\\S"
+   },
+   "fix": {
+    "type": "string",
+    "minLength": 1,
+    "pattern": "\\S"
+   },
+   "severity": {
+    "enum": [
+     "blocker",
+     "major",
+     "minor",
+     "info"
+    ]
+   },
+   "line": {
+    "type": "integer",
+    "minimum": 1
+   }
+  }
+ }
+}

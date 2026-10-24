@@ -97,6 +97,48 @@ and continue. Successful steps are preserved across retries and repeated `close`
 Repeated `close` reports the existing result; retry delivery explicitly. Commands should also be
 idempotent across a controller crash between an external side effect and recording its success.
 
+## Automatic engineering review
+
+Add `review` to a task spec to run an independent review after its frozen verifier passes:
+
+```json
+"review": {
+  "pool": "reviewers",
+  "path": "src",
+  "rounds": 3,
+  "blocking": ["blocker", "major"],
+  "after_max_rounds": "pass_with_followups"
+}
+```
+
+Configure the review pool with a different pool name and effective lane from the executor.
+If lanes are omitted, different hosts are required. This is checked at submission and launch.
+`path` is a directory relative to workdir (default `.`); the review workspace and Yardgoat
+store must be outside that directory. The directory can be created by the initial worker.
+Reviewers receive a snapshot under their pool root, the original goal/card and acceptance
+instructions. They write `out/findings.json` and `out/REVIEW.md`. Findings use
+`id`, `severity`, `file`, `line`, `title`, `scenario`, `fix`; file paths are relative to
+the reviewed directory, and line numbers start at 1. See the [findings schema](src/yardgoat/schemas/findings.schema.json).
+
+`review` enables automatic verification through `reconcile`, including repair runs.
+Each `<task-id>-review-<round>` child has its own frozen verifier checking output structure,
+file/line references and unchanged original/snapshot trees. An invalid or failed review
+never means clean: it retries within the child's two-attempt budget, then needs attention.
+Blocking findings become an answer appended to the original prompt, and a repair is dispatched.
+Successful review/repair rounds do not spend the original failure retry budget.
+
+The parent stays `reviewing` while waiting for review. Its write-set lease remains held through
+review and repairs; dependents wait and `on_pass` runs only after the full loop passes.
+At the round limit, `park` asks for a follow-up decision; `pass_with_followups` verifies the
+parent and submits one task per remaining finding. Those follow-ups appear in `inbox`
+without runs until their owner chooses to dispatch them. They inherit the original risk
+and require their own approval when l3. A parked round-limit result cannot acquire more
+rounds by answering; submit a new task for further work.
+
+Take over the parent to transfer its review children too. Repeated close/reconcile does not
+duplicate children, answers or repair rounds. Receipts include round numbers, each round's
+finding count and the validated findings used to decide the result.
+
 ## Local wiring
 
 How a lane or account is chosen is your machine's business, not the task's. Put it in `~/.config/yardgoat/config.json`:

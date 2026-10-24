@@ -142,6 +142,8 @@ def scope_conflicts(task_id: str, spec: dict) -> list[dict]:
         reservations = [r for r in st["runs"] if r["state"] in ("running", "submit_unknown")]
         if st.get("delivery_reservation"):
             reservations.append(st["delivery_reservation"])
+        if st.get("review_reservation") and st["status"] not in ("verified", "archived"):
+            reservations.append(st["review_reservation"])
         for run in reservations:
             # An unknown remote submit may already be executing; retain its reservation
             # until its outcome is resolved, just like its existing duplicate-dispatch guard.
