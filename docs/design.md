@@ -328,6 +328,11 @@ happens before skipping a success or replacing a failed attempt, so both success
 survive the receipt-first crash window without duplicate events. Successful steps are skipped, including
 duplicate step names. Commands must still tolerate retry after external side effects complete but before
 the successful local receipt is committed; those two operations cannot be atomic.
+For project cards, recovery explicitly runs with system audit context even when
+manual `deliver` or `archive` triggers it. The replay event records the current
+system `on_behalf_of`, and `execution_control` preserves the original session/epoch
+or original system `on_behalf_of`. An immediately completed step still uses its
+original execution snapshot directly, including when handoff happened during execution.
 
 The PASS commit first marks declared delivery pending in both task state and receipt. Only success
 records for **every declared step** clear `delivery_pending` / `delivery_failed`; an empty or partial
@@ -542,8 +547,13 @@ to project handoff/transfer.
 All policy refusals exit 3. Manual control events include `actor_session` and
 `epoch`. Reconciliation events use `actor: reconciler` and
 `on_behalf_of: {project, epoch}`, never an invented active session identity.
-When replaying a prior session's delivery result, `execution_control` retains the
-original grant's session/epoch as provenance.
+When replaying a delivery result, `execution_control` retains the original grant's
+session/epoch or system `on_behalf_of` as provenance. Verification persists the
+same control snapshot into `receipt.verifier` at its verdict commit, before
+writing `run.verified`. The event uses that snapshot without resolving a later
+controller or system epoch. Manual receipts retain `checked_by` plus
+`actor_session`/`epoch`; system receipts retain `checked_by: reconciler`,
+`actor: reconciler` and `on_behalf_of`.
 A control entry point captures its ticket before waiting; task commits and delivery
 pipe grants recheck the original epoch. A→B→A therefore cannot revive an old call.
 
@@ -627,6 +637,11 @@ The extension is written before run updates and the deduplicated `task.review_ch
 event; repeating the command repairs an interrupted write using the original actor/time/channel,
 not a newly read pool config. Confirmation never dispatches, changes task status or consumes a
 round. A parked task still needs its normal answer; a running task finishes its existing run.
+The frozen confirmation also stores `control`, the original controller identity
+snapshot. Event recovery uses its original actor, time, session and epoch, and
+separately records the invoking controller in `replayed_by`. Old confirmations
+without a snapshot keep their identity unknown; recovery never fills it with the
+new controller's identity.
 
 After frozen acceptance, `review.begin` records a pending round containing the exact child id
 `<parent>-review-<n>` and the execution run id. Parent/run/receipt become `reviewing` with the
@@ -718,6 +733,11 @@ parent state. An ordinary side-effect error parks the original pending state, re
 reservation and retry entry point. A crash before state commit replays those idempotent side
 effects. Partial follow-up success is reused by deterministic ID plus content hash; a foreign
 ID collision stays pending and visible instead of starting a new execution round.
+If the parent was bound to a project after a partial follow-up acceptance, replay
+compares the follow-up against its original frozen spec (including its historical
+owner field), frozen files and exact parent/round/finding relation. Role inheritance
+then updates only task state, after the independent ownership-conflict checks;
+it never rehashes an existing task with the parent's newly bound role.
 Before accepting each follow-up, a round writes its deterministic ID and initial owner into
 owner-side `reviews/<parent>/<round>/followups.json`. This journal survives discarded staged
 state and crashes immediately after acceptance. The pending parent row exposes accepted IDs.
@@ -791,9 +811,11 @@ The placeholders are `{task_id}`, `{status}`, `{owner}`, `{question}` (first 500
 `{hint}`, `{controller}`, `{controller_session}` and `{endpoint}`. The last three
 resolve to the current project controller's registered label, session ID and a compact
 JSON object `{"socket":"...","pane_id":"..."}`. For legacy cards all three are empty.
-A project route referencing any of these fields is skipped when the current controller
-is not confirmed alive or its registered endpoint is unverified/missing; it records
-no sent key, and a later reconcile retries. Routes without these placeholders still
+A project route referencing any of these fields requires a confirmed-alive current
+controller. Only a route referencing `{endpoint}` also requires a verified endpoint
+with both socket and pane; label/session routes can reach sessions outside tmux.
+An unavailable route records no sent key, and a later reconcile retries.
+Routes without these placeholders still
 send to their configured human destination. The controller is resolved afresh for
 each send attempt, outside project locks; the selected snapshot defines that send's
 recipient. A handoff after the send starts cannot retract it; the next reconcile

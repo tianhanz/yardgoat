@@ -79,7 +79,7 @@
      }
     }
    ],
-   "description": "Route names must be unique. Controller fields require a live controller and verified endpoint for project-owned cards. Endpoint is compact JSON with socket and pane_id; controller fields are empty for legacy cards."
+   "description": "Route names must be unique. Controller fields require a live controller for project-owned cards. Only endpoint requires a verified socket and pane_id; label/session routes work outside tmux. Endpoint is compact JSON; controller fields are empty for legacy cards."
   }
  },
  "$defs": {

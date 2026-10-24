@@ -179,6 +179,11 @@ step. The reconciler continues automatic verification, review, repair and delive
 as `reconciler`, recording `{project, epoch}` in `on_behalf_of`. Station claim/finish,
 answer and approval keep their existing rules.
 
+Verification receipts preserve the verifier's session/epoch or system
+`on_behalf_of` snapshot. Recovery of a delivery result is attributed to the
+reconciler, with the original grant in `execution_control`, including when a new
+controller invokes `deliver` or `archive` to recover it.
+
 Status and inbox show the project, current controller/epoch and transfer state.
 `whoami` includes per-project unfinished-card counts and a total. Reports grouped
 by project use the role reference. See the [operation permission table](docs/design.md#project-owned-tasks-and-operation-permissions).
@@ -329,6 +334,10 @@ transfer those follow-ups and record their ownership history. A follow-up taken 
 is not overwritten: the parent parks with the task and owner to coordinate. Explicitly align
 that follow-up's owner with the parent, then answer the parent to retry. After the round is
 processed, its follow-ups remain independent tasks.
+If a legacy parent is bound to a project during a partial round, replay validates
+each accepted follow-up against its original frozen content and parent relation,
+then inherits the project role in task state. An independent takeover or conflicting
+project binding still needs explicit coordination; historical specs and hashes stay intact.
 
 `inbox` reports a removed pool only when an unfinished task still refers to it. Historical
 verified, archived and exhausted tasks do not trigger that pool warning; `status <task-id>`
@@ -387,8 +396,10 @@ For independent routes, `notify` also accepts a list:
 Project routes can use `{controller}`, `{controller_session}` and `{endpoint}` in
 both command and recipient templates. The endpoint is compact JSON containing
 `socket` and `pane_id`. Use `recipient: "{controller_session}"` to send a pending
-question once to each current controller after handoff. Such a route waits without
-recording success if the controller is not alive or its endpoint is unverified;
+question once to each current controller after handoff. These routes require a live
+controller; only a template using `{endpoint}` additionally requires a verified
+socket and pane. A session outside tmux can receive a `{controller_session}` route.
+Unavailable routes wait without recording success and retry at the next reconcile;
 a fixed human route still sends. These three values are empty for legacy tasks.
 
 Unknown placeholders or malformed formatting disable only the affected route.

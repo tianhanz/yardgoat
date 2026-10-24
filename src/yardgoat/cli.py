@@ -678,8 +678,9 @@ def _do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -
             return refuse(f"frozen files changed during verification: {changed}"), None
         rec_p = rd / "receipt.json"
         rec = json.loads(rec_p.read_text())
+        verification_control = control.audit(st)
         rec["verifier"] = {"command": spec["verifier"]["command"], "exit_code": rc, "result": verdict,
-                           "checked_at": checked, "checked_by": who}
+                           "checked_at": checked, "checked_by": who, **verification_control}
         if verdict == "PASS":
             rec["status"] = "passed"; last["state"] = "verified"; st["status"] = "verified"
             if review_findings is not None:
@@ -697,7 +698,8 @@ def _do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -
             rec["status"] = "verifier_error"; last["state"] = "verify_error"
         write_json(rec_p, rec)
         st["verdict"] = {"run_id": last["run_id"], "verdict": verdict, "by": who, "at": checked}
-    td.event("run.verified", who, run_id=last["run_id"], verdict=verdict, note=actor_note)
+    td.event("run.verified", who, control_fields=verification_control,
+             run_id=last["run_id"], verdict=verdict, note=actor_note)
     delivery_rc = 0
     if verdict == "PASS":
         if spec.get("review"):

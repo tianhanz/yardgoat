@@ -32,7 +32,7 @@ def template_fields(template):
     return fields
 
 
-def controller_values(state):
+def controller_values(state, *, require_endpoint=False):
     values = dict.fromkeys(CONTROLLER_FIELDS, "")
     project = (state.get("owner_ref") or {}).get("project")
     if not project:
@@ -40,14 +40,16 @@ def controller_values(state):
     ps = projects.show(project)
     sid = ps["controller"]["session_id"]
     rec = sessions.record(sid)
-    if not rec or sessions.liveness(rec) != "alive" or not rec.get("endpoint", {}).get("verified"):
+    if not rec or sessions.liveness(rec) != "alive":
         return None
-    endpoint = rec["endpoint"]
-    if not endpoint.get("socket") or not endpoint.get("pane_id"):
+    values.update(controller=rec["label"], controller_session=sid)
+    endpoint = rec.get("endpoint") or {}
+    verified = endpoint.get("verified") and endpoint.get("socket") and endpoint.get("pane_id")
+    if require_endpoint and not verified:
         return None
-    values.update(controller=rec["label"], controller_session=sid,
-                  endpoint=json.dumps({k: endpoint[k] for k in ("socket", "pane_id")},
-                                      ensure_ascii=False, separators=(",", ":")))
+    if verified:
+        values["endpoint"] = json.dumps({k: endpoint[k] for k in ("socket", "pane_id")},
+                                       ensure_ascii=False, separators=(",", ":"))
     return values
 
 
@@ -75,7 +77,8 @@ def _hint(task_id, status, owner):
     return f"yardgoat status {task} --json"
 
 
-def _notify_one(task_id, command, on, *, name="default", recipient=None, legacy=True, errors=None, controller_route=False, config_error=None):
+def _notify_one(task_id, command, on, *, name="default", recipient=None, legacy=True, errors=None,
+                controller_route=False, require_endpoint=False, config_error=None):
     directory = home() / "notified"
     directory.mkdir(parents=True, exist_ok=True)
     # A separate per-task lock serializes concurrent reconcilers without holding schedule/task locks
@@ -95,7 +98,7 @@ def _notify_one(task_id, command, on, *, name="default", recipient=None, legacy=
         values = {"task_id": task_id, "status": status, "owner": owner, "question": question[:500],
                   "hint": _hint(task_id, status, owner)}
         if controller_route:
-            current = controller_values(state)
+            current = controller_values(state, require_endpoint=require_endpoint)
             if current is None:
                 return None  # no guessed endpoint and no sent key; try next reconcile
             values.update(current)
@@ -166,7 +169,8 @@ def _routes(settings):
                 fields.update(template_fields(template))
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             problem = str(exc)
-        routes.append({"controller_route": bool(fields & CONTROLLER_FIELDS), "config_error": problem,
+        routes.append({"controller_route": bool(fields & CONTROLLER_FIELDS),
+                       "require_endpoint": "endpoint" in fields, "config_error": problem,
                        "name": name, "command": command, "on": on, "recipient": item.get("recipient"),
                        "legacy": single and "recipient" not in item})
     return routes

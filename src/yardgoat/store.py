@@ -91,9 +91,11 @@ class TaskDir:
                 return spec
         return read_json(self.path / "spec.json")
 
-    def event(self, kind: str, actor: str, **data) -> dict:
+    def event(self, kind: str, actor: str, *, control_fields: dict | None = None, **data) -> dict:
         from . import control
-        audit = control.event_fields(self)
+        # Durable results may supply their original snapshot, including an empty
+        # snapshot for legacy records. Never fill those with the current caller.
+        audit = control.event_fields(self) if control_fields is None else dict(control_fields)
         if audit.get("actor") == "reconciler":
             # Receipt replay is a system action. Preserve the original grant as
             # provenance, rather than impersonating the session that issued it.

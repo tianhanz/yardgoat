@@ -267,7 +267,74 @@
   },
   "execution_control": {
    "type": "object",
-   "description": "Original execution grant audit when the reconciler replays a prior session's delivery result."
+   "description": "Original delivery execution grant (session/epoch or system on_behalf_of) preserved separately from the system recovery actor.",
+   "properties": {
+    "actor_session": {
+     "type": "string",
+     "pattern": "^s-[0-9a-f]{64}$",
+     "description": "Mechanically identified manual controller."
+    },
+    "epoch": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "on_behalf_of": {
+     "type": "object",
+     "required": [
+      "project",
+      "epoch"
+     ],
+     "additionalProperties": false,
+     "properties": {
+      "project": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+      },
+      "epoch": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "description": "System executor's project/term; actor is reconciler, without an impersonated actor_session."
+    }
+   }
+  },
+  "replayed_by": {
+   "type": "object",
+   "description": "Caller that recovered a frozen review confirmation; the event itself retains the original confirmer identity.",
+   "properties": {
+    "actor": {
+     "type": "string"
+    },
+    "actor_session": {
+     "type": "string",
+     "pattern": "^s-[0-9a-f]{64}$",
+     "description": "Mechanically identified manual controller."
+    },
+    "epoch": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "on_behalf_of": {
+     "type": "object",
+     "required": [
+      "project",
+      "epoch"
+     ],
+     "additionalProperties": false,
+     "properties": {
+      "project": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+      },
+      "epoch": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "description": "System executor's project/term; actor is reconciler, without an impersonated actor_session."
+    }
+   }
   }
  }
 }

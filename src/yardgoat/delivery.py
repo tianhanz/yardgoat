@@ -125,7 +125,7 @@ def reserve_locked(st: dict, spec: dict, who: str, records=(), replace=False) ->
                                   "run_id": st["verdict"]["run_id"], "at": now()}
 
 
-def replay_finished(td: TaskDir, run_id: str, records: list[dict]) -> None:
+def replay_finished(td: TaskDir, run_id: str, records: list[dict], *, recovering=True) -> None:
     """Receipt is the outbox; replay before skipping success or replacing a failed attempt."""
     events = td.events()
     for record in records:
@@ -135,8 +135,21 @@ def replay_finished(td: TaskDir, run_id: str, records: list[dict]) -> None:
                and e.get("step") == record["step"] and e.get("attempt") == record["attempt"] for e in events):
             continue
         event_id = f"{td.task_id}:{run_id}:on_pass:{record['step']}:{record['attempt']}:finished"
-        events.append(td.event("task.on_pass_finished", record["by"], run_id=run_id, event_id=event_id,
-                               **{k: v for k, v in record.items() if k != "by"}))
+        fields = {k: v for k, v in record.items() if k != "by"}
+        origin = {k: fields.pop(k) for k in ("actor_session", "epoch", "on_behalf_of") if k in fields}
+        if recovering:
+            # Recovery is a system action even when deliver/archive invoked it.
+            # Do not merge a new controller's ticket with the old execution grant.
+            with control.system():
+                audit = control.event_fields(td)
+            if origin:
+                fields["execution_control"] = origin
+        else:
+            audit = origin
+            if "on_behalf_of" in origin:
+                audit = {"actor": "reconciler", **origin}
+        events.append(td.event("task.on_pass_finished", record["by"], control_fields=audit,
+                               run_id=run_id, event_id=event_id, **fields))
 
 
 class Journal:
@@ -176,8 +189,8 @@ class Journal:
                 log.seek(max(0, path.stat().st_size - 4000))
                 record["output_tail"] = log.read().decode("utf-8", errors="replace")
 
-    def replay(self):
-        replay_finished(self.td, self.run_id, self.records)
+    def replay(self, *, recovering=True):
+        replay_finished(self.td, self.run_id, self.records, recovering=recovering)
 
     def recover(self, who, wait=False, assume_stopped=False, release=False) -> str | None:
         self.replay()
@@ -335,7 +348,7 @@ def run_locked(td: TaskDir, st: dict, spec: dict, who: str, cfg: dict, assume_st
         # The terminal result and release land together, before result-event replay.
         terminal = record["exit_code"] != 0 or index == len(actions) - 1
         journal.save(grant_refused, release=terminal)
-        journal.replay()
+        journal.replay(recovering=False)
         if grant_refused:
             return 3
         if record["exit_code"] != 0:

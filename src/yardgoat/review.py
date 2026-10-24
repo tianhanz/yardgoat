@@ -175,6 +175,7 @@ def confirm_channel(td: TaskDir, st: dict, who: str, run_channels: list) -> dict
     auth = read_json(td.frozen_path) if td.frozen_path.exists() else {
         "spec": spec, "content_hash": st["content_hash"], "frozen": st["frozen"]}
     record = auth.get("review_confirmation")
+    replaying = record is not None
     supplied = {}
     runs = {r["run_id"]: r for r in st["runs"]}
     for rid, host, lane in run_channels:
@@ -210,7 +211,7 @@ def confirm_channel(td: TaskDir, st: dict, who: str, run_channels: list) -> dict
             problem = workspace_problem(spec, cfg, number, st.get("review_reservation", {}).get("write_set", []))
             if problem:
                 raise contract.SpecError(problem)
-        record = {"by": who, "at": now(), "channel": spec["review"]["channel"],
+        record = {"by": who, "at": now(), "control": control.audit(st), "channel": spec["review"]["channel"],
                   "run_channels": identities, "confirmed_run_channels": supplied}
     # Repeat confirmation replays the original record, even after pool config changes.
     for rid, identity in supplied.items():
@@ -228,8 +229,12 @@ def confirm_channel(td: TaskDir, st: dict, who: str, run_channels: list) -> dict
         runs[rid]["channel_confirmation"] = {"by": record["by"], "at": record["at"]}
     key = f"{td.task_id}:review-channel-confirmed"
     if not any(e.get("event_id") == key for e in td.events()):
+        # The frozen confirmation is the outbox. A later controller can repair
+        # its event, but cannot become the original confirmer by doing so.
+        replay = {"replayed_by": {"actor": who, **control.audit(st)}} if replaying else {}
         td.event("task.review_channel_confirmed", record["by"], event_id=key,
-                 **{k: v for k, v in record.items() if k != "by"})
+                 control_fields=record.get("control", {}),
+                 **{k: v for k, v in record.items() if k not in ("by", "control")}, **replay)
     return record
 
 
@@ -283,27 +288,43 @@ def event_once(td: TaskDir, kind: str, key: str, **fields) -> None:
 
 def accept_generated(raw: dict, owner: str, assets: Path, owner_ref=None) -> TaskDir:
     """Idempotent internal submit, under schedule lock; never overwrite a foreign id."""
-    if owner_ref:
-        raw = {**raw, "owner": dict(owner_ref)}
-    spec = contract.normalize(raw, assets)
-    frozen = contract.freeze(spec)
-    h = contract.content_hash(spec, frozen)
-    td = TaskDir(spec["task_id"])
+    from . import cli
+    td = TaskDir(raw["task_id"])
     with td.locked() as box:
         if box["state"] is not None:
+            accepted = td.spec()
+            # Binding only changes state. Compare the original frozen role field,
+            # while all other content (including the exact parent relation) must
+            # still match. Ownership inheritance is checked separately below.
+            for relation in ("review_of", "review_followup"):
+                if accepted.get(relation) != raw.get(relation):
+                    raise contract.SpecError(f"generated review task id already exists with another relation: {td.task_id}")
+            raw = {k: v for k, v in raw.items() if k != "owner"}
+            if "owner" in accepted:
+                raw["owner"] = accepted["owner"]
+            spec = contract.normalize(raw, assets)
+            frozen = contract.freeze(spec)
+            h = contract.content_hash(spec, frozen)
             if box["state"]["content_hash"] != h:
                 raise contract.SpecError(f"generated review task id already exists with different content: {td.task_id}")
+            changed = cli.checked_drift(td, box["state"])
+            if changed:
+                raise contract.SpecError(f"generated review task frozen files changed: {td.task_id}: {changed}")
         else:
             if owner_ref:
+                raw = {**raw, "owner": dict(owner_ref)}
                 owner = control.current_label(owner_ref["project"])
+            spec = contract.normalize(raw, assets)
+            frozen = contract.freeze(spec)
+            h = contract.content_hash(spec, frozen)
             write_json(td.path / "spec.json", spec)
             td.frozen_path.parent.mkdir(parents=True, exist_ok=True)
             write_json(td.frozen_path, {"content_hash": h, "frozen": frozen, "spec": spec})
             box["state"] = {"task_id": td.task_id, "content_hash": h, "frozen": frozen, "owner": owner,
                             "owner_history": [], "status": "accepted", "runs": [], "verdict": None,
                             "question": None, "accepted_at": now()}
-        if owner_ref:
-            box["state"]["owner_ref"] = dict(owner_ref)
+            if owner_ref:
+                box["state"]["owner_ref"] = dict(owner_ref)
     event_once(td, "task.accepted", td.task_id + ":accepted", content_hash=h)
     return td
 
@@ -425,23 +446,30 @@ def initial_owner(st: dict) -> str:
 
 
 def sync_followup_owner(td: TaskDir, st: dict, row: dict, child: TaskDir, link: dict) -> str | None:
-    if st.get("owner_ref"):
-        return None if child.state().get("owner_ref") == st["owner_ref"] else "follow-up role differs from parent"
     with child.locked() as box:
         cs = box["state"]
         relation = child.spec().get("review_followup", {})
         if relation.get("task_id") != td.task_id or relation.get("round") != row["round"]:
             return f"follow-up id already exists for another task: {child.task_id}"
+        if cs.get("owner_ref"):
+            return (None if cs["owner_ref"] == st.get("owner_ref") else
+                    f"follow-up {child.task_id} role differs from parent; coordinate ownership before retrying")
+        if cs["owner"] != st["owner"]:
+            expected = link["owner"]
+            for move in cs["owner_history"]:
+                if move.get("parent") != td.task_id or move["from"] != expected:
+                    return (f"follow-up {child.task_id} independently taken over by {cs['owner']}; "
+                            f"coordinate ownership with {st['owner']} before retrying this round")
+                expected = move["to"]
+            if cs["owner"] != expected:
+                return f"follow-up {child.task_id} owner is {cs['owner']}; coordinate ownership before retrying"
+        if st.get("owner_ref"):
+            cs["owner_ref"] = dict(st["owner_ref"])
+            child.event("task.project_bound", "reconciler", parent=td.task_id, owner_ref=cs["owner_ref"],
+                        control_fields=control.audit(cs))
+            return None
         if cs["owner"] == st["owner"]:
             return None
-        expected = link["owner"]
-        for move in cs["owner_history"]:
-            if move.get("parent") != td.task_id or move["from"] != expected:
-                return (f"follow-up {child.task_id} independently taken over by {cs['owner']}; "
-                        f"coordinate ownership with {st['owner']} before retrying this round")
-            expected = move["to"]
-        if cs["owner"] != expected:
-            return f"follow-up {child.task_id} owner is {cs['owner']}; coordinate ownership before retrying"
         previous = cs["owner"]
         move = {"from": previous, "to": st["owner"], "at": now(), "parent": td.task_id,
                 "run_in_flight": (cs["runs"] or [{}])[-1].get("run_id")}
