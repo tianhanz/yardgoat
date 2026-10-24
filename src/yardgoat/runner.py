@@ -108,7 +108,7 @@ def launch_daemon(me: list[str], cfg: dict, root: str, window: str, linger: int 
         if k in os.environ:
             envs[k] = os.environ[k]
     session = cfg.get("tmux_session")
-    if session and shutil.which("tmux") and not os.environ.get("YARDGOAT_NO_TMUX"):
+    if session and shutil.which(tmux_argv(cfg)[0]) and not os.environ.get("YARDGOAT_NO_TMUX"):
         cmd = " ".join(f"{k}={shlex.quote(v)}" for k, v in envs.items()) + " " + shlex.join(me)
         if linger:
             cmd += f"; echo '[yardgoat] finished; window closes in {linger}s'; sleep {linger}"
@@ -127,7 +127,9 @@ def tmux_argv(cfg: dict) -> list[str]:
     """tmux with an explicit server socket. Cron and interactive shells reach different tmux servers when relying on
     $TMUX, so the socket comes from the local config (tmux_socket), falling back to the caller's $TMUX socket."""
     sock = cfg.get("tmux_socket") or (os.environ.get("TMUX", "").split(",")[0] or None)
-    return ["tmux", "-S", os.path.expanduser(sock)] if sock else ["tmux"]
+    # tmux_bin: the client must speak the same protocol as the running server; PATH differs between cron and shells
+    binary = os.path.expanduser(cfg.get("tmux_bin") or "tmux")
+    return [binary, "-S", os.path.expanduser(sock)] if sock else [binary]
 
 
 def launch_env_fingerprint(cfg: dict) -> str:

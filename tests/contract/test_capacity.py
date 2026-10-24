@@ -82,6 +82,7 @@ def test_tmux_socket_comes_from_config_not_the_callers_environment(env):
     setenv(env)
     from yardgoat import runner
     assert runner.tmux_argv({"tmux_socket": "/tmp/some/sock"}) == ["tmux", "-S", "/tmp/some/sock"]
+    assert runner.tmux_argv({"tmux_socket": "/tmp/s", "tmux_bin": "/opt/tmux"}) == ["/opt/tmux", "-S", "/tmp/s"]
     os.environ.pop("TMUX", None)
     assert runner.tmux_argv({}) == ["tmux"]
 
