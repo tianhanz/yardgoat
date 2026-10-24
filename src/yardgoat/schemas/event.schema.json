@@ -38,7 +38,8 @@
     "task.approved",
     "task.approval_invalidated",
     "task.on_pass_started",
-    "task.on_pass_finished"
+    "task.on_pass_finished",
+    "task.delivery_assumed_stopped"
    ]
   },
   "actor": {
@@ -158,6 +159,42 @@
    "type": "number"
   },
   "interrupted": {
+   "type": "boolean"
+  },
+  "process_identity": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "properties": {
+    "start_ticks": {
+     "type": "string"
+    },
+    "boot_id": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "start_ticks",
+    "boot_id"
+   ]
+  },
+  "launch_protocol": {
+   "type": "integer"
+  },
+  "write_set": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  },
+  "assumed_stopped_by": {
+   "type": "string"
+  },
+  "assumed_stopped_at": {
+   "type": "string"
+  },
+  "assume_stopped": {
    "type": "boolean"
   }
  }

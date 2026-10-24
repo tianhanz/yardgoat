@@ -51,7 +51,7 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 15. **Concurrency.** Every "check capacity, then start" decision (dispatch, reconcile, station scheduling) holds one
     machine-wide schedule lock; lock order is schedule → pool → task. Outcomes are committed exactly once, receipt and
     state together under the task lock; a late or duplicate outcome is ignored, and a receipt whose state never got
-    written is replayed by `reconcile`. Archive also takes schedule → task locks, so it cannot revoke a verified
+    written is replayed by `reconcile`. Archive takes delivery → schedule → task locks, so it cannot revoke a verified
     dependency between the final dependency check and start/claim. Other mutation paths either refuse verified
     tasks or preserve their status; verifier failure/exhaustion starts from an unverified task and does not revoke
     eligibility. The potentially slow verifier remains outside the schedule lock.
@@ -217,14 +217,45 @@ short task locks and preserve current ownership/status. If ownership or status c
 that step may finish, but later steps stop until the current owner explicitly resumes. Concurrent
 deliver calls serialize on the delivery mutex without holding the global scheduler lock.
 
-Each attempt records its PGID and absolute deadline in the receipt before the shell is allowed to run.
-A pipe grant gates shell execution: controller death before the durable record closes the pipe and
-prevents command execution. On recovery, a live old process group refuses retry with its PGID and
-deadline; after that deadline, deliver kills the group and confirms it has no live members before retry.
-The reservation stays until completion or confirmed termination; after controller death, explicit
-`deliver` is the recovery operation (there is no independent timeout supervisor). Shell exit alone does
-not release the write set while background children remain alive. Timeout kills the entire group and
-records exit 124; an interrupted attempt whose group has exited records 125; startup errors record 127.
+Each new attempt records `launch_protocol: 2`, its PGID, group leader's `/proc/<pid>/stat` field 22
+(`process_identity.start_ticks`), Linux boot ID, absolute deadline and canonical write set before the
+shell is allowed to run. A pipe grant gates execution: controller death before the durable record
+closes the pipe and prevents command execution. A small delivery worker stays as the identifiable
+group leader until the shell and all non-zombie members of its group exit, including background
+children left after shell exit. Its TERM handler keeps the leader available for identity checks before
+KILL; child commands retain normal signal handling. Commands that deliberately escape the process
+group are outside this local process-group contract.
+
+Recovery skips persisted successes before inspecting any historical process fields. For unfinished
+attempts, only an exact boot ID/start-time match authorizes waiting or signalling; a reused PGID does
+not identify the old attempt. Every signal, including escalation, rechecks identity. A live matching
+group refuses retry until its deadline; then delivery cleanup terminates it and confirms exit before
+releasing the reservation. Timeout records exit 124; an interrupted attempt whose group has exited
+records 125; startup errors record 127.
+
+Recovery preserves the old persisted write set. Any newly resolved paths (for example after a scope
+symlink changes target) are added as a union under the schedule lock. Only after old attempts are
+confirmed stopped, when a new attempt is actually prepared, can the reservation be replaced with
+the new write set; conflicts are rechecked in that same schedule → task section.
+
+`reconcile` performs pure cleanup before taking its scheduling lock, using a nonblocking delivery
+mutex acquisition for each task. It skips active controllers, retains live orphan reservations until
+the deadline, and releases stopped attempts without automatically rerunning commands. `archive`
+acquires delivery first, waits for any existing controller and orphan group to finish (or reach its
+deadline and be terminated), and only then archives under schedule → task. Neither path waits while
+holding the global schedule/task locks. Cleanup includes already archived tasks; `deliver` on an
+archived task is cleanup only. Terminal progress fields and reservation release share one task-state
+commit. If receipt writing succeeds but that commit is interrupted, reconcile/archive/explicit
+delivery recover the receipt, replay missing result events and finish releasing the reservation.
+
+Legacy unfinished records without process identity and without `finished_at` are unknown, never
+automatically retried or released. They preserve (or reconstruct) conservative scope reservations
+and appear in inbox with “旧版本留下的收尾记录，进程状态未知”, including older archived records.
+After confirming old processes have stopped, the current owner can use `deliver --assume-stopped`.
+The human assertion is recorded as `task.delivery_assumed_stopped` before release or retry, with
+actor, run, step and attempt. It cannot override a known live process. Legacy successful records
+still skip normally. Only a new-protocol record with no PGID can prove the command had no grant.
+
 Combined stdout/stderr goes to `runs/<run>/on-pass-<step>-<attempt>.log`; the last 4000 bytes are decoded
 into `output_tail` in the receipt and `task.on_pass_finished` event. `task.on_pass_started` records each
 start. Records also carry the step number, command, cwd, owner, attempt, timestamps and timeout flag.

@@ -576,10 +576,35 @@ def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) ->
     return (delivery_rc if verdict == "PASS" else (1 if verdict == "FAIL" else 2)), verdict
 
 
-def do_deliver(td: TaskDir, who: str, echo: bool = False) -> int:
+def do_deliver(td: TaskDir, who: str, echo: bool = False, assume_stopped: bool = False) -> int:
     # Delivery contenders wait outside schedule/task locks. Only the reservation needs
     # schedule → task; the long shell command holds neither, so unrelated work can start.
     with delivery.locked(td):
+        current = td.state()
+        if current["owner"] != who:
+            return refuse(f"owner is {current['owner']}, not {who}")
+        if current["status"] == "archived":
+            # Old archives can contain orphan reservations. This path only cleans
+            # up; it never grants permission to execute another delivery step.
+            reason = delivery.cleanup_locked(td, who, assume_stopped=assume_stopped)
+            if reason:
+                return refuse(reason)
+            if echo:
+                print(json.dumps({"task_id": td.task_id, "result": "delivery-cleaned"}))
+            return 0
+        spec = td.spec()
+        if current["status"] == "verified" and (current.get("verdict") or {}).get("verdict") == "PASS":
+            progress = delivery.view(td, current, spec)
+            if any(r.get("exit_code") != 0 and not r.get("finished_at") for r in progress["on_pass"]):
+                # Recover old execution before admission checks for a NEW one.
+                # Even a conflicting/revoked preflight must protect legacy writers
+                # that predate delivery_reservation, and may already be running.
+                reason = delivery.Journal(td, current, spec).recover(who, assume_stopped=assume_stopped)
+                if reason:
+                    if echo:
+                        print(json.dumps({"task_id": td.task_id, "result": "delivery_failed",
+                                          **delivery.view(td, td.state(), spec)}, ensure_ascii=False))
+                    return refuse(reason)
         with pool.schedule_lock(), td.locked() as box:
             st = box["state"]
             if st["owner"] != who:
@@ -606,10 +631,9 @@ def do_deliver(td: TaskDir, who: str, echo: bool = False) -> int:
                 delivery.problem_locked(td, st, reason)
                 return refuse(reason)
             if spec.get("on_pass"):
-                st["delivery_reservation"] = {"write_set": scheduling.write_set(spec), "by": who,
-                                              "run_id": st["verdict"]["run_id"], "at": now()}
+                delivery.reserve_locked(st, spec, who)
         try:
-            rc = delivery.run_locked(td, st, spec, who, cfg)
+            rc = delivery.run_locked(td, st, spec, who, cfg, assume_stopped=assume_stopped)
         except (contract.SpecError, ValueError, OSError) as exc:
             with td.locked() as box:
                 delivery.problem_locked(td, box["state"], str(exc))
@@ -623,7 +647,8 @@ def do_deliver(td: TaskDir, who: str, echo: bool = False) -> int:
 
 def cmd_deliver(a) -> int:
     td = TaskDir(a.task_id)
-    return do_deliver(td, a.as_, echo=True) if td.exists else refuse(f"unknown task {a.task_id}")
+    return do_deliver(td, a.as_, echo=True, assume_stopped=getattr(a, "assume_stopped", False)) \
+        if td.exists else refuse(f"unknown task {a.task_id}")
 
 
 def cmd_park(a) -> int:
@@ -681,9 +706,9 @@ def cmd_inbox(a) -> int:
         if ad.get("kind") == "pool" and not pool.pools(cfg).get(ad["pool"]):
             missing_pools.add(ad["pool"])
         progress = delivery.view(td, st, td.spec())
-        if st["status"] == "verified" and progress["delivery_pending"]:
+        if progress["delivery_pending"] and (st["status"] == "verified" or progress["delivery_unknown"]):
             reason = progress["delivery_reason"]
-            items.append({"task_id": t, "status": "verified", "owner": st["owner"],
+            items.append({"task_id": t, "status": st["status"], "owner": st["owner"],
                           "delivery_failed": True, "reason": reason, "question": reason})
             continue
         if st["status"] not in ("archived", "verified", "exhausted") and td.spec().get("risk") == "l3":
@@ -722,6 +747,22 @@ def cmd_reconcile(a) -> int:
     cfg = runner.config()
     report = []
     to_close = []
+    # Pure delivery recovery runs BEFORE acquiring schedule, and never waits for
+    # an active controller. Include archived tasks and receipt-first crash states.
+    for t in list_tasks():
+        td = TaskDir(t)
+        st, spec = td.state(), td.spec()
+        if not st.get("delivery_reservation") and not delivery.view(td, st, spec)["delivery_pending"]:
+            continue
+        with delivery.locked(td, blocking=False) as acquired:
+            if not acquired:
+                continue
+            reserved = bool(td.state().get("delivery_reservation"))
+            reason = delivery.cleanup_locked(td, "reconciler")
+            if reserved and not td.state().get("delivery_reservation"):
+                report.append({"task_id": t, "delivery_reservation_released": True})
+            elif reason:
+                report.append({"task_id": t, "delivery_reason": reason})
     with pool.schedule_lock():
         for t in list_tasks():
             td = TaskDir(t)
@@ -828,15 +869,26 @@ def cmd_archive(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
         return refuse(f"unknown task {a.task_id}")
-    # Archiving revokes verified dependencies; serialize it with gate → reserve → start.
-    with pool.schedule_lock(), td.locked() as box:
-        st = box["state"]
+    # Wait for delivery without holding schedule/task, including orphan groups
+    # until their deadline. A legacy unknown process must first be acknowledged.
+    with delivery.locked(td):
+        st = td.state()
         if st["owner"] != a.as_:
             return refuse(f"owner is {st['owner']}, not {a.as_}")
         if _active_run(st):
             return refuse("a run is in flight")
-        st["archived"] = {"from_status": st["status"], "reason": a.reason, "by": a.as_, "at": now()}
-        st["status"] = "archived"
+        reason = delivery.cleanup_locked(td, a.as_, wait=True)
+        if reason:
+            return refuse(reason)
+        # Archiving revokes verified dependencies; serialize with gate → start.
+        with pool.schedule_lock(), td.locked() as box:
+            st = box["state"]
+            if st["owner"] != a.as_:
+                return refuse(f"owner is {st['owner']}, not {a.as_}")
+            if _active_run(st):
+                return refuse("a run is in flight")
+            st["archived"] = {"from_status": st["status"], "reason": a.reason, "by": a.as_, "at": now()}
+            st["status"] = "archived"
     td.event("task.archived", a.as_, reason=a.reason)
     print(json.dumps({"task_id": td.task_id, "result": "archived"}))
     return 0
@@ -1109,6 +1161,8 @@ def main(argv=None) -> int:
     s = sub.add_parser("approve"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s.add_argument("--note")
     s = sub.add_parser("deliver"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
+    s.add_argument("--assume-stopped", action="store_true",
+                   help="record owner confirmation that unidentified legacy delivery processes have stopped")
     s = sub.add_parser("park"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s.add_argument("--question", required=True)
     s = sub.add_parser("answer"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)

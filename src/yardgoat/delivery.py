@@ -4,20 +4,70 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from . import contract, runner
 from .store import TaskDir, now, read_json, write_json
 
+UNKNOWN_REASON = "旧版本留下的收尾记录，进程状态未知；确认旧进程已停止后用 deliver --assume-stopped 继续"
+
 
 @contextlib.contextmanager
-def locked(td: TaskDir):
-    # Take this BEFORE schedule → task; waiting for a slow delivery never holds either.
+def locked(td: TaskDir, blocking: bool = True):
+    # Take this BEFORE schedule → task; upkeep skips busy controllers, never waits
+    # for this mutex while holding the global schedule lock.
     with (td.path / ".delivery.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def process_identity(pgid) -> dict | None:
+    if not pgid:
+        return None
+    try:
+        fields = Path(f"/proc/{int(pgid)}/stat").read_text().rsplit(") ", 1)[1].split()
+        if fields[2] != str(pgid):
+            return None
+        return {"start_ticks": fields[19], "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def group_alive(record: dict) -> bool:
+    identity = record.get("process_identity")
+    return bool(identity and process_identity(record.get("pgid")) == identity
+                and runner.pgid_alive(record["pgid"]))
+
+
+def kill_group(record: dict, grace: float = 0.5) -> None:
+    # Recheck the full identity before EVERY signal, including escalation. The
+    # delivery worker retains its group-leader identity while descendants live.
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not group_alive(record):
+            return
+        try:
+            os.killpg(record["pgid"], sig)
+        except ProcessLookupError:
+            return
+        end = time.monotonic() + grace
+        while group_alive(record) and time.monotonic() < end:
+            time.sleep(0.02)
+
+
+def unknown(record: dict) -> bool:
+    if record.get("exit_code") == 0 or record.get("finished_at") or record.get("process_identity"):
+        return False
+    # Only the new grant protocol proves that a missing identity means the shell
+    # was never permitted to execute. Old formats cannot make this assertion.
+    return not (record.get("launch_protocol") == 2 and record.get("pgid") is None)
 
 
 def complete(actions: list[dict], records: list[dict]) -> bool:
@@ -41,8 +91,11 @@ def view(td: TaskDir, st: dict, spec: dict) -> dict:
             reason = receipt.get("delivery_reason", reason)
     pending = bool(spec.get("on_pass") and st.get("verdict", {})
                    and st["verdict"]["verdict"] == "PASS" and not complete(spec["on_pass"], records))
+    uncertain = pending and any(unknown(r) for r in records)
     return {"on_pass": records, "delivery_failed": pending, "delivery_pending": pending,
-            "delivery_reason": (reason or failure_reason(records) or "收尾未完成") if pending else None}
+            "delivery_unknown": bool(uncertain),
+            "delivery_reason": (UNKNOWN_REASON if uncertain else reason or failure_reason(records) or "收尾未完成")
+            if pending else None}
 
 
 def mark_pending(st: dict, receipt: dict, reason: str = "收尾未完成") -> None:
@@ -56,6 +109,19 @@ def problem_locked(td: TaskDir, st: dict, reason: str) -> None:
     receipt = read_json(path)
     mark_pending(st, receipt, reason)
     write_json(path, receipt)
+
+
+def reserve_locked(st: dict, spec: dict, who: str, records=(), replace=False) -> None:
+    """Caller owns schedule → task. Shrinking is allowed only at a new attempt."""
+    from . import scheduling
+    paths = set(scheduling.write_set(spec))
+    if not replace:
+        paths.update(st.get("delivery_reservation", {}).get("write_set", []))
+        for record in records:
+            if record.get("exit_code") != 0 and not record.get("finished_at"):
+                paths.update(record.get("write_set", []))
+    st["delivery_reservation"] = {"write_set": sorted(paths), "by": who,
+                                  "run_id": st["verdict"]["run_id"], "at": now()}
 
 
 def replay_finished(td: TaskDir, run_id: str, records: list[dict]) -> None:
@@ -72,96 +138,162 @@ def replay_finished(td: TaskDir, run_id: str, records: list[dict]) -> None:
                                **{k: v for k, v in record.items() if k != "by"}))
 
 
-def run_locked(td: TaskDir, st: dict, spec: dict, who: str, cfg: dict) -> int:
-    """Caller owns the delivery mutex and a durable write-set reservation, not the task lock."""
-    actions = spec.get("on_pass", [])
-    if not actions:
-        return 0
-    timeout = contract.positive_timeout(spec.get("on_pass_timeout", cfg.get("on_pass_timeout", 600)))
-    run_id = st["verdict"]["run_id"]
-    rd = td.run_dir(run_id)
-    receipt_path = rd / "receipt.json"
-    receipt = read_json(receipt_path)
-    if receipt.get("verifier", {}).get("result") != "PASS":
-        raise ValueError("on_pass requires a PASS receipt")
-    records = receipt.setdefault("on_pass", [])
+class Journal:
+    """The delivery mutex protects receipt progress; short commits preserve takeover."""
+    def __init__(self, td, st, spec):
+        self.td, self.st, self.spec = td, st, spec
+        self.run_id = st["verdict"]["run_id"]
+        self.rd = td.run_dir(self.run_id)
+        self.path = self.rd / "receipt.json"
+        self.receipt = read_json(self.path)
+        if self.receipt.get("verifier", {}).get("result") != "PASS":
+            raise ValueError("on_pass requires a PASS receipt")
+        self.records = self.receipt.setdefault("on_pass", [])
 
-    def save(reason=None, release=False):
-        pending = not complete(actions, records)
-        fields = {"on_pass": records, "delivery_pending": pending, "delivery_failed": pending,
-                  "delivery_reason": (reason or failure_reason(records) or "收尾未完成") if pending else None}
-        receipt.update(fields)
-        write_json(receipt_path, receipt)
-        with td.locked() as box:
-            # Never overwrite a takeover/archive that happened during the shell command.
-            box["state"].update(fields)
+    def save(self, reason=None, release=False, reserve=False):
+        from . import pool
+        pending = not complete(self.spec.get("on_pass", []), self.records)
+        fields = {"on_pass": self.records, "delivery_pending": pending, "delivery_failed": pending,
+                  "delivery_reason": (reason or failure_reason(self.records) or "收尾未完成") if pending else None}
+        # Result fields and reservation release share one task.json commit. Receipt
+        # remains first: upkeep can finish a crash between the two atomic files.
+        with pool.schedule_lock(), self.td.locked() as box:
+            self.receipt.update(fields)
+            write_json(self.path, self.receipt)
+            fresh = box["state"]
+            fresh.update(fields)
             if release:
-                box["state"].pop("delivery_reservation", None)
-        st.update(fields)
+                fresh.pop("delivery_reservation", None)
+            elif reserve:
+                reserve_locked(fresh, self.spec, fresh["owner"], self.records)
+        self.st.update(fields)
 
-    def tail(record):
-        path = rd / f"on-pass-{record['step']}-{record['attempt']}.log"
+    def tail(self, record):
+        path = self.rd / f"on-pass-{record['step']}-{record['attempt']}.log"
         if path.exists():
             with path.open("rb") as log:
                 log.seek(max(0, path.stat().st_size - 4000))
                 record["output_tail"] = log.read().decode("utf-8", errors="replace")
 
-    replay_finished(td, run_id, records)
+    def replay(self):
+        replay_finished(self.td, self.run_id, self.records)
+
+    def recover(self, who, wait=False, assume_stopped=False, release=False) -> str | None:
+        self.replay()
+        for record in self.records:
+            # A committed success is terminal, even with stale/reused PGID fields.
+            if record.get("exit_code") == 0 or record.get("finished_at"):
+                continue
+            if unknown(record):
+                if not assume_stopped:
+                    self.save(UNKNOWN_REASON, reserve=True)
+                    return UNKNOWN_REASON
+                # Log the human assertion BEFORE it enables any retry or release.
+                with self.td.locked() as box:
+                    owner = box["state"]["owner"]
+                    if owner == who:
+                        self.td.event("task.delivery_assumed_stopped", who, run_id=self.run_id,
+                                      step=record["step"], attempt=record["attempt"], assume_stopped=True,
+                                      reason=UNKNOWN_REASON)
+                if owner != who:
+                    reason = f"owner is {owner}, not {who}；{UNKNOWN_REASON}"
+                    self.save(reason, reserve=True)
+                    return reason
+                record["assumed_stopped_by"] = who
+                record["assumed_stopped_at"] = now()
+            else:
+                deadline = record.get("deadline", float("inf"))
+                while wait and group_alive(record) and time.time() < deadline:
+                    time.sleep(0.05)
+                if group_alive(record):
+                    if time.time() < deadline:
+                        reason = (f"等待收尾第 {record['step']} 步 {record['name']} 的进程组 "
+                                  f"{record['pgid']}，截止时间 {deadline}")
+                        self.save(reason, reserve=True)
+                        return reason
+                    kill_group(record)
+                    if group_alive(record):
+                        reason = f"收尾进程组 {record['pgid']} 超过截止时间 {deadline}，尚未确认退出"
+                        self.save(reason, reserve=True)
+                        return reason
+                    record.update(exit_code=124, timed_out=True)
+            if record.get("exit_code") is None:
+                record.update(exit_code=125, interrupted=True)
+            record["finished_at"] = now()
+            self.tail(record)
+            self.save()
+            self.replay()
+        self.save(release=release)
+        return None
+
+
+def cleanup_locked(td: TaskDir, who: str, wait=False, assume_stopped=False) -> str | None:
+    """Pure recovery, including archived tasks. Caller owns the delivery mutex."""
+    st, spec = td.state(), td.spec()
+    if (st.get("verdict") or {}).get("verdict") != "PASS" or not spec.get("on_pass"):
+        return None
+    return Journal(td, st, spec).recover(who, wait=wait, assume_stopped=assume_stopped, release=True)
+
+
+def run_locked(td: TaskDir, st: dict, spec: dict, who: str, cfg: dict, assume_stopped=False) -> int:
+    """Caller owns the delivery mutex and a durable reservation, not the task lock."""
+    from . import pool, scheduling
+    actions = spec.get("on_pass", [])
+    if not actions:
+        return 0
+    timeout = contract.positive_timeout(spec.get("on_pass_timeout", cfg.get("on_pass_timeout", 600)))
+    journal = Journal(td, st, spec)
+    if journal.recover(who, assume_stopped=assume_stopped):
+        return 3
+    records = journal.records
     for index, step in enumerate(actions):
         previous = records[index] if index < len(records) else None
-        if previous and runner.pgid_alive(previous.get("pgid")):
-            deadline = previous.get("deadline", float("inf"))
-            if time.time() < deadline:
-                save(f"等待收尾第 {index + 1} 步 {previous['name']} 的进程组 {previous['pgid']}，截止时间 {deadline}")
-                return 3  # reservation stays until the old group has actually exited
-            runner.kill_group(previous["pgid"], grace=0.5)
-            if runner.pgid_alive(previous["pgid"]):
-                save(f"收尾进程组 {previous['pgid']} 超过截止时间 {deadline}，尚未确认退出")
-                return 3
-            previous.update(exit_code=124, timed_out=True, finished_at=now())
-            tail(previous)
-            save()
-            replay_finished(td, run_id, records)
         if previous and previous.get("exit_code") == 0:
             continue
-        if previous and not previous.get("finished_at"):
-            previous.update(exit_code=125, finished_at=now(), interrupted=True)
-            tail(previous)
-            save()
-            replay_finished(td, run_id, records)
-        fresh = td.state()
-        if fresh["owner"] != who or fresh["status"] != "verified":
-            save(f"收尾暂停：当前 owner={fresh['owner']}，status={fresh['status']}", release=True)
+        # All old attempts have now been proved stopped. Recheck and replace the
+        # union only when actually preparing a fresh attempt, under the schedule lock.
+        with pool.schedule_lock(), td.locked() as box:
+            fresh = box["state"]
+            if fresh["owner"] != who or fresh["status"] != "verified":
+                reason = f"收尾暂停：当前 owner={fresh['owner']}，status={fresh['status']}"
+            else:
+                conflicts = scheduling.scope_conflicts(td.task_id, spec)
+                reason = "；".join(f"收尾撞了 {c['task_id']} 的 {c['path']}，它完成后可重试" for c in conflicts)
+            if not reason:
+                reserve_locked(fresh, spec, who, replace=True)
+                paths = fresh["delivery_reservation"]["write_set"]
+        if reason:
+            journal.save(reason, release=True)
             return 3
         record = {"step": index + 1, "name": step["name"], "command": step["command"],
                   "cwd": step.get("cwd", spec["workdir"]), "by": who, "started_at": now(),
                   "attempt": (previous or {}).get("attempt", 0) + 1,
                   "exit_code": None, "output_tail": "", "timed_out": False,
+                  "launch_protocol": 2, "process_identity": None, "write_set": paths,
                   "pgid": None, "deadline": time.time() + timeout}
         if previous is None:
             records.append(record)
         else:
             records[index] = record
-        save()
-        td.event("task.on_pass_started", who, run_id=run_id, **{k: v for k, v in record.items() if k != "by"})
-        log_path = rd / f"on-pass-{index + 1}-{record['attempt']}.log"
-        env = {**os.environ, "YARDGOAT_TASK_ID": td.task_id, "YARDGOAT_RUN_DIR": str(rd), "YARDGOAT_OWNER": who}
-        # The child cannot execute the shell until its PGID/deadline are durable. EOF on
-        # controller death before the grant exits harmlessly, closing the Popen/save gap.
-        gate = ("import os,sys; grant=sys.stdin.buffer.read(1); "
-                "sys.stdin.close(); "
-                "fd=os.open(os.devnull,os.O_RDONLY); os.dup2(fd,0); "
-                "os.execv('/bin/sh',['sh','-c',sys.argv[1]]) if grant==b'1' else sys.exit(125)")
+        journal.save()
+        td.event("task.on_pass_started", who, run_id=journal.run_id,
+                 **{k: v for k, v in record.items() if k != "by"})
+        log_path = journal.rd / f"on-pass-{index + 1}-{record['attempt']}.log"
+        env = {**os.environ, "YARDGOAT_TASK_ID": td.task_id,
+               "YARDGOAT_RUN_DIR": str(journal.rd), "YARDGOAT_OWNER": who}
         with log_path.open("wb") as log:
             try:
-                process = subprocess.Popen([sys.executable, "-c", gate, step["command"]],
+                process = subprocess.Popen([sys.executable, str(Path(__file__).with_name("delivery_worker.py")),
+                                            step["command"]],
                                            cwd=record["cwd"], env=env, stdin=subprocess.PIPE,
                                            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 record["pgid"] = process.pid
+                record["process_identity"] = process_identity(process.pid)
                 try:
-                    save()
-                    # Serialize the execution grant with takeover/archive, without holding
-                    # the task lock during the command or waiting under the scheduler lock.
+                    if record["process_identity"] is None:
+                        raise OSError("cannot identify delivery group leader; execution grant withheld")
+                    journal.save()
+                    # No shell runs before identity + deadline + write set are durable.
                     with td.locked() as box:
                         fresh = box["state"]
                         if fresh["owner"] == who and fresh["status"] == "verified":
@@ -171,28 +303,26 @@ def run_locked(td: TaskDir, st: dict, spec: dict, who: str, cfg: dict) -> int:
                     process.stdin.close()
                 try:
                     record["exit_code"] = process.wait(timeout=max(0, record["deadline"] - time.time()))
-                    # A shell can exit while background children still own the write set.
-                    while runner.pgid_alive(process.pid) and time.time() < record["deadline"]:
-                        time.sleep(0.05)
-                    if runner.pgid_alive(process.pid):
-                        raise subprocess.TimeoutExpired(step["command"], timeout)
                 except subprocess.TimeoutExpired:
-                    runner.kill_group(process.pid, grace=0.5)
-                    process.wait()
+                    kill_group(record)
+                    # Do not wait without a bound on a group that could not be stopped.
+                    if not group_alive(record):
+                        process.wait(timeout=1)
                     record.update(exit_code=124, timed_out=True)
             except OSError as exc:
                 record["exit_code"] = 127
                 log.write(str(exc).encode("utf-8", errors="replace"))
-        if runner.pgid_alive(record.get("pgid")):
+        if group_alive(record):
             record["exit_code"] = None
-            save(f"收尾进程组 {record['pgid']} 尚未确认退出，截止时间 {record['deadline']}")
+            journal.save(f"收尾进程组 {record['pgid']} 尚未确认退出，截止时间 {record['deadline']}")
             return 3
-        tail(record)
+        journal.tail(record)
         record["finished_at"] = now()
-        save()
-        replay_finished(td, run_id, records)
+        # The terminal result and release land together, before result-event replay.
+        terminal = record["exit_code"] != 0 or index == len(actions) - 1
+        journal.save(release=terminal)
+        journal.replay()
         if record["exit_code"] != 0:
-            save(release=True)
             return 1
-    save(release=True)
+    journal.save(release=True)
     return 0

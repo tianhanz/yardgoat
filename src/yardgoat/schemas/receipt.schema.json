@@ -214,6 +214,39 @@
      },
      "interrupted": {
       "type": "boolean"
+     },
+     "process_identity": {
+      "type": [
+       "object",
+       "null"
+      ],
+      "properties": {
+       "start_ticks": {
+        "type": "string"
+       },
+       "boot_id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "start_ticks",
+       "boot_id"
+      ]
+     },
+     "launch_protocol": {
+      "type": "integer"
+     },
+     "write_set": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "assumed_stopped_by": {
+      "type": "string"
+     },
+     "assumed_stopped_at": {
+      "type": "string"
      }
     }
    },
