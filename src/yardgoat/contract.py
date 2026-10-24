@@ -25,7 +25,7 @@ class SpecError(ValueError):
     pass
 
 
-def load_spec_file(path: str | Path) -> dict:
+def load_spec_file(path: str | Path, metadata_defaults: bool = True) -> dict:
     p = Path(path).expanduser().resolve()
     text = p.read_text(encoding="utf-8")
     if p.suffix in (".yaml", ".yml"):
@@ -38,7 +38,7 @@ def load_spec_file(path: str | Path) -> dict:
         spec = json.loads(text)
     if not isinstance(spec, dict):
         raise SpecError("spec must be a mapping")
-    return normalize(spec, base=p.parent)
+    return normalize(spec, base=p.parent, metadata_defaults=metadata_defaults)
 
 
 def _abs(base: Path, v: str) -> str:
@@ -46,7 +46,7 @@ def _abs(base: Path, v: str) -> str:
     return str(q if q.is_absolute() else (base / q).resolve())
 
 
-def normalize(spec: dict, base: Path) -> dict:
+def normalize(spec: dict, base: Path, metadata_defaults: bool = True) -> dict:
     s = json.loads(json.dumps(spec))  # deep copy, JSON-only types
     for k in ("task_id", "project", "goal", "card", "workdir", "executor", "verifier"):
         if k not in s:
@@ -79,9 +79,19 @@ def normalize(spec: dict, base: Path) -> dict:
         raise SpecError("budget.max_attempts must be an integer >= 1")
     if isinstance(mw, bool) or not isinstance(mw, (int, float)) or mw <= 0:
         raise SpecError("budget.max_wall_min must be a number > 0")
-    for k in ("outputs", "escalate_when", "allowed_lanes"):
+    for k in ("outputs", "escalate_when", "allowed_lanes", "scope"):
         if k in s and not (isinstance(s[k], list) and all(isinstance(x, str) for x in s[k])):
             raise SpecError(f"{k} must be a list of strings")
+    for p in s.get("scope", []):
+        if not p or Path(p).is_absolute() or ".." in Path(p).parts or p.startswith("~"):
+            raise SpecError("scope entries must be paths or globs relative to workdir")
+    if metadata_defaults:
+        s.setdefault("scope", [])
+        s.setdefault("risk", "l2")
+    if not isinstance(s.get("risk", "l2"), str) or s.get("risk", "l2") not in ("l1", "l2", "l3"):
+        raise SpecError("risk must be l1, l2 or l3")
+    if "acceptance" in s and not isinstance(s["acceptance"], str):
+        raise SpecError("acceptance must be a string")
     if not isinstance(v["command"], str) or not all(isinstance(x, str) for x in v["freeze"]):
         raise SpecError("verifier.command must be a string and verifier.freeze a list of paths")
     for k in ("host", "lane", "acct", "command", "sandbox"):

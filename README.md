@@ -40,6 +40,7 @@ For one-off work there is a one-liner that writes the card, a frozen verifier an
 ```bash
 yardgoat quick "Write the 200 smallest primes to out/primes.txt" --verify "test $(wc -l < out/primes.txt) -eq 200" --as me
 yardgoat quick "Fix the flaky test in tests/test_io.py" --verify "pytest -q tests/test_io.py" --pool research --as me
+yardgoat quick "Update the guide" --verify "test -s docs/guide.md" --scope docs/guide.md --risk l1 --acceptance "Guide describes the new command" --as me
 ```
 
 Pools reuse a warm agent session across cards — every card is queued first, and a station claims one after another:
@@ -97,6 +98,19 @@ An optional machine-local `notify` setting runs your own command for pending dec
 them. The question argument is limited to 500 characters. Successful reminders are remembered across
 reconciles; a new status or full question gets a new reminder. Failures log to stderr and retry next time.
 Without `notify`, no hook runs. Reconcile still emits one JSON document, with a `notified` array.
+
+Check the actual launch chain without calling a model:
+
+```bash
+yardgoat doctor --pool codex --json
+yardgoat doctor --host codex --lane fast --acct primary
+```
+
+Pools check automatically before starting stations, caching successful checks for `doctor_ttl_h` (default 12 hours).
+Failures leave cards queued and show their reasons in `status` and `inbox`. Model-provider refusals are recorded
+separately as `provider_refused`, with the matching log line, and do not spend an attempt. Local
+`provider_refusal_patterns` can override the default case-insensitive refusal/quota patterns; these tasks wait in
+the inbox for an explicit resend after rewording or changing the channel.
 
 ## Roadmap
 

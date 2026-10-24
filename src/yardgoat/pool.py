@@ -17,9 +17,9 @@ spec says `"auto_close": true`.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -129,7 +129,14 @@ def live_stations(name: str) -> list[dict]:
         if station_alive(s):
             res.append(s)
         elif s.get("state") == "running":
-            update_station(name, s["station"], only_if_state="running", state="gone", ended_at=now())
+            cfg = runner.config()
+            # A dead wrapper may never have recorded an initial provider rejection.
+            outcome = idle_outcome(name, s, cfg) if not s.get("current") else None
+            if outcome and outcome["state"] == "provider_refused":
+                pause_provider(name, s, cfg, outcome["reason"])
+            update_station(name, s["station"], only_if_state="running",
+                           state="provider_refused" if outcome and outcome["state"] == "provider_refused" else "gone",
+                           ended_at=now())
     return res
 
 
@@ -174,40 +181,37 @@ def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
             free = sum(1 for x in live if not x.get("current"))
             want = min(-(-q // k) - free, int(c.get("max_stations", 1)) - len(live))
             while want > 0:
+                if provider_backoff(name, cfg, next_station(name, c)[1]):
+                    break
                 if cap is not None and direct_in_use + all_live_stations(cfg) >= int(cap):
                     break
                 if not resources_ok(cfg)[0]:
+                    break
+                from . import doctor
+                if not doctor.ensure(name, cfg, next_station(name, c)[1])["ok"]:
                     break
                 started.append(start_station(name, c, cfg)); want -= 1
     return started
 
 
-def start_station(name: str, c: dict, cfg: dict) -> str:
+def next_station(name: str, c: dict) -> tuple[str, str]:
     d = pool_dir(name)
     n = 1 + max([int(f.stem.rsplit("-", 1)[-1]) for f in (d / "stations").glob("*.json")] or [0])
     station = f"{name}-st-{n}"
     accts = c.get("accts") or ([c["acct"]] if c.get("acct") else [""])
     acct = accts[(n - 1) % len(accts)]          # spread stations over accounts (each account has its own rate limits)
+    return station, acct
+
+
+def start_station(name: str, c: dict, cfg: dict) -> str:
+    station, acct = next_station(name, c)
     update_station(name, station, station=station, pool=name, state="running", started_at=now(), tasks=[], current=None, acct=acct)
     me = [sys.executable, "-m", "yardgoat.cli", "_station", name, station]
-    pypath = str(Path(__file__).resolve().parents[1])
-    envs = {"YARDGOAT_HOME": str(home()), "PYTHONPATH": pypath, "YARDGOAT_ORIG_PYTHONPATH": os.environ.get("PYTHONPATH", "")}
-    if os.environ.get("YARDGOAT_CONFIG"):
-        envs["YARDGOAT_CONFIG"] = os.environ["YARDGOAT_CONFIG"]
-    session = cfg.get("tmux_session")
-    if session and shutil.which("tmux") and not os.environ.get("YARDGOAT_NO_TMUX"):
-        cmd = " ".join(f"{k}={shlex.quote(v)}" for k, v in envs.items()) + " " + shlex.join(me) + \
-              "; echo '[yardgoat] station finished; window closes in 120s'; sleep 120"
-        r = subprocess.run(["tmux", "new-window", "-d", "-P", "-F", "#{pane_pid}", "-t", session, "-n", f"yg-{station}", cmd],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            update_station(name, station, state="launch_failed", reason=r.stderr.strip())
-        else:
-            update_station(name, station, launcher_pid=int(r.stdout.strip()))
-    else:
-        p = subprocess.Popen(me, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True, env=dict(os.environ, **envs))
-        update_station(name, station, launcher_pid=p.pid)
+    try:
+        launched = runner.launch_daemon(me, cfg, str(home()), f"yg-{station}", linger=120)
+        update_station(name, station, launcher_pid=launched["pid"])
+    except (OSError, RuntimeError) as e:
+        update_station(name, station, state="launch_failed", reason=str(e))
     return station
 
 
@@ -219,7 +223,7 @@ def mailbox_dir(name: str, station: str, c: dict) -> Path:
     return d
 
 
-def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
+def station_argv(name: str, station: str, c: dict, cfg: dict, probe_argv: list[str] | None = None) -> list[str]:
     yg = shutil.which("yardgoat") or f"{sys.executable} -m yardgoat.cli"
     prompt = STATION_PROMPT.format(pool=name, station=station, yg=yg, max_tasks=int(c.get("max_tasks_per_station", 5)))
     pre = c.get("preamble") or (Path(os.path.expanduser(c["preamble_file"])).read_text(encoding="utf-8") if c.get("preamble_file") else "")
@@ -231,7 +235,7 @@ def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
     root = os.path.expanduser(c.get("root", str(sd)))
     if host == "codex":
         # no --add-dir: the station writes only its pool root; claim/finish go through the mailbox in that root
-        argv = ["codex", "exec", "-s", c.get("sandbox", "workspace-write"), "--skip-git-repo-check", "-C", root,
+        argv = ["codex", "exec", "--json", "-s", c.get("sandbox", "workspace-write"), "--skip-git-repo-check", "-C", root,
                 "-o", str(sd / f"{station}.last.md"), *extra, prompt]
     elif host == "claude":
         argv = ["claude", "-p", "--output-format", "stream-json", "--verbose", *extra, prompt]
@@ -239,12 +243,101 @@ def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
         argv = ["kimi", "--prompt", prompt, *extra]
     else:  # shell: a scripted station, used by the contract tests
         argv = ["bash", "-c", c["command"], station]
+    if probe_argv is not None:
+        argv = probe_argv
     launcher = cfg.get("launcher") if host != "shell" else None
     if launcher:
         acct = (get_station(name, station) or {}).get("acct") or c.get("acct", "")
         fill = {"host": host, "lane": c.get("lane", ""), "acct": acct}
         argv = [a.format(**fill) for a in launcher] + argv
     return argv
+
+
+def station_script(name: str, station: str, c: dict, cfg: dict, mb: Path,
+                   probe_argv: list[str] | None = None) -> str:
+    root = os.path.expanduser(c.get("root", str(pool_dir(name) / "stations")))
+    return runner.shell_script(root, cfg, station_argv(name, station, c, cfg, probe_argv),
+                               {"YARDGOAT_STATION": station, "YARDGOAT_MAILBOX": str(mb)})
+
+
+def station_env() -> dict:
+    env = runner.worker_env()
+    env["PATH"] = os.path.dirname(shutil.which("yardgoat") or sys.executable) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def station_log(name: str, station: str) -> Path:
+    return pool_dir(name) / "stations" / f"{station}.log"
+
+
+def log_offset(name: str, station: str) -> int:
+    path = station_log(name, station)
+    return path.stat().st_size if path.exists() else 0
+
+
+def _account_backoff(c: dict, acct: str) -> Path:
+    identity = json.dumps([c["host"], c.get("lane", ""), acct])
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    return home() / "provider-backoffs" / f"{key}.json"
+
+
+def pause_provider(name: str, station: dict, cfg: dict, reason: str) -> None:
+    c = pool_conf(cfg, name)
+    record = {"pool": name, "host": c["host"], "lane": c.get("lane", ""),
+              "account_alias": station.get("acct", ""), "station": station["station"],
+              "status": "provider_refused", "reason": reason, "at": now(),
+              "until": time.time() + max(1, float(cfg.get("provider_backoff_seconds", 300)))}
+    # Separate from doctor health: a successful --version probe cannot clear a provider refusal.
+    write_json(pool_dir(name) / "provider-backoff.json", record)
+    account = _account_backoff(c, record["account_alias"])
+    account.parent.mkdir(parents=True, exist_ok=True)
+    write_json(account, record)
+
+
+def provider_backoff(name: str, cfg: dict, acct: str | None = None) -> dict | None:
+    c = pool_conf(cfg, name)
+    acct = next_station(name, c)[1] if acct is None else acct
+    for path in (pool_dir(name) / "provider-backoff.json", _account_backoff(c, acct)):
+        if path.exists():
+            record = read_json(path)
+            if record.get("until", 0) > time.time():
+                return record
+    return None
+
+
+def idle_outcome(name: str, station: dict, cfg: dict) -> dict:
+    log = station_log(name, station["station"])
+    # After a completed card, only the following idle interval belongs to the station itself.
+    offset = station.get("idle_log_offset", 0 if not station.get("tasks") else log_offset(name, station["station"]))
+    evidence = station.get("execution", {})
+    return runner.classify_outcome(log, cfg, start=offset, default="lost", **evidence)
+
+
+def unfinished_outcome(name: str, station: str, cfg: dict, run: dict | None = None,
+                       default: str = "lost", blocked_path: Path | None = None) -> dict:
+    srec = get_station(name, station) or {}
+    cur = srec.get("current") or {}
+    if run is None and cur:
+        run = next((r for r in TaskDir(cur["task_id"]).state()["runs"] if r["run_id"] == cur["run_id"]), None)
+    run = run or {}
+    # Legacy records without a claim boundary cannot safely attribute a shared log to a card.
+    start = run.get("log_start", log_offset(name, station))
+    evidence = run.get("execution", {})
+    out = runner.classify_outcome(station_log(name, station), cfg, start=start,
+                                  end=run.get("log_end"), default=default, blocked_path=blocked_path,
+                                  blocked_before=run.get("blocked_before"), **evidence)
+    c = pool_conf(cfg, name)
+    return {**out, "worker": station, "host": c["host"], "lane": c.get("lane", ""),
+            "account_alias": srec.get("acct", ""), "actual_model": station_model(name, station),
+            "model_source": "station-log", "cost_basis": "shared-station"}
+
+
+def record_execution(name: str, station: str, cur: dict | None, **evidence) -> None:
+    update_station(name, station, execution=evidence)
+    if cur:
+        with TaskDir(cur["task_id"]).locked() as box:
+            run = next(r for r in box["state"]["runs"] if r["run_id"] == cur["run_id"])
+            run.update(execution=evidence, log_end=log_offset(name, station))
 
 
 def run_station(name: str, station: str) -> int:
@@ -259,13 +352,8 @@ def run_station(name: str, station: str) -> int:
     d = pool_dir(name) / "stations"
     mb = mailbox_dir(name, station, c)
     update_station(name, station, pid=os.getpid(), mailbox=str(mb))
-    lines = ["set -u"] + [f"source {shlex.quote(os.path.expanduser(x))} || exit 3" for x in cfg.get("source", [])]
-    lines += [f"cd {shlex.quote(os.path.expanduser(c.get('root', str(d))))} || exit 3",
-              "export YARDGOAT_STATION=" + shlex.quote(station), "export YARDGOAT_MAILBOX=" + shlex.quote(str(mb)),
-              "exec " + shlex.join(station_argv(name, station, c, cfg))]
-    (d / f"{station}.sh").write_text("\n".join(lines) + "\n")
-    env = runner.worker_env()
-    env["PATH"] = os.path.dirname(shutil.which("yardgoat") or sys.executable) + os.pathsep + env.get("PATH", "")
+    (d / f"{station}.sh").write_text(station_script(name, station, c, cfg, mb))
+    env = station_env()
     timed_out = None
     with open(d / f"{station}.log", "wb") as log:
         p = subprocess.Popen(["bash", str(d / f"{station}.sh")], stdin=subprocess.DEVNULL, stdout=log,
@@ -275,6 +363,7 @@ def run_station(name: str, station: str) -> int:
             serve_mailbox(name, station, mb, cli)
             cur = (get_station(name, station) or {}).get("current")
             if cur and time.time() > cur["deadline"]:
+                record_execution(name, station, cur, exit_code=124, timed_out=True)
                 runner.kill_group(p.pid)
                 timed_out = cur
                 break
@@ -282,16 +371,19 @@ def run_station(name: str, station: str) -> int:
         p.wait()
     serve_mailbox(name, station, mb, cli, respond_only=True)
     cur = (get_station(name, station) or {}).get("current")
+    previous = (get_station(name, station) or {}).get("execution", {})
+    timed_out = bool(timed_out) or previous.get("timed_out") is True
+    record_execution(name, station, cur, exit_code=124 if timed_out else p.returncode, timed_out=timed_out)
     if cur:
-        from .store import TaskDir
-        if timed_out:
-            runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], {
-                "state": "exited", "exit_code": 124, "worker": station, "host": c.get("host", ""), "lane": c.get("lane", ""),
-                "actual_model": station_model(name, station), "model_source": "station-log", "cost_basis": "shared-station"})
-        else:
-            runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], {
-                "state": "lost", "reason": f"station {station} exited without finishing the card", "worker": station})
-    rec = update_station(name, station, state="exited", exit_code=p.returncode, ended_at=now(), current=None,
+        outcome = unfinished_outcome(name, station, cfg)
+        runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], outcome)
+    else:
+        srec = get_station(name, station)
+        outcome = idle_outcome(name, srec, cfg)
+        if outcome["state"] == "provider_refused":
+            pause_provider(name, srec, cfg, outcome["reason"])
+    rec = update_station(name, station, state="provider_refused" if not cur and outcome["state"] == "provider_refused" else "exited",
+                         exit_code=p.returncode, ended_at=now(), current=None,
                          model=runner.detect_model(d / f"{station}.log")[0], timed_out=bool(timed_out))
     return p.returncode or 0
 
