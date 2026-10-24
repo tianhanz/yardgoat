@@ -166,7 +166,7 @@
     "l3"
    ],
    "default": "l2",
-   "description": "l1 documentation; l2 ordinary work; l3 migrations, releases, permissions or CI. Recorded only."
+   "description": "l1 documentation; l2 ordinary work; l3 requires explicit approval of the frozen content before dispatch/start/claim."
   },
   "acceptance": {
    "type": "string",
@@ -179,6 +179,40 @@
     "pattern": "^[a-z0-9][a-z0-9._-]{2,79}$"
    },
    "description": "Accepted upstream task ids. Every upstream must be verified before this task starts; self-dependencies, missing tasks and dependency cycles are rejected at submit."
+  },
+  "on_pass": {
+   "type": "array",
+   "description": "Ordered owner-side shell commands run only after a PASS verdict. Commands and working directories are frozen in content_hash.",
+   "items": {
+    "type": "object",
+    "required": [
+     "name",
+     "command"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+     },
+     "command": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+     },
+     "cwd": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Defaults to workdir; explicit relative paths resolve against the spec directory."
+     }
+    }
+   }
+  },
+  "on_pass_timeout": {
+   "type": "number",
+   "exclusiveMinimum": 0,
+   "description": "Per-step timeout in seconds. Overrides local on_pass_timeout; default 600."
   }
  }
 }

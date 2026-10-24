@@ -356,6 +356,8 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay
                 "cost_basis": outcome.get("cost_basis", "unknown"), "artifacts": artifacts, "finished_at": now(),
                 "status": STATUS_OF[state],
             }
+            if run.get("approval"):
+                receipt["approval"] = run["approval"]
             if state == "blocked":
                 receipt["question"] = outcome.get("question", "")
             if state in ("lost", "launch_failed", "provider_refused"):

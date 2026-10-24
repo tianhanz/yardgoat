@@ -34,7 +34,11 @@
     "run.claimed",
     "run.provider_refused",
     "run.waiting_deps",
-    "run.scope_blocked"
+    "run.scope_blocked",
+    "task.approved",
+    "task.approval_invalidated",
+    "task.on_pass_started",
+    "task.on_pass_finished"
    ]
   },
   "actor": {
@@ -72,6 +76,73 @@
     }
    },
    "description": "Conflicting tasks and absolute path prefixes for run.scope_blocked."
+  },
+  "approval": {
+   "type": "object",
+   "required": [
+    "by",
+    "at",
+    "content_hash",
+    "note"
+   ],
+   "properties": {
+    "by": {
+     "type": "string"
+    },
+    "at": {
+     "type": "string"
+    },
+    "content_hash": {
+     "type": "string"
+    },
+    "note": {
+     "type": "string"
+    },
+    "invalidated_at": {
+     "type": "string"
+    },
+    "drift": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "name": {
+   "type": "string"
+  },
+  "command": {
+   "type": "string"
+  },
+  "cwd": {
+   "type": "string"
+  },
+  "started_at": {
+   "type": "string"
+  },
+  "finished_at": {
+   "type": "string"
+  },
+  "output_tail": {
+   "type": "string"
+  },
+  "step": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "attempt": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "exit_code": {
+   "type": [
+    "integer",
+    "null"
+   ]
+  },
+  "timed_out": {
+   "type": "boolean"
   }
  }
 }

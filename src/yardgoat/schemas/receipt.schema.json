@@ -115,6 +115,101 @@
   },
   "reason": {
    "type": "string"
+  },
+  "approval": {
+   "type": "object",
+   "required": [
+    "by",
+    "at",
+    "content_hash",
+    "note"
+   ],
+   "properties": {
+    "by": {
+     "type": "string"
+    },
+    "at": {
+     "type": "string"
+    },
+    "content_hash": {
+     "type": "string"
+    },
+    "note": {
+     "type": "string"
+    },
+    "invalidated_at": {
+     "type": "string"
+    },
+    "drift": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "on_pass": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": [
+     "step",
+     "name",
+     "command",
+     "cwd",
+     "by",
+     "attempt",
+     "started_at",
+     "exit_code",
+     "output_tail",
+     "timed_out"
+    ],
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "command": {
+      "type": "string"
+     },
+     "cwd": {
+      "type": "string"
+     },
+     "by": {
+      "type": "string"
+     },
+     "started_at": {
+      "type": "string"
+     },
+     "finished_at": {
+      "type": "string"
+     },
+     "output_tail": {
+      "type": "string"
+     },
+     "step": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "attempt": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "exit_code": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "timed_out": {
+      "type": "boolean"
+     }
+    }
+   },
+   "description": "Latest attempt per step, in execution order; successful steps are never rerun. Events retain retry history."
+  },
+  "delivery_failed": {
+   "type": "boolean",
+   "description": "Delivery needs retry; verification and receipt.status remain PASS/passed."
   }
  }
 }
