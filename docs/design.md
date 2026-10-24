@@ -30,7 +30,8 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 8. **Asking is not failing.** A worker that writes `out/BLOCKED.md` (or a pool card that lands in `parked/`) parks the task with that text as the question. `answer` records a reply; `reconcile` resumes the task on the owner's behalf, and the answer is appended to the prompt. Parked runs do not use the attempt budget.
 9. **Infrastructure failures are not attempts.** When the local launcher exits with one of `launcher_failure_codes` before any agent started, the run is `launch_failed` and does not count.
 10. **The worker sees the caller's environment.** Yardgoat's own import path is never passed to workers.
-11. **Queue first, then start.** Every dispatch is accepted as a queued run. Direct runs start immediately only while
+11. **Queue first, then start.** Every eligible dispatch is accepted as a queued run (unverified dependencies wait
+    under invariant 20). Direct runs start immediately only while
     fewer than `max_concurrent` direct runs are alive (local config); otherwise they wait and `reconcile` starts them
     oldest first, re-checking drift and lane policy at launch. A queued run counts as in flight (no duplicates) but
     not as an attempt; `cancel` removes it. Adapter runs are capped by the fleet they go to.
@@ -50,7 +51,10 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 15. **Concurrency.** Every "check capacity, then start" decision (dispatch, reconcile, station scheduling) holds one
     machine-wide schedule lock; lock order is schedule → pool → task. Outcomes are committed exactly once, receipt and
     state together under the task lock; a late or duplicate outcome is ignored, and a receipt whose state never got
-    written is replayed by `reconcile`.
+    written is replayed by `reconcile`. Archive also takes schedule → task locks, so it cannot revoke a verified
+    dependency between the final dependency check and start/claim. Other mutation paths either refuse verified
+    tasks or preserve their status; verifier failure/exhaustion starts from an unverified task and does not revoke
+    eligibility. The potentially slow verifier remains outside the schedule lock.
 16. **Process groups.** A direct worker runs in its own process group; a timeout ends the whole group, and liveness is
     judged by the group, so a worker that outlives its runner still blocks a retry.
 17. **Unknown submits are not retried blindly.** If an adapter's submit fails, Yardgoat asks the adapter whether the
@@ -62,6 +66,26 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     `run.provider_refused` event preserve the matching line. This state never spends the attempt budget and appears
     in the inbox with a request to reword or switch lanes before resending. Reconcile does not automatically retry it.
     Lost-wrapper recovery and receipt replay preserve the same classification.
+
+20. **Dependencies require verification.** `depends_on` lists accepted upstream task ids. Submission validates
+    self-references, missing ids and cycles by traversing authoritative accepted specs, under the schedule lock.
+    Dispatch uses the same dependency gate as queue release and claim: terminated upstreams immediately park the
+    task; otherwise it creates one `waiting_deps` run if any upstream is not `verified`. Waiting counts only as in flight:
+    it prevents duplicate dispatch and survives takeover, but uses no attempt, direct slot or pool station.
+    `status` names the unverified upstreams; `cancel` can cancel the wait without spending an attempt.
+    Reconcile moves the same run to `queued` once all upstreams are verified, then applies ordinary capacity,
+    lane, drift and pool rules. Worker exit or a retryable verifier failure is insufficient. An `archived` or
+    `exhausted` upstream instead parks the task with a `blocked_deps` run and an inbox question naming the
+    terminated upstream. No worker or receipt is created for that run. Answering does not waive the dependency;
+    an impossible dependency requires a replacement task spec under a new id. Auto-verification stays outside
+    the schedule lock; downstream tasks observe its result on the next reconcile tick.
+21. **Declared writes exclude overlapping work.** Before direct start, file-pool/plugin submit, and pool claim,
+    the scheduler compares `workdir + scope` against every running task's write set, across all adapters and
+    pools. The check, reservation and start share the machine schedule lock; claim follows schedule → pool →
+    task lock order. Conflicts keep the same run queued, spend no attempt, and name the conflicting task and
+    absolute path in `status` and reconcile output. Every worker outcome releases its reservation; reconcile
+    then starts eligible queued work (or makes pool cards available for claim). An uncertain remote submit
+    retains its reservation because it may already be executing. Scope waits alone do not spawn stations.
 
 ## Launch-chain health checks
 
@@ -110,7 +134,30 @@ the frozen card requires a new task id.
 Specs may record `scope` (a list of paths/globs relative to workdir), `risk` (`l1` documentation, `l2` ordinary work,
 the default, or `l3` migrations/releases/permissions/CI), and optional `acceptance` (a sentence describing success).
 `quick --scope PATH --scope GLOB --risk l1 --acceptance TEXT` includes these in the spec and at the end of `CARD.md`.
-M1 only validates and records these fields; they do not change scheduling or grant permissions.
+M2 uses `scope` for scheduling; metadata does not grant permissions. Each literal scope path becomes a
+canonical absolute prefix (`Path.resolve`, including existing symlinks). A glob reserves the directory before
+its first wildcard component: `src/**/*.py` reserves `workdir/src`, and `*.md` reserves the entire workdir.
+This is deliberately conservative and covers future files as well as existing matches; it does not enumerate
+only files that currently exist. Existing symlinks below these prefixes add their resolved absolute target
+prefixes, including targets outside workdir and dangling links to future files. Directory targets are scanned
+too, so nested aliases cannot escape the reservation. Directory device/inode identities prevent traversal
+cycles; symlink-only loops keep an absolute prefix and are skipped when they cannot be traversed.
+Prefix comparison respects path-component boundaries, so `src/a` and `src/b`
+or `src` and `src-other` can run together. The reservation is saved on the running record until its outcome.
+Omitted or empty `scope` opts out for backwards compatibility. `risk` and `acceptance` remain descriptive.
+
+`depends_on: ["prepare-data", "build-tool"]` requires both upstream tasks to be verified before starting.
+The accepted dependency graph is immutable just like the rest of the spec; changing dependencies needs a new id.
+
+### Known limitations of scope scans
+
+Each write-set calculation inspects at most 50,000 directory entries across all scope roots and linked
+directories (one extra entry may be read to detect truncation). On truncation it emits a
+`task.scope_scan_limited` task event with the limit, scanned count and explanation, then continues scheduling
+with the prefixes collected so far. Checks and reservation can each emit this event. Unvisited symlink
+targets may therefore be unreserved; the original prefixes still protect future ordinary files. Unreadable
+directories retain their prefix but their links cannot be inspected. Scanning is not a filesystem snapshot:
+links created or retargeted after the scan are not covered by the saved reservation.
 An unchanged pre-M1 spec can be resubmitted without rewriting its frozen snapshot: comparison also tries the original
 shape without injected defaults. Explicitly adding scope/risk/acceptance, even default values, remains a content change.
 

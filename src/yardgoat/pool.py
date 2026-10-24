@@ -27,7 +27,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import runner
+from . import runner, scheduling
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 STATION_PROMPT = """你是 Yardgoat 任务池「{pool}」的工位，身份 {station}。按下面的循环干活，直到池子空了：
@@ -76,7 +76,7 @@ def workdir_problem(spec: dict, cfg: dict) -> str | None:
     return None
 
 
-def queued_cards(name: str) -> list[tuple[str, str]]:
+def queued_cards(name: str, ready_only: bool = False) -> list[tuple[str, str]]:
     out = []
     for t in list_tasks():
         td = TaskDir(t)
@@ -84,7 +84,9 @@ def queued_cards(name: str) -> list[tuple[str, str]]:
         last = st["runs"][-1] if st["runs"] else None
         if last and last["state"] == "queued" and td.spec().get("adapter", {}).get("pool") == name \
                 and td.spec().get("adapter", {}).get("kind") == "pool":
-            out.append((last.get("queued_at", ""), t))
+            if not ready_only or (not scheduling.dependencies(td.spec())[0]
+                                  and not scheduling.scope_conflicts(t, td.spec())):
+                out.append((last.get("queued_at", ""), t))
     return sorted(out)
 
 
@@ -173,7 +175,7 @@ def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
     cap = cfg.get("max_concurrent")
     for name, c in pools(cfg).items():
         with pool_lock(name):
-            q = len(queued_cards(name))
+            q = len(queued_cards(name, ready_only=True))
             live = live_stations(name)
             # one more station per `spawn_per_queued` waiting cards: small batches stay on one warm station.
             # Only stations without a card in hand count as available — a station busy with a long card does not.

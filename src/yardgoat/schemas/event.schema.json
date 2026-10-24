@@ -32,7 +32,9 @@
     "run.queued",
     "run.cancelled",
     "run.claimed",
-    "run.provider_refused"
+    "run.provider_refused",
+    "run.waiting_deps",
+    "run.scope_blocked"
    ]
   },
   "actor": {
@@ -43,7 +45,33 @@
   },
   "reason": {
    "type": "string",
-   "description": "Matching provider refusal log line, when applicable."
+   "description": "Scheduling blocker, upstream termination, or matching provider refusal log line, when applicable."
+  },
+  "waiting_for": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   },
+   "description": "Unverified upstream task ids for run.waiting_deps."
+  },
+  "conflicts": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": [
+     "task_id",
+     "path"
+    ],
+    "properties": {
+     "task_id": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     }
+    }
+   },
+   "description": "Conflicting tasks and absolute path prefixes for run.scope_blocked."
   }
  }
 }

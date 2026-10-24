@@ -156,7 +156,7 @@
     "minLength": 1,
     "pattern": "^(?!/|~)(?!.*(?:^|/)\\.\\.(?:/|$)).+"
    },
-   "description": "Expected files or directories relative to workdir; globs allowed. Recorded only, not a scheduling constraint."
+   "description": "Write set relative to workdir. Literal paths and the directory prefix before the first glob component reserve canonical absolute path prefixes while running. Overlapping scopes queue; omitted or empty scope opts out."
   },
   "risk": {
    "type": "string",
@@ -171,6 +171,14 @@
   "acceptance": {
    "type": "string",
    "description": "Optional one-sentence acceptance description."
+  },
+  "depends_on": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "pattern": "^[a-z0-9][a-z0-9._-]{2,79}$"
+   },
+   "description": "Accepted upstream task ids. Every upstream must be verified before this task starts; self-dependencies, missing tasks and dependency cycles are rejected at submit."
   }
  }
 }

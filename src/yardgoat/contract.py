@@ -18,7 +18,8 @@ HOSTS = ("codex", "claude", "kimi", "shell")
 TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,79}$")
 
 # Task lifecycle. "exited" means the process ended; only a passing frozen verifier makes it "verified".
-STATES = ("accepted", "running", "exited", "verified", "failed", "exhausted")
+STATES = ("accepted", "waiting_deps", "queued", "running", "exited", "verified", "failed", "exhausted",
+          "parked", "answered", "archived", "submit_unknown", "provider_refused")
 
 
 class SpecError(ValueError):
@@ -79,9 +80,11 @@ def normalize(spec: dict, base: Path, metadata_defaults: bool = True) -> dict:
         raise SpecError("budget.max_attempts must be an integer >= 1")
     if isinstance(mw, bool) or not isinstance(mw, (int, float)) or mw <= 0:
         raise SpecError("budget.max_wall_min must be a number > 0")
-    for k in ("outputs", "escalate_when", "allowed_lanes", "scope"):
+    for k in ("outputs", "escalate_when", "allowed_lanes", "scope", "depends_on"):
         if k in s and not (isinstance(s[k], list) and all(isinstance(x, str) for x in s[k])):
             raise SpecError(f"{k} must be a list of strings")
+    if any(not TASK_ID_RE.fullmatch(t) for t in s.get("depends_on", [])):
+        raise SpecError("depends_on entries must be valid task ids")
     for p in s.get("scope", []):
         if not p or Path(p).is_absolute() or ".." in Path(p).parts or p.startswith("~"):
             raise SpecError("scope entries must be paths or globs relative to workdir")
