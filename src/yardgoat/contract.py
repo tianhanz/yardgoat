@@ -25,7 +25,7 @@ class SpecError(ValueError):
     pass
 
 
-def load_spec_file(path: str | Path) -> dict:
+def load_spec_file(path: str | Path, metadata_defaults: bool = True) -> dict:
     p = Path(path).expanduser().resolve()
     text = p.read_text(encoding="utf-8")
     if p.suffix in (".yaml", ".yml"):
@@ -38,7 +38,7 @@ def load_spec_file(path: str | Path) -> dict:
         spec = json.loads(text)
     if not isinstance(spec, dict):
         raise SpecError("spec must be a mapping")
-    return normalize(spec, base=p.parent)
+    return normalize(spec, base=p.parent, metadata_defaults=metadata_defaults)
 
 
 def _abs(base: Path, v: str) -> str:
@@ -46,7 +46,7 @@ def _abs(base: Path, v: str) -> str:
     return str(q if q.is_absolute() else (base / q).resolve())
 
 
-def normalize(spec: dict, base: Path) -> dict:
+def normalize(spec: dict, base: Path, metadata_defaults: bool = True) -> dict:
     s = json.loads(json.dumps(spec))  # deep copy, JSON-only types
     for k in ("task_id", "project", "goal", "card", "workdir", "executor", "verifier"):
         if k not in s:
@@ -85,9 +85,10 @@ def normalize(spec: dict, base: Path) -> dict:
     for p in s.get("scope", []):
         if not p or Path(p).is_absolute() or ".." in Path(p).parts or p.startswith("~"):
             raise SpecError("scope entries must be paths or globs relative to workdir")
-    s.setdefault("scope", [])
-    s.setdefault("risk", "l2")
-    if not isinstance(s["risk"], str) or s["risk"] not in ("l1", "l2", "l3"):
+    if metadata_defaults:
+        s.setdefault("scope", [])
+        s.setdefault("risk", "l2")
+    if not isinstance(s.get("risk", "l2"), str) or s.get("risk", "l2") not in ("l1", "l2", "l3"):
         raise SpecError("risk must be l1, l2 or l3")
     if "acceptance" in s and not isinstance(s["acceptance"], str):
         raise SpecError("acceptance must be a string")

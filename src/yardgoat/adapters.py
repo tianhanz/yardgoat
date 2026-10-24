@@ -46,10 +46,11 @@ class Direct:
             return None  # the worker's process group is still alive: not lost, keep its slot
         if (td.run_dir(run["run_id"]) / "receipt.json").exists():
             return None  # already recorded by the runner
-        refusal = runner.provider_refusal(td.run_dir(run["run_id"]) / "log", cfg)
-        if refusal:
-            return {"state": "provider_refused", "reason": refusal}
-        return {"state": "lost", "reason": "worker process ended without writing a receipt"}
+        rd = td.run_dir(run["run_id"])
+        evidence = runner.execution_evidence(rd)
+        return runner.classify_outcome(rd / "log", cfg, default="exited" if evidence else "lost",
+                                       blocked_path=Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md"),
+                                       blocked_before=run.get("blocked_before"), **evidence)
 
 
 class FilePool:

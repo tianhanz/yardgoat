@@ -17,6 +17,7 @@ spec says `"auto_close": true`.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -128,7 +129,14 @@ def live_stations(name: str) -> list[dict]:
         if station_alive(s):
             res.append(s)
         elif s.get("state") == "running":
-            update_station(name, s["station"], only_if_state="running", state="gone", ended_at=now())
+            cfg = runner.config()
+            # A dead wrapper may never have recorded an initial provider rejection.
+            outcome = idle_outcome(name, s, cfg) if not s.get("current") else None
+            if outcome and outcome["state"] == "provider_refused":
+                pause_provider(name, s, cfg, outcome["reason"])
+            update_station(name, s["station"], only_if_state="running",
+                           state="provider_refused" if outcome and outcome["state"] == "provider_refused" else "gone",
+                           ended_at=now())
     return res
 
 
@@ -171,6 +179,8 @@ def schedule(cfg: dict, direct_in_use_fn) -> list[str]:
             k = max(1, int(c.get("spawn_per_queued", 1)))
             want = min(-(-q // k), int(c.get("max_stations", 1))) - len(live)
             while want > 0:
+                if provider_backoff(name, cfg, next_station(name, c)[1]):
+                    break
                 if cap is not None and direct_in_use + all_live_stations(cfg) >= int(cap):
                     break
                 if not resources_ok(cfg)[0]:
@@ -223,7 +233,7 @@ def station_argv(name: str, station: str, c: dict, cfg: dict, probe_argv: list[s
     root = os.path.expanduser(c.get("root", str(sd)))
     if host == "codex":
         # no --add-dir: the station writes only its pool root; claim/finish go through the mailbox in that root
-        argv = ["codex", "exec", "-s", c.get("sandbox", "workspace-write"), "--skip-git-repo-check", "-C", root,
+        argv = ["codex", "exec", "--json", "-s", c.get("sandbox", "workspace-write"), "--skip-git-repo-check", "-C", root,
                 "-o", str(sd / f"{station}.last.md"), *extra, prompt]
     elif host == "claude":
         argv = ["claude", "-p", "--output-format", "stream-json", "--verbose", *extra, prompt]
@@ -254,13 +264,78 @@ def station_env() -> dict:
     return env
 
 
-def unfinished_outcome(name: str, station: str, cfg: dict) -> dict:
-    refusal = runner.provider_refusal(pool_dir(name) / "stations" / f"{station}.log", cfg)
+def station_log(name: str, station: str) -> Path:
+    return pool_dir(name) / "stations" / f"{station}.log"
+
+
+def log_offset(name: str, station: str) -> int:
+    path = station_log(name, station)
+    return path.stat().st_size if path.exists() else 0
+
+
+def _account_backoff(c: dict, acct: str) -> Path:
+    identity = json.dumps([c["host"], c.get("lane", ""), acct])
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    return home() / "provider-backoffs" / f"{key}.json"
+
+
+def pause_provider(name: str, station: dict, cfg: dict, reason: str) -> None:
     c = pool_conf(cfg, name)
-    return {"state": "provider_refused" if refusal else "lost",
-            "reason": refusal or f"station {station} exited without finishing the card", "worker": station,
-            "host": c["host"], "lane": c.get("lane", ""),
-            "account_alias": (get_station(name, station) or {}).get("acct", "")}
+    record = {"pool": name, "host": c["host"], "lane": c.get("lane", ""),
+              "account_alias": station.get("acct", ""), "station": station["station"],
+              "status": "provider_refused", "reason": reason, "at": now(),
+              "until": time.time() + max(1, float(cfg.get("provider_backoff_seconds", 300)))}
+    # Separate from doctor health: a successful --version probe cannot clear a provider refusal.
+    write_json(pool_dir(name) / "provider-backoff.json", record)
+    account = _account_backoff(c, record["account_alias"])
+    account.parent.mkdir(parents=True, exist_ok=True)
+    write_json(account, record)
+
+
+def provider_backoff(name: str, cfg: dict, acct: str | None = None) -> dict | None:
+    c = pool_conf(cfg, name)
+    acct = next_station(name, c)[1] if acct is None else acct
+    for path in (pool_dir(name) / "provider-backoff.json", _account_backoff(c, acct)):
+        if path.exists():
+            record = read_json(path)
+            if record.get("until", 0) > time.time():
+                return record
+    return None
+
+
+def idle_outcome(name: str, station: dict, cfg: dict) -> dict:
+    log = station_log(name, station["station"])
+    # After a completed card, only the following idle interval belongs to the station itself.
+    offset = station.get("idle_log_offset", 0 if not station.get("tasks") else log_offset(name, station["station"]))
+    evidence = station.get("execution", {})
+    return runner.classify_outcome(log, cfg, start=offset, default="lost", **evidence)
+
+
+def unfinished_outcome(name: str, station: str, cfg: dict, run: dict | None = None,
+                       default: str = "lost", blocked_path: Path | None = None) -> dict:
+    srec = get_station(name, station) or {}
+    cur = srec.get("current") or {}
+    if run is None and cur:
+        run = next((r for r in TaskDir(cur["task_id"]).state()["runs"] if r["run_id"] == cur["run_id"]), None)
+    run = run or {}
+    # Legacy records without a claim boundary cannot safely attribute a shared log to a card.
+    start = run.get("log_start", log_offset(name, station))
+    evidence = run.get("execution", {})
+    out = runner.classify_outcome(station_log(name, station), cfg, start=start,
+                                  end=run.get("log_end"), default=default, blocked_path=blocked_path,
+                                  blocked_before=run.get("blocked_before"), **evidence)
+    c = pool_conf(cfg, name)
+    return {**out, "worker": station, "host": c["host"], "lane": c.get("lane", ""),
+            "account_alias": srec.get("acct", ""), "actual_model": station_model(name, station),
+            "model_source": "station-log", "cost_basis": "shared-station"}
+
+
+def record_execution(name: str, station: str, cur: dict | None, **evidence) -> None:
+    update_station(name, station, execution=evidence)
+    if cur:
+        with TaskDir(cur["task_id"]).locked() as box:
+            run = next(r for r in box["state"]["runs"] if r["run_id"] == cur["run_id"])
+            run.update(execution=evidence, log_end=log_offset(name, station))
 
 
 def run_station(name: str, station: str) -> int:
@@ -286,6 +361,7 @@ def run_station(name: str, station: str) -> int:
             serve_mailbox(name, station, mb, cli)
             cur = (get_station(name, station) or {}).get("current")
             if cur and time.time() > cur["deadline"]:
+                record_execution(name, station, cur, exit_code=124, timed_out=True)
                 runner.kill_group(p.pid)
                 timed_out = cur
                 break
@@ -293,15 +369,19 @@ def run_station(name: str, station: str) -> int:
         p.wait()
     serve_mailbox(name, station, mb, cli, respond_only=True)
     cur = (get_station(name, station) or {}).get("current")
+    previous = (get_station(name, station) or {}).get("execution", {})
+    timed_out = bool(timed_out) or previous.get("timed_out") is True
+    record_execution(name, station, cur, exit_code=124 if timed_out else p.returncode, timed_out=timed_out)
     if cur:
-        from .store import TaskDir
-        if timed_out:
-            runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], {
-                "state": "exited", "exit_code": 124, "worker": station, "host": c.get("host", ""), "lane": c.get("lane", ""),
-                "actual_model": station_model(name, station), "model_source": "station-log", "cost_basis": "shared-station"})
-        else:
-            runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], unfinished_outcome(name, station, cfg))
-    rec = update_station(name, station, state="exited", exit_code=p.returncode, ended_at=now(), current=None,
+        outcome = unfinished_outcome(name, station, cfg)
+        runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], outcome)
+    else:
+        srec = get_station(name, station)
+        outcome = idle_outcome(name, srec, cfg)
+        if outcome["state"] == "provider_refused":
+            pause_provider(name, srec, cfg, outcome["reason"])
+    rec = update_station(name, station, state="provider_refused" if not cur and outcome["state"] == "provider_refused" else "exited",
+                         exit_code=p.returncode, ended_at=now(), current=None,
                          model=runner.detect_model(d / f"{station}.log")[0], timed_out=bool(timed_out))
     return p.returncode or 0
 

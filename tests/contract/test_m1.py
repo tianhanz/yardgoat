@@ -46,7 +46,7 @@ def test_doctor_shell_probe_is_persisted_and_does_not_run_a_card(tmp_path, env):
     report = json.loads(out)
     assert report["ok"] and report["checked_at"]
     assert all(checks(report)[k]["ok"] for k in ("host_path", "host_version", "launcher", "mailbox"))
-    saved = Path(env["YARDGOAT_HOME"]) / "doctor/p.json"
+    saved = Path(env["YARDGOAT_HOME"]) / "doctor/pool/p.json"
     assert json.loads(saved.read_text()) == report
     assert not (tmp_path / "MODEL_WAS_CALLED").exists()
     assert not list((tmp_path / "root/.yardgoat-mailbox").rglob("*.probe"))
@@ -62,7 +62,7 @@ def test_doctor_uses_sources_launcher_and_host_version_only(tmp_path, env):
     assert rc == 0, err
     report = json.loads(out)
     assert report["ok"] and "fake-host-version" in checks(report)["host_version"]["reason"]
-    assert (Path(env["YARDGOAT_HOME"]) / "doctor/codex-lane-test.json").exists()
+    assert (Path(env["YARDGOAT_HOME"]) / "doctor/direct/codex-lane-test.json").exists()
 
 
 def test_doctor_reports_launcher_failure(tmp_path, env):
@@ -104,7 +104,7 @@ def test_schedule_failed_doctor_starts_no_station_and_exposes_reason(tmp_path, e
     for command in (("status",), ("status", "t-doctor"), ("inbox",)):
         assert "池子 p 体检失败" in yg(env, *command)[1]
     assert "missing-source.sh" in yg(env, "inbox", "--json")[1]
-    report = json.loads((Path(env["YARDGOAT_HOME"]) / "doctor/p.json").read_text())
+    report = json.loads((Path(env["YARDGOAT_HOME"]) / "doctor/pool/p.json").read_text())
     assert not report["ok"]
     cfg.pop("source")
     configure(env, **cfg)
@@ -116,7 +116,7 @@ def test_schedule_failed_doctor_starts_no_station_and_exposes_reason(tmp_path, e
 def test_schedule_reuses_fresh_doctor_then_refreshes_expired_record(tmp_path, env):
     pool_cfg(env, tmp_path, max_stations=0)
     assert yg(env, "doctor", "--pool", "p", "--json")[0] == 0
-    saved = Path(env["YARDGOAT_HOME"]) / "doctor/p.json"
+    saved = Path(env["YARDGOAT_HOME"]) / "doctor/pool/p.json"
     before = saved.read_text()
     cfg = json.loads(Path(env["YARDGOAT_CONFIG"]).read_text())
     cfg["pools"]["p"]["max_stations"] = 1
@@ -178,7 +178,8 @@ def test_quick_records_metadata_in_spec_and_card(tmp_path, env):
 @pytest.mark.parametrize("line", ["FLAGGED FOR POSSIBLE policy issue", "Usage limit reached",
                                   "You've reached your quota", "rate limit exceeded"])
 def test_direct_provider_refusal_does_not_use_attempts(tmp_path, env, line):
-    sp = make_task(tmp_path, worker=f"echo {shlex.quote(line)}; exit 1", attempts=1)
+    event = json.dumps({"type": "error", "error": {"message": line}})
+    sp = make_task(tmp_path, worker=f"echo {shlex.quote(event)}; exit 1", attempts=1)
     assert yg(env, "submit", str(sp), "--as", "A")[0] == 0
     for _ in range(2):
         assert yg(env, "dispatch", "t-demo", "--as", "A")[0] == 0
@@ -197,14 +198,16 @@ def test_direct_provider_refusal_does_not_use_attempts(tmp_path, env, line):
 
 def test_custom_provider_refusal_pattern(tmp_path, env):
     configure(env, provider_refusal_patterns=[r"custom denial \d+"])
-    sp = make_task(tmp_path, worker="echo 'Custom Denial 42'; exit 2", attempts=1)
+    event = json.dumps({"type": "error", "error": {"message": "Custom Denial 42"}})
+    sp = make_task(tmp_path, worker=f"echo {shlex.quote(event)}; exit 2", attempts=1)
     yg(env, "submit", str(sp), "--as", "A"); yg(env, "dispatch", "t-demo", "--as", "A")
     assert wait_exit(env, "t-demo")["runs"][-1]["state"] == "provider_refused"
 
 
 def test_pool_provider_refusal_does_not_use_attempts(tmp_path, env):
+    event = json.dumps({"type": "error", "error": {"message": "Rate limit exceeded by provider"}})
     pool_cfg(env, tmp_path, command='python3 -m yardgoat.cli claim --pool p --station "$0" >/dev/null; '
-             'echo "Rate limit exceeded by provider"; exit 1')
+             + f"echo {shlex.quote(event)}; exit 1")
     pool_task(tmp_path, env, "t-refusal", budget={"max_attempts": 1, "max_wall_min": 1})
     for _ in range(2):
         assert yg(env, "dispatch", "t-refusal", "--as", "A")[0] == 0
@@ -272,11 +275,11 @@ def test_provider_refusal_survives_a_dead_wrapper(tmp_path, env, action):
     statefile = root / "tasks/t-crash/task.json"
     st = json.loads(statefile.read_text())
     st["status"] = "running"
-    st["runs"][0].update(state="running", station="p-st-1")
+    st["runs"][0].update(state="running", station="p-st-1", log_start=0)
     statefile.write_text(json.dumps(st))
     sd = root / "pools/p/stations"
     (sd / "p-st-1.json").write_text(json.dumps({"state": "gone", "station": "p-st-1"}))
-    (sd / "p-st-1.log").write_text("Usage limit reached\n")
+    (sd / "p-st-1.log").write_text(json.dumps({"type": "error", "error": {"message": "Usage limit reached"}}) + "\n")
     args = ("reconcile",) if action == "reconcile" else ("dispatch", "t-crash", "--as", "A")
     assert yg(env, *args)[0] == 0
     st = json.loads(yg(env, "status", "t-crash", "--json")[1])

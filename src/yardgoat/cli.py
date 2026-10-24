@@ -59,7 +59,11 @@ def cmd_submit(a) -> int:
     td = TaskDir(spec["task_id"])
     with td.locked() as box:
         if box["state"] is not None:
-            if box["state"]["content_hash"] == h:
+            old_hash = box["state"]["content_hash"]
+            # Pre-M1 specs omitted metadata defaults. Compare the original input shape only;
+            # explicit scope/risk (even default values) remain content changes. Never rewrite frozen data.
+            legacy_hash = contract.content_hash(contract.load_spec_file(a.spec, metadata_defaults=False), frozen)
+            if old_hash in (h, legacy_hash):
                 print(json.dumps({"task_id": td.task_id, "result": "already-accepted", "status": box["state"]["status"]}))
                 return 0
             return refuse(f"{td.task_id} already exists with different content (task ids are immutable)")
@@ -169,7 +173,7 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
         elif last and last["state"] == "running" and not _alive(last):
             spec = td.spec()
             if adapter_kind(spec) == "pool":
-                outcome = pool.unfinished_outcome(last["pool"], last.get("station", ""), cfg)
+                outcome = pool.unfinished_outcome(last["pool"], last.get("station", ""), cfg, last)
             else:
                 outcome = adapters.get(adapter_kind(spec), cfg).poll(td, last, spec, cfg)
             if outcome:
@@ -307,7 +311,9 @@ def _status_obj(td: TaskDir) -> dict:
         runs.append(rr)
     ad = td.spec().get("adapter", {})
     health = doctor.pool_report(ad["pool"]) if ad.get("kind") == "pool" else None
+    backoff = pool.provider_backoff(ad["pool"], runner.config()) if ad.get("kind") == "pool" else None
     return {"task_id": td.task_id, "status": st["status"], "owner": st["owner"], "owner_history": st["owner_history"],
+            "pool_backoff": backoff,
             "pool_doctor": health, "pool_problem": doctor.failure_message(ad.get("pool", ""), health),
             "verdict": st["verdict"], "question": st.get("question"), "runs": runs, "drift": contract.drift(frozen_of(td, st))}
 
@@ -321,6 +327,9 @@ def cmd_status(a) -> int:
     if not a.task_id:
         represented = {o["pool_doctor"]["pool"] for o in out if o["pool_doctor"]}
         for name in pool.pools(runner.config()):
+            backoff = pool.provider_backoff(name, runner.config())
+            if backoff:
+                unlisted_pools.append({**backoff, "pool": name})
             message = doctor.failure_message(name, doctor.pool_report(name))
             if message and name not in represented:
                 unlisted_pools.append({"pool": name, "status": "doctor_failed", "reason": message})
@@ -331,6 +340,9 @@ def cmd_status(a) -> int:
         print(f"{o['task_id']}: {o['status']}  owner={o['owner']}  verdict={(o['verdict'] or {}).get('verdict')}")
         if o["pool_problem"]:
             print(f"  {o['pool_problem']}")
+        if o["pool_backoff"]:
+            b = o["pool_backoff"]
+            print(f"  provider_refused account={b['account_alias']} until={b['until']}: {b['reason']}")
         if o["question"]:
             print(f"  QUESTION: {o['question']['text'][:200]}")
         for r in o["runs"]:
@@ -465,6 +477,9 @@ def cmd_inbox(a) -> int:
             items.append({"task_id": t, "status": st["status"], "owner": st["owner"],
                           "question": (st.get("question") or {}).get("text")})
     for name in pool.pools(runner.config()):
+        backoff = pool.provider_backoff(name, runner.config())
+        if backoff:
+            items.append({**backoff, "pool": name, "task_id": None, "owner": None, "question": backoff["reason"]})
         message = doctor.failure_message(name, doctor.pool_report(name))
         if message:
             items.append({"pool": name, "task_id": None, "owner": None, "status": "doctor_failed", "question": message})
@@ -505,7 +520,7 @@ def cmd_reconcile(a) -> int:
                 continue
             if last["state"] == "running" and adapter_kind(spec) == "pool":
                 if not _alive(last):
-                    outcome = pool.unfinished_outcome(last["pool"], last.get("station", ""), cfg)
+                    outcome = pool.unfinished_outcome(last["pool"], last.get("station", ""), cfg, last)
                     if runner.record_outcome(td, last["run_id"], outcome):
                         report.append({"task_id": t, "run_id": last["run_id"], "observed": outcome["state"]})
                 continue
@@ -658,7 +673,9 @@ def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
                     continue
                 rd = td.run_dir(run["run_id"]); rd.mkdir(parents=True, exist_ok=True)
                 (rd / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
-                run.update(state="running", station=station, started_at=now(), claimed_epoch=time.time())
+                run.update(state="running", station=station, started_at=now(), claimed_epoch=time.time(),
+                           log_start=pool.log_offset(pool_name, station),
+                           blocked_before=runner.file_fingerprint(Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")))
                 st["status"] = "running"
                 out = {"result": "CLAIMED", "task_id": t, "run_id": run["run_id"], "workdir": spec["workdir"],
                        "prompt": str(rd / "prompt.md"), "blocked_file": spec.get("blocked_file", "out/BLOCKED.md"),
@@ -682,23 +699,29 @@ def finish_card(task_id: str, run_id: str, station: str, late: bool = False) -> 
     run = next((r for r in st["runs"] if r["run_id"] == run_id), None)
     if not run or run.get("station") != station:
         return 3, {"result": "REFUSED", "reason": f"{run_id} was not claimed by {station}"}
+    if run["state"] != "running":
+        return 3, {"result": "REFUSED", "reason": f"{run_id} is no longer running"}
     spec = td.spec()
-    c = pool.pool_conf(runner.config(), run["pool"])
-    out = {"state": "exited", "exit_code": 0, "host": c.get("host", ""), "lane": c.get("lane", ""), "worker": station,
-           "account_alias": (pool.get_station(run["pool"], station) or {}).get("acct", ""),
-           "actual_model": pool.station_model(run["pool"], station), "model_source": "station-log",
-           "cost_basis": "shared-station"}
+    srec = pool.get_station(run["pool"], station) or {}
+    cur = srec.get("current") or {}
+    if late:
+        # A late finish invokes the actual timeout handler; 124 alone is never timeout evidence.
+        pool.record_execution(run["pool"], station, cur, exit_code=124, timed_out=True)
+        if srec.get("worker_pgid"):
+            runner.kill_group(srec["worker_pgid"])
+    run = {**run, "log_end": pool.log_offset(run["pool"], station),
+           "execution": {"exit_code": 124 if late else 0, "timed_out": late}}
     bf = Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")
-    if late:  # arrived after the card's deadline: a timeout, not a normal delivery (review 3, F5)
-        out.update(exit_code=124)
-    elif bf.is_file() and bf.stat().st_mtime >= run.get("claimed_epoch", 0):
-        out.update(state="blocked", question=bf.read_text(encoding="utf-8", errors="replace").strip()[:2000])
+    if "blocked_before" not in run and bf.is_file() and bf.stat().st_mtime < run.get("claimed_epoch", 0):
+        run["blocked_before"] = runner.file_fingerprint(bf)  # conservative legacy fallback
+    out = pool.unfinished_outcome(run["pool"], station, runner.config(), run, default="exited", blocked_path=bf)
     rec = runner.record_outcome(td, run_id, out)   # checks, under the task lock, that the run is still running
     with pool.station_lock(run["pool"], station):  # clear the station's hold only if it is *this* card (review 3, F2)
         srec = pool.get_station(run["pool"], station) or {}
         cur = srec.get("current") or {}
         if cur.get("task_id") == task_id and cur.get("run_id") == run_id:
             srec["current"] = None
+            srec["idle_log_offset"] = run["log_end"]
             write_json(pool.station_file(run["pool"], station), srec)
     if rec is None:
         return 3, {"result": "REFUSED", "reason": f"{run_id} is no longer running (timed out, lost or already finished)"}

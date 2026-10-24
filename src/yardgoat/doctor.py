@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import os
+import math
+import re
 import shlex
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from datetime import datetime
 from urllib.parse import quote
 
 from . import pool, runner
@@ -16,19 +19,46 @@ from .store import home, now, read_json, write_json
 PROBE_TIMEOUT = 20
 
 
-def record_path(name: str) -> Path:
-    return home() / "doctor" / (quote(name, safe="") + ".json")
+def record_path(name: str, kind: str = "pool") -> Path:
+    return home() / "doctor" / kind / (quote(name, safe="") + ".json")
+
+
+def valid_report(report) -> bool:
+    if not isinstance(report, dict) or type(report.get("ok")) is not bool:
+        return False
+    if "pool" not in report or (report["pool"] is not None and not isinstance(report["pool"], str)):
+        return False
+    if report.get("host") not in ("codex", "claude", "kimi", "shell"):
+        return False
+    if not all(isinstance(report.get(k), str) for k in ("lane", "account_alias", "checked_at", "reason")):
+        return False
+    epoch = report.get("checked_epoch")
+    if type(epoch) not in (int, float) or not math.isfinite(epoch) or epoch <= 0:
+        return False
+    try:
+        timestamp = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", report["checked_at"].replace("Z", "+00:00"))
+        datetime.fromisoformat(timestamp)
+    except ValueError:
+        return False
+    checks = report.get("checks")
+    if not isinstance(checks, list) or not all(isinstance(c, dict) and isinstance(c.get("name"), str)
+            and type(c.get("ok")) is bool and isinstance(c.get("reason"), str) for c in checks):
+        return False
+    required = {"startup", "host_path", "host_version", "launcher"} | ({"mailbox"} if report["pool"] else set())
+    names = [c["name"] for c in checks]
+    return required <= set(names) and len(names) == len(set(names)) and report["ok"] == all(c["ok"] for c in checks)
 
 
 def failure_message(name: str, report: dict | None) -> str | None:
-    if report and not report.get("ok"):
+    if valid_report(report) and report["pool"] == name and not report["ok"]:
         return f"池子 {name} 体检失败：{report.get('reason', 'unknown error')}"
     return None
 
 
 def pool_report(name: str) -> dict | None:
     try:
-        return read_json(record_path(name))
+        report = read_json(record_path(name))
+        return report if valid_report(report) and report["pool"] == name else None
     except (OSError, ValueError):
         return None
 
@@ -81,7 +111,9 @@ def run(cfg: dict, name: str | None = None, host: str = "codex", lane: str = "",
             report = _failed(request, "startup timed out before the probe returned")
     except (OSError, RuntimeError, ValueError) as e:
         report = _failed(request, str(e))
-    write_json(record_path(key), report)
+    path = record_path(key, "pool" if name else "direct")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, report)
     if name:
         write_json(pool.pool_dir(name) / "state.json", {"pool": name, "doctor": report,
                    "reason": failure_message(name, report)})
@@ -90,8 +122,10 @@ def run(cfg: dict, name: str | None = None, host: str = "codex", lane: str = "",
 
 def ensure(name: str, cfg: dict, acct: str) -> dict:
     report = pool_report(name)
+    ex = pool.pool_conf(cfg, name)
     try:
-        fresh = report and report.get("ok") and report.get("account_alias") == acct and \
+        fresh = report and report["ok"] and report["pool"] == name and \
+            report["host"] == ex["host"] and report["lane"] == ex.get("lane", "") and report["account_alias"] == acct and \
             0 <= time.time() - float(report["checked_epoch"]) < float(cfg.get("doctor_ttl_h", 12)) * 3600
     except (KeyError, TypeError, ValueError):
         fresh = False

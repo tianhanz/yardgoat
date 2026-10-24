@@ -49,7 +49,7 @@ def build_argv(td: TaskDir, spec: dict, run_dir: Path, cfg: dict, probe_argv: li
     prompt = "" if probe_argv is not None else prompt_text(td, spec)
     extra = list(cfg.get("host_args", {}).get(host, [])) + list(ex.get("args", []))
     if host == "codex":
-        argv = ["codex", "exec", "-s", ex.get("sandbox", "workspace-write"), "--skip-git-repo-check",
+        argv = ["codex", "exec", "--json", "-s", ex.get("sandbox", "workspace-write"), "--skip-git-repo-check",
                 "-C", spec["workdir"], "-o", str(run_dir / "last_message.md"), *extra, prompt]
     elif host == "claude":
         argv = ["claude", "-p", "--output-format", "stream-json", "--verbose", *extra, prompt]
@@ -198,18 +198,100 @@ PROVIDER_REFUSAL_PATTERNS = [r"flagged for possible", r"usage limit", r"You've r
 PROVIDER_REFUSAL_HINT = "换措辞或换通道后重发"
 
 
-def provider_refusal(log: Path, cfg: dict) -> str | None:
-    """Return the last matching line from the final 20 KB, without loading an entire station log."""
-    if not log.is_file():
-        return None
-    with log.open("rb") as f:
-        f.seek(max(0, log.stat().st_size - 20000))
-        tail = f.read().decode("utf-8", errors="replace")
+def log_segment(log: Path, start: int = 0, end: int | None = None, tail: bool = True) -> str:
+    """Read complete lines within one run's byte interval, bounded to 20 KB."""
+    try:
+        with log.open("rb") as f:
+            end = min(os.fstat(f.fileno()).st_size, end) if end is not None else os.fstat(f.fileno()).st_size
+            offset = max(start, end - 20000) if tail else start
+            if offset >= end:
+                return ""
+            if offset:
+                f.seek(offset - 1)
+                if f.read(1) != b"\n":
+                    f.readline(end - offset)  # never parse a fragment crossing the claim boundary
+            else:
+                f.seek(0)
+            return f.read(min(20000, max(0, end - f.tell()))).decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def provider_refusal(log: Path, cfg: dict, start: int = 0, end: int | None = None) -> str | None:
+    """Only host error envelopes are evidence; prose and nested tool output are not.
+
+    A later successful terminal event clears an intermediate refusal, including hosts that exit 0.
+    Plain logs have no reliable provenance, so keyword matching is limited to error payloads.
+    """
     patterns = cfg.get("provider_refusal_patterns", PROVIDER_REFUSAL_PATTERNS)
-    for line in reversed(tail.splitlines()):
-        if any(re.search(p, line, re.I) for p in patterns):
-            return line
-    return None
+    codes = {"rate_limit_exceeded", "rate_limit_error", "usage_limit_reached", "quota_exceeded",
+             "insufficient_quota", "policy_violation", "content_policy_violation"}
+    refusal = None
+    for line in log_segment(log, start, end).splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "turn.completed" or (kind == "result" and event.get("is_error") is False):
+            refusal = None
+            continue
+        if kind in ("error", "turn.failed"):
+            error = event.get("error", event.get("message", ""))
+        elif kind == "result" and event.get("is_error") is True:
+            error = event.get("errors", event.get("error", event.get("result", "")))
+        else:
+            continue
+        message = error.get("message", "") if isinstance(error, dict) else error
+        text = message if isinstance(message, str) else json.dumps(message, ensure_ascii=False)
+        code = error.get("code", error.get("type")) if isinstance(error, dict) else None
+        matched = isinstance(code, str) and code in codes
+        matched |= any(re.search(p, text, re.I) for p in patterns)
+        refusal = (text or str(code))[:2000] if matched else None
+    return refusal
+
+
+def classify_outcome(log: Path, cfg: dict, *, exit_code: int | None = None, timed_out: bool = False,
+                     start: int = 0, end: int | None = None, default: str = "lost",
+                     elapsed: float | None = None, blocked_path: Path | None = None,
+                     blocked_before: list[int] | None = None) -> dict:
+    """One precedence for finish and recovery: launch failure > actual timeout > refusal > other."""
+    out = {"state": default, "exit_code": exit_code, "timed_out": timed_out}
+    marker = next((s for s in log_segment(log, start, end, tail=False).splitlines()
+                   if s.startswith(LAUNCH_FAIL)), None)
+    if marker:
+        return {**out, "state": "launch_failed", "reason": marker[:500]}
+    if timed_out:
+        return {**out, "state": "exited", "exit_code": 124}
+    refusal = provider_refusal(log, cfg, start, end)
+    if refusal:
+        return {**out, "state": "provider_refused", "reason": refusal}
+    if exit_code in cfg.get("launcher_failure_codes", []) and elapsed is not None and elapsed < 120 \
+            and not detect_model(log)[0]:
+        lines = log_segment(log, start, end, tail=False).strip().splitlines()
+        return {**out, "state": "launch_failed", "reason": (lines[0] if lines else f"launcher exit {exit_code}")[:500]}
+    if default == "exited" and blocked_path is not None and blocked_path.is_file() \
+            and file_fingerprint(blocked_path) != blocked_before:
+        return {**out, "state": "blocked", "question": blocked_path.read_text(encoding="utf-8", errors="replace").strip()[:2000]}
+    if default == "lost":
+        out["reason"] = "worker process ended without finishing the card"
+    return out
+
+
+def execution_evidence(rd: Path) -> dict:
+    path = rd / "execution.json"
+    return read_json(path) if path.exists() else {}
+
+
+def file_fingerprint(path: Path) -> list[int] | None:
+    """Observe file changes without comparing filesystem timestamps to a finer-resolution clock."""
+    try:
+        s = path.stat()
+        return [s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns] if path.is_file() else None
+    except FileNotFoundError:
+        return None
 
 
 STATUS_OF = {"exited": "exited", "blocked": "blocked", "lost": "lost", "launch_failed": "launch_failed",
@@ -250,7 +332,7 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay
             receipt = {
                 "task_id": td.task_id, "run_id": run_id, "project": spec["project"], "attempt": int(run_id.lstrip("r")),
                 "adapter": spec.get("adapter", {}).get("kind", "direct"),
-                "exit_code": outcome.get("exit_code"), "timed_out": outcome.get("exit_code") == 124,
+                "exit_code": outcome.get("exit_code"), "timed_out": outcome.get("timed_out") is True,
                 "host": outcome.get("host", ex["host"]), "lane": outcome.get("lane", ex.get("lane", "")),
                 "account_alias": outcome.get("account_alias") or ex.get("acct", ""), "worker": outcome.get("worker"),
                 "actual_model": outcome.get("actual_model", ""), "model_source": outcome.get("model_source", "none"),
@@ -300,12 +382,16 @@ def run_and_receipt(td: TaskDir, run_id: str) -> int:
     rd = td.run_dir(run_id)
     rd.mkdir(parents=True, exist_ok=True)
     (rd / "script.sh").write_text(script_for(td, spec, rd, cfg), encoding="utf-8")
+    bf = Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")
+    blocked_before = file_fingerprint(bf)
     with td.locked() as box:
         run = next(r for r in box["state"]["runs"] if r["run_id"] == run_id)
         run["worker_pid"] = os.getpid()
+        run["blocked_before"] = blocked_before
     td.event("run.started", "runner", run_id=run_id)
     started = time.time()
     timeout = float(spec["budget"]["max_wall_min"]) * 60
+    timed_out = False
     with open(rd / "log", "wb") as log:
         # own process group: a timeout ends the worker *and* everything it spawned, and liveness is judged by the
         # group, so a worker that outlives this runner still counts as running (no parallel retry)
@@ -317,26 +403,16 @@ def run_and_receipt(td: TaskDir, run_id: str) -> int:
         try:
             rc = p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
+            # Persist the timeout handler decision before killing, so recovery preserves its priority.
+            write_json(rd / "execution.json", {"exit_code": 124, "timed_out": True, "elapsed": time.time() - started})
             kill_group(p.pid)
             p.wait()
             rc = 124
+    write_json(rd / "execution.json", {"exit_code": rc, "timed_out": timed_out, "elapsed": time.time() - started})
     model, model_src = detect_model(rd / "log")
-    out = {"state": "exited", "exit_code": rc, "actual_model": model, "model_source": model_src,
-           "cost_basis": detect_cost(rd / "log")}
-    codes = cfg.get("launcher_failure_codes", [])
-    head = (rd / "log").read_text(errors="replace")[:2000]
-    refusal = provider_refusal(rd / "log", cfg)
-    if any(LAUNCH_FAIL in l for l in head.splitlines()[:5]):
-        out.update(state="launch_failed", reason=next(l for l in head.splitlines() if LAUNCH_FAIL in l)[:500])
-    elif refusal:
-        out.update(state="provider_refused", reason=refusal)
-    elif rc in codes and model_src == "none" and time.time() - started < 120:
-        # the launcher refused before any agent started (bad lane, missing tool): an infrastructure
-        # failure, not an attempt at the task — it must not consume the task's attempt budget
-        first = (rd / "log").read_text(errors="replace").strip().splitlines()[:1]
-        out.update(state="launch_failed", reason=(first[0] if first else f"launcher exit {rc}")[:500])
-    bf = Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")
-    if out["state"] == "exited" and bf.is_file() and bf.stat().st_mtime >= started:
-        out.update(state="blocked", question=bf.read_text(encoding="utf-8", errors="replace").strip()[:2000])
+    out = classify_outcome(rd / "log", cfg, default="exited", blocked_path=bf, blocked_before=blocked_before,
+                           **execution_evidence(rd))
+    out.update(actual_model=model, model_source=model_src, cost_basis=detect_cost(rd / "log"))
     record_outcome(td, run_id, out)
     return rc

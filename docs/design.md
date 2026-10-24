@@ -74,19 +74,36 @@ is `bash`, and the launcher is bypassed just as for real shell workers.
 
 Pool probes also create and remove a file in a mailbox under the pool root. Probes use the next station's account,
 including account rotation. `--json` returns each check and its reason; a failed check exits 1. Results with timestamps
-live in `$YARDGOAT_HOME/doctor/<pool or host-lane>.json`; probe scripts and logs live under `doctor/runs/`. Pool health
+live in `$YARDGOAT_HOME/doctor/pool/<pool>.json` or `doctor/direct/<host-lane>.json`; probe scripts and logs live under `doctor/runs/`. Pool health
 is also stored in `pools/<pool>/state.json` and surfaced by `status` and `inbox`.
 
 Before starting a station, `pool.schedule` requires a successful result for that account newer than local
-`doctor_ttl_h` (default 12 hours). Missing, failed, malformed or expired records trigger a new probe. A failed probe
+`doctor_ttl_h` (default 12 hours). Cache reuse also checks the pool, host, lane, account, timestamp, boolean result and
+required checks (including mailbox for pools). Missing, failed, malformed or expired records trigger a new probe. Old
+unnamespaced cache files are ignored. A failed probe
 leaves cards queued and starts no station. Probes time out after 20 seconds; rerun doctor after changing local wiring
 to refresh the cached result immediately.
 
 The local `provider_refusal_patterns` list replaces the default case-insensitive regexes: `flagged for possible`,
-`usage limit`, `You've reached your`, `rate limit exceeded`. Matching scans the last 20 KB of the log and records the
-last matching line, even if the host exits 0. An explicit source/cwd launch failure retains its infrastructure
-classification. A pool wall-time cutoff retains its timeout classification. Owners can explicitly dispatch again;
-changing the frozen card requires a new task id.
+`usage limit`, `You've reached your`, `rate limit exceeded`. Patterns apply only to host error payloads, never plain
+text, assistant content or nested tool output. Recognized envelopes are `error`, `turn.failed`, and `result` with
+`is_error: true`; known quota/policy error codes also count. A later `turn.completed` or successful `result` clears an
+intermediate refusal. Codex launches request JSON events. Unknown host formats remain ordinary exits/lost runs rather
+than guessing from prose; shell fixtures simulate the same error envelopes. A final refusal can still exit 0.
+
+One classifier handles direct completion/recovery and pool completion/recovery. Priority is explicit launch failure,
+then a real timeout handler, then provider refusal, then ordinary exit/lost. Returning 124 alone is not timeout evidence.
+Direct execution evidence is stored in each run's `execution.json`; pool evidence is stored on the run and station.
+Claim records the shared log's byte offset and completion captures its end, so earlier cards cannot supply refusal
+evidence. Legacy pool runs without a boundary conservatively skip shared-log classification. Each scan is bounded to
+20 KB. BLOCKED files never override a timeout.
+
+If a station is refused before claiming a card (or in the idle interval after finishing one), its pool and host/lane/account
+enter a visible backoff. Records live in `pools/<pool>/provider-backoff.json` and `provider-backoffs/`; `status` and `inbox`
+show the account, reason and expiry. Scheduling waits until both applicable records expire, including other pools using
+the same host/lane/account. `provider_backoff_seconds` defaults to 300. A successful doctor probe does not clear this
+backoff, and queued cards receive no fabricated receipt. Owners can explicitly dispatch a refused task again; changing
+the frozen card requires a new task id.
 
 ## Card metadata
 
@@ -94,6 +111,8 @@ Specs may record `scope` (a list of paths/globs relative to workdir), `risk` (`l
 the default, or `l3` migrations/releases/permissions/CI), and optional `acceptance` (a sentence describing success).
 `quick --scope PATH --scope GLOB --risk l1 --acceptance TEXT` includes these in the spec and at the end of `CARD.md`.
 M1 only validates and records these fields; they do not change scheduling or grant permissions.
+An unchanged pre-M1 spec can be resubmitted without rewriting its frozen snapshot: comparison also tries the original
+shape without injected defaults. Explicitly adding scope/risk/acceptance, even default values, remains a content change.
 
 ## Adapters
 
