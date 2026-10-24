@@ -87,14 +87,46 @@ def queued_cards(name: str) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+def station_file(name: str, station: str) -> Path:
+    return pool_dir(name) / "stations" / f"{station}.json"
+
+
+@contextmanager
+def station_lock(name: str, station: str):
+    with open(pool_dir(name) / "stations" / f".{station}.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        yield
+
+
+def update_station(pool_name: str, station_id: str, only_if_state: str | None = None, **fields) -> dict | None:
+    """Re-read, merge, write — under the station's own lock, so parent and child never overwrite each other."""
+    with station_lock(pool_name, station_id):
+        f = station_file(pool_name, station_id)
+        rec = read_json(f) if f.exists() else {}
+        if only_if_state is not None and rec.get("state") != only_if_state:
+            return None
+        rec.update(fields)
+        write_json(f, rec)
+        return rec
+
+
+def get_station(name: str, station: str) -> dict | None:
+    f = station_file(name, station)
+    return read_json(f) if f.exists() else None
+
+
+def station_alive(rec: dict | None) -> bool:
+    return bool(rec) and rec.get("state") == "running" and (runner.pid_alive(rec.get("pid")) or runner.pid_alive(rec.get("launcher_pid")))
+
+
 def live_stations(name: str) -> list[dict]:
     res = []
     for f in sorted((pool_dir(name) / "stations").glob("*.json")):
         s = read_json(f)
-        if s.get("state") == "running" and (runner.pid_alive(s.get("pid")) or runner.pid_alive(s.get("launcher_pid"))):
+        if station_alive(s):
             res.append(s)
         elif s.get("state") == "running":
-            s["state"] = "gone"; s["ended_at"] = now(); write_json(f, s)
+            update_station(name, s["station"], only_if_state="running", state="gone", ended_at=now())
     return res
 
 
@@ -133,8 +165,7 @@ def start_station(name: str, c: dict, cfg: dict) -> str:
     d = pool_dir(name)
     n = 1 + max([int(f.stem.rsplit("-", 1)[-1]) for f in (d / "stations").glob("*.json")] or [0])
     station = f"{name}-st-{n}"
-    rec = {"station": station, "pool": name, "state": "running", "started_at": now(), "tasks": []}
-    write_json(d / "stations" / f"{station}.json", rec)
+    update_station(name, station, station=station, pool=name, state="running", started_at=now(), tasks=[], current=None)
     me = [sys.executable, "-m", "yardgoat.cli", "_station", name, station]
     pypath = str(Path(__file__).resolve().parents[1])
     envs = {"YARDGOAT_HOME": str(home()), "PYTHONPATH": pypath, "YARDGOAT_ORIG_PYTHONPATH": os.environ.get("PYTHONPATH", "")}
@@ -147,15 +178,22 @@ def start_station(name: str, c: dict, cfg: dict) -> str:
         r = subprocess.run(["tmux", "new-window", "-d", "-P", "-F", "#{pane_pid}", "-t", session, "-n", f"yg-{station}", cmd],
                            capture_output=True, text=True)
         if r.returncode != 0:
-            rec["state"] = "launch_failed"; rec["reason"] = r.stderr.strip()
+            update_station(name, station, state="launch_failed", reason=r.stderr.strip())
         else:
-            rec["launcher_pid"] = int(r.stdout.strip())
+            update_station(name, station, launcher_pid=int(r.stdout.strip()))
     else:
         p = subprocess.Popen(me, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True, env=dict(os.environ, **envs))
-        rec["launcher_pid"] = p.pid
-    write_json(d / "stations" / f"{station}.json", rec)
+        update_station(name, station, launcher_pid=p.pid)
     return station
+
+
+def mailbox_dir(name: str, station: str, c: dict) -> Path:
+    """Inside the pool root (the only place a sandboxed station may write); the broker reads it from outside."""
+    root = Path(os.path.expanduser(c.get("root", str(pool_dir(name) / "stations"))))
+    d = root / ".yardgoat-mailbox" / station
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
@@ -166,8 +204,8 @@ def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
     extra = list(cfg.get("host_args", {}).get(host, [])) + list(c.get("args", []))
     root = os.path.expanduser(c.get("root", str(sd)))
     if host == "codex":
+        # no --add-dir: the station writes only its pool root; claim/finish go through the mailbox in that root
         argv = ["codex", "exec", "-s", c.get("sandbox", "workspace-write"), "--skip-git-repo-check", "-C", root,
-                "--add-dir", str(home() / "tasks"), "--add-dir", str(home() / "pools"),
                 "-o", str(sd / f"{station}.last.md"), *extra, prompt]
     elif host == "claude":
         argv = ["claude", "-p", "--output-format", "stream-json", "--verbose", *extra, prompt]
@@ -183,26 +221,72 @@ def station_argv(name: str, station: str, c: dict, cfg: dict) -> list[str]:
 
 
 def run_station(name: str, station: str) -> int:
-    """Body of `yardgoat _station`: run the agent CLI with the loop prompt, then mark the station done."""
+    """Body of `yardgoat _station`: run the agent with the loop prompt and broker its claim/finish requests.
+
+    The agent may be sandboxed and cannot write the task store; it drops requests into its mailbox (inside the pool
+    root) and this wrapper, running outside the sandbox, executes them. The wrapper also enforces each card's
+    max_wall_min: past the deadline the whole agent process group is ended and the card is recorded as timed out."""
+    from . import cli  # local import: cli imports pool
     cfg = runner.config()
     c = pool_conf(cfg, name)
     d = pool_dir(name) / "stations"
-    f = d / f"{station}.json"
-    rec = read_json(f); rec["pid"] = os.getpid(); write_json(f, rec)
-    lines = ["set -u"] + [f"source {shlex.quote(os.path.expanduser(s))}" for s in cfg.get("source", [])]
-    lines += [f"cd {shlex.quote(os.path.expanduser(c.get('root', str(d))))}",
-              "export YARDGOAT_STATION=" + shlex.quote(station), "exec " + shlex.join(station_argv(name, station, c, cfg))]
+    mb = mailbox_dir(name, station, c)
+    update_station(name, station, pid=os.getpid(), mailbox=str(mb))
+    lines = ["set -u"] + [f"source {shlex.quote(os.path.expanduser(x))} || exit 3" for x in cfg.get("source", [])]
+    lines += [f"cd {shlex.quote(os.path.expanduser(c.get('root', str(d))))} || exit 3",
+              "export YARDGOAT_STATION=" + shlex.quote(station), "export YARDGOAT_MAILBOX=" + shlex.quote(str(mb)),
+              "exec " + shlex.join(station_argv(name, station, c, cfg))]
     (d / f"{station}.sh").write_text("\n".join(lines) + "\n")
     env = runner.worker_env()
     env["PATH"] = os.path.dirname(shutil.which("yardgoat") or sys.executable) + os.pathsep + env.get("PATH", "")
+    timed_out = None
     with open(d / f"{station}.log", "wb") as log:
-        rc = subprocess.run(["bash", str(d / f"{station}.sh")], stdin=subprocess.DEVNULL, stdout=log,
-                            stderr=subprocess.STDOUT, env=env).returncode
-    rec = read_json(f)
-    rec.update(state="exited", exit_code=rc, ended_at=now())
-    rec["model"], _ = runner.detect_model(d / f"{station}.log")
-    write_json(f, rec)
-    return rc
+        p = subprocess.Popen(["bash", str(d / f"{station}.sh")], stdin=subprocess.DEVNULL, stdout=log,
+                             stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        update_station(name, station, worker_pgid=p.pid)
+        while p.poll() is None:
+            serve_mailbox(name, station, mb, cli)
+            cur = (get_station(name, station) or {}).get("current")
+            if cur and time.time() > cur["deadline"]:
+                runner.kill_group(p.pid)
+                timed_out = cur
+                break
+            time.sleep(0.2)
+        p.wait()
+    serve_mailbox(name, station, mb, cli, respond_only=True)
+    cur = (get_station(name, station) or {}).get("current")
+    if cur:
+        from .store import TaskDir
+        if timed_out:
+            runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], {
+                "state": "exited", "exit_code": 124, "worker": station, "host": c.get("host", ""), "lane": c.get("lane", ""),
+                "actual_model": station_model(name, station), "model_source": "station-log", "cost_basis": "shared-station"})
+        else:
+            runner.record_outcome(TaskDir(cur["task_id"]), cur["run_id"], {
+                "state": "lost", "reason": f"station {station} exited without finishing the card", "worker": station})
+    rec = update_station(name, station, state="exited", exit_code=p.returncode, ended_at=now(), current=None,
+                         model=runner.detect_model(d / f"{station}.log")[0], timed_out=bool(timed_out))
+    return p.returncode or 0
+
+
+def serve_mailbox(name: str, station: str, mb: Path, cli, respond_only: bool = False) -> None:
+    for req in sorted(mb.glob("req-*.json")):
+        try:
+            r = json.loads(req.read_text())
+        except (OSError, ValueError):
+            continue  # still being written; next tick
+        if respond_only:
+            out = (3, {"result": "REFUSED", "reason": "station is shutting down"})
+        elif r.get("op") == "claim":
+            out = cli.claim_card(name, station)
+        elif r.get("op") == "finish":
+            out = cli.finish_card(r.get("task_id", ""), r.get("run_id", ""), station)
+        else:
+            out = (2, {"result": "ERROR", "reason": f"unknown op {r.get('op')!r}"})
+        tmp = mb / f".{req.stem}.resp.tmp"
+        tmp.write_text(json.dumps({"rc": out[0], "out": out[1]}, ensure_ascii=False))
+        os.replace(tmp, mb / req.name.replace("req-", "resp-"))
+        req.unlink(missing_ok=True)
 
 
 def station_model(name: str, station: str) -> str:

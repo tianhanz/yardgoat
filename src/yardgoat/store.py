@@ -70,7 +70,17 @@ class TaskDir:
     def state(self) -> dict:
         return read_json(self.path / "task.json")
 
+    @property
+    def frozen_path(self) -> Path:
+        return self.path.parent.parent / "frozen" / f"{self.task_id}.json"
+
     def spec(self) -> dict:
+        """The accepted spec. The authoritative copy lives outside the task store that stations may touch."""
+        f = self.frozen_path
+        if f.exists():
+            d = read_json(f)
+            if "spec" in d:
+                return d["spec"]
         return read_json(self.path / "spec.json")
 
     def event(self, kind: str, actor: str, **data) -> dict:

@@ -35,13 +35,16 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     oldest first, re-checking drift and lane policy at launch. A queued run counts as in flight (no duplicates) but
     not as an attempt; `cancel` removes it. Adapter runs are capped by the fleet they go to.
 
-12. **Pools: queue first, stations pull.** A task with `adapter.kind = "pool"` is only queued at dispatch. Stations
+12. **Pools: queue first, stations pull.** (Stations never write the task store: their `claim`/`finish` go through a
+    mailbox inside the pool root and are executed by the station wrapper outside any sandbox; the wrapper also cuts a
+    card off at its `max_wall_min`, ending the station's whole process group.) A task with `adapter.kind = "pool"` is only queued at dispatch. Stations
     (one agent CLI session each, started by Yardgoat within `max_stations` per pool and `max_concurrent` per machine)
     run a loop prompt: `claim` the oldest card → do it → `finish` → claim again, until `EMPTY` or
     `max_tasks_per_station`. Warm sessions are reused across cards; nothing is ever typed into a station. A card whose
     station dies is marked `lost`. Task workdirs must live under the pool's `root` (the station's writable root).
-13. **Frozen hashes have an authoritative copy** outside the directories stations may write
-    (`$YARDGOAT_HOME/frozen/`); a task whose `task.json` hashes disagree with it is treated as drifted.
+13. **The accepted spec and frozen hashes have an authoritative copy** outside the task store
+    (`$YARDGOAT_HOME/frozen/`); verification reads the spec from there, and any disagreement with `spec.json` or the
+    hashes in `task.json` is treated as drift.
 14. **`auto_close`** in a spec lets `reconcile` run the frozen verifier on the owner's behalf once a run exits.
 15. **Concurrency.** Every "check capacity, then start" decision (dispatch, reconcile, station scheduling) holds one
     machine-wide schedule lock; lock order is schedule → pool → task. Outcomes are committed exactly once, receipt and

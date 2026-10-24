@@ -65,7 +65,7 @@ def cmd_submit(a) -> int:
             return refuse(f"{td.task_id} already exists with different content (task ids are immutable)")
         write_json(td.path / "spec.json", spec)
         (home() / "frozen").mkdir(parents=True, exist_ok=True)   # authoritative copy, outside what stations may write
-        write_json(home() / "frozen" / f"{td.task_id}.json", {"content_hash": h, "frozen": frozen})
+        write_json(home() / "frozen" / f"{td.task_id}.json", {"content_hash": h, "frozen": frozen, "spec": spec})
         box["state"] = {"task_id": td.task_id, "content_hash": h, "frozen": frozen, "owner": a.as_,
                         "owner_history": [], "status": "accepted", "runs": [], "verdict": None,
                         "question": None, "accepted_at": now()}
@@ -75,13 +75,22 @@ def cmd_submit(a) -> int:
 
 
 def frozen_of(td: TaskDir, st: dict) -> dict:
-    f = home() / "frozen" / f"{td.task_id}.json"
-    if f.exists():
-        auth = read_json(f)["frozen"]
-        if auth != st["frozen"]:
-            return {**auth, "<task.json frozen hashes were altered>": ""}
-        return auth
-    return st["frozen"]
+    """Hashes to check for drift, from the authoritative copy. Any disagreement with the copies inside the task store
+    (task.json hashes, spec.json) is itself reported as drift: the store is not trusted to describe the task."""
+    f = td.frozen_path
+    if not f.exists():
+        return st["frozen"]
+    auth = read_json(f)
+    out = dict(auth["frozen"])
+    if auth["frozen"] != st["frozen"]:
+        out["<task.json frozen hashes were altered>"] = ""
+    if "spec" in auth:
+        try:
+            if read_json(td.path / "spec.json") != auth["spec"]:
+                out["<spec.json was altered>"] = ""
+        except (OSError, ValueError):
+            out["<spec.json is unreadable>"] = ""
+    return out
 
 
 DIRECT_MODES = ("tmux", "process")
@@ -334,11 +343,11 @@ def cmd_close(a) -> int:
     td = TaskDir(a.task_id)
     if not td.exists:
         return refuse(f"unknown task {a.task_id}")
-    rc, _ = do_close(td, a.as_)
+    rc, _ = do_close(td, a.as_, echo=True)
     return rc
 
 
-def do_close(td: TaskDir, who: str, actor_note: str = "") -> tuple[int, str | None]:
+def do_close(td: TaskDir, who: str, actor_note: str = "", echo: bool = False) -> tuple[int, str | None]:
     with td.locked() as box:
         st = box["state"]
         if st["owner"] != who:
@@ -378,7 +387,8 @@ def do_close(td: TaskDir, who: str, actor_note: str = "") -> tuple[int, str | No
         write_json(rec_p, rec)
         st["verdict"] = {"run_id": last["run_id"], "verdict": verdict, "by": who, "at": checked}
     td.event("run.verified", who, run_id=last["run_id"], verdict=verdict, note=actor_note)
-    print(json.dumps({"task_id": td.task_id, "run_id": last["run_id"], "verdict": verdict}))
+    if echo:
+        print(json.dumps({"task_id": td.task_id, "run_id": last["run_id"], "verdict": verdict}))
     return (0 if verdict == "PASS" else (1 if verdict == "FAIL" else 2)), verdict
 
 
@@ -473,7 +483,7 @@ def cmd_reconcile(a) -> int:
                                                                   "worker": last.get("station")}):
                         report.append({"task_id": t, "run_id": last["run_id"], "observed": "lost"})
                 continue
-            if last["state"] == "exited" and spec.get("auto_close"):
+            if last["state"] == "exited" and spec.get("auto_close") and st["status"] == "exited":
                 rc, verdict = do_close(td, st["owner"], actor_note="auto_close by reconcile")
                 if verdict:
                     report.append({"task_id": t, "run_id": last["run_id"], "auto_closed": verdict})
@@ -588,18 +598,20 @@ def cmd_quick(a) -> int:
     return do_dispatch(TaskDir(tid), a.as_)
 
 
-def cmd_claim(a) -> int:
-    """A station takes the oldest queued card of its pool. Prints the card location, or result=EMPTY."""
+def claim_card(pool_name: str, station: str) -> tuple[int, dict]:
+    """Give the oldest queued card of a pool to a live station. One card at a time per station."""
     cfg = runner.config()
-    c = pool.pool_conf(cfg, a.pool)
-    rec_f = pool.pool_dir(a.pool) / "stations" / f"{a.station}.json"
-    if not rec_f.exists():
-        return refuse(f"unknown station {a.station}")
-    srec = read_json(rec_f)
-    if len(srec.get("tasks", [])) >= int(c.get("max_tasks_per_station", 5)):
-        print(json.dumps({"result": "EMPTY", "reason": "this station reached max_tasks_per_station"})); return 0
-    with pool.pool_lock(a.pool):
-        for _, t in pool.queued_cards(a.pool):
+    c = pool.pool_conf(cfg, pool_name)
+    with pool.pool_lock(pool_name):
+        with pool.station_lock(pool_name, station):
+            rec = pool.get_station(pool_name, station)
+            if not rec or rec.get("state") != "running" or not pool.station_alive(rec):
+                return 3, {"result": "REFUSED", "reason": f"{station} is not a live station of pool {pool_name}"}
+            if rec.get("current"):
+                return 3, {"result": "REFUSED", "reason": f"{station} still holds {rec['current']['task_id']}; finish it first"}
+            if len(rec.get("tasks", [])) >= int(c.get("max_tasks_per_station", 5)):
+                return 0, {"result": "EMPTY", "reason": "this station reached max_tasks_per_station"}
+        for _, t in pool.queued_cards(pool_name):
             td = TaskDir(t)
             with td.locked() as box:
                 st = box["state"]
@@ -613,36 +625,79 @@ def cmd_claim(a) -> int:
                     continue
                 rd = td.run_dir(run["run_id"]); rd.mkdir(parents=True, exist_ok=True)
                 (rd / "prompt.md").write_text(runner.prompt_text(td, spec), encoding="utf-8")
-                run.update(state="running", station=a.station, started_at=now(), claimed_epoch=time.time())
+                run.update(state="running", station=station, started_at=now(), claimed_epoch=time.time())
                 st["status"] = "running"
                 out = {"result": "CLAIMED", "task_id": t, "run_id": run["run_id"], "workdir": spec["workdir"],
                        "prompt": str(rd / "prompt.md"), "blocked_file": spec.get("blocked_file", "out/BLOCKED.md"),
                        "outputs": spec["outputs"]}
-            td.event("run.claimed", a.station, run_id=out["run_id"], pool=a.pool)
-            srec = read_json(rec_f); srec.setdefault("tasks", []).append(f"{t}/{out['run_id']}"); write_json(rec_f, srec)
-            print(json.dumps(out, ensure_ascii=False)); return 0
-    print(json.dumps({"result": "EMPTY"})); return 0
+                deadline = time.time() + float(spec["budget"]["max_wall_min"]) * 60
+            with pool.station_lock(pool_name, station):
+                rec = pool.get_station(pool_name, station)
+                rec.setdefault("tasks", []).append(f"{t}/{out['run_id']}")
+                rec["current"] = {"task_id": t, "run_id": out["run_id"], "deadline": deadline}
+                write_json(pool.station_file(pool_name, station), rec)
+            td.event("run.claimed", station, run_id=out["run_id"], pool=pool_name)
+            return 0, out
+    return 0, {"result": "EMPTY"}
 
 
-def cmd_finish(a) -> int:
-    td = TaskDir(a.task_id)
+def finish_card(task_id: str, run_id: str, station: str) -> tuple[int, dict]:
+    td = TaskDir(task_id)
     if not td.exists:
-        return refuse(f"unknown task {a.task_id}")
+        return 3, {"result": "REFUSED", "reason": f"unknown task {task_id}"}
     st = td.state()
-    run = next((r for r in st["runs"] if r["run_id"] == a.run), None)
-    if not run or run["state"] != "running" or run.get("station") != a.station:
-        return refuse(f"{a.run} is not a running card claimed by {a.station}")
+    run = next((r for r in st["runs"] if r["run_id"] == run_id), None)
+    if not run or run.get("station") != station:
+        return 3, {"result": "REFUSED", "reason": f"{run_id} was not claimed by {station}"}
     spec = td.spec()
     c = pool.pool_conf(runner.config(), run["pool"])
-    out = {"state": "exited", "exit_code": 0, "host": c.get("host", ""), "lane": c.get("lane", ""), "worker": a.station,
-           "actual_model": pool.station_model(run["pool"], a.station), "model_source": "station-log",
+    out = {"state": "exited", "exit_code": 0, "host": c.get("host", ""), "lane": c.get("lane", ""), "worker": station,
+           "actual_model": pool.station_model(run["pool"], station), "model_source": "station-log",
            "cost_basis": "shared-station"}
     bf = Path(spec["workdir"]) / spec.get("blocked_file", "out/BLOCKED.md")
     if bf.is_file() and bf.stat().st_mtime >= run.get("claimed_epoch", 0):
         out.update(state="blocked", question=bf.read_text(encoding="utf-8", errors="replace").strip()[:2000])
-    runner.record_outcome(td, a.run, out)
-    print(json.dumps({"task_id": td.task_id, "run_id": a.run, "result": out["state"]}))
-    return 0
+    rec = runner.record_outcome(td, run_id, out)   # checks, under the task lock, that the run is still running
+    pool.update_station(run["pool"], station, current=None)
+    if rec is None:
+        return 3, {"result": "REFUSED", "reason": f"{run_id} is no longer running (timed out, lost or already finished)"}
+    return 0, {"task_id": task_id, "run_id": run_id, "result": out["state"]}
+
+
+def _via_mailbox(op: dict) -> int:
+    """Inside a station: hand the request to the station wrapper (outside any sandbox) and wait for its answer."""
+    import uuid
+    mb = Path(os.environ["YARDGOAT_MAILBOX"])
+    rid = uuid.uuid4().hex[:12]
+    tmp = mb / f".req-{rid}.tmp"
+    tmp.write_text(json.dumps(op, ensure_ascii=False))
+    os.replace(tmp, mb / f"req-{rid}.json")
+    resp = mb / f"resp-{rid}.json"
+    end = time.time() + 300
+    while time.time() < end:
+        if resp.exists():
+            r = json.loads(resp.read_text()); resp.unlink(missing_ok=True)
+            print(json.dumps(r["out"], ensure_ascii=False))
+            return r["rc"]
+        time.sleep(0.2)
+    print(json.dumps({"result": "ERROR", "reason": "station wrapper did not answer within 300 s"}))
+    return 2
+
+
+def cmd_claim(a) -> int:
+    if os.environ.get("YARDGOAT_MAILBOX"):
+        return _via_mailbox({"op": "claim"})
+    rc, out = claim_card(a.pool, a.station)
+    print(json.dumps(out, ensure_ascii=False))
+    return rc
+
+
+def cmd_finish(a) -> int:
+    if os.environ.get("YARDGOAT_MAILBOX"):
+        return _via_mailbox({"op": "finish", "task_id": a.task_id, "run_id": a.run})
+    rc, out = finish_card(a.task_id, a.run, a.station)
+    print(json.dumps(out, ensure_ascii=False))
+    return rc
 
 
 def cmd_cancel(a) -> int:
