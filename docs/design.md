@@ -23,7 +23,7 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
 2. **One owner.** Only the current owner can dispatch or close. Ownership moves only through `takeover --from <current owner>`, which records whether a run was in flight.
 3. **No duplicate dispatch.** While a run is alive, `dispatch` returns the existing run. A run that exited must be verified before another attempt.
 4. **Frozen verification.** The card and every file listed in `verifier.freeze` are hashed at submit; any drift blocks both dispatch and close.
-5. **Exited ≠ verified.** The runner only writes a receipt with `status: exited`. `close` runs the verifier: exit 0 → `passed`, exit 1 → `failed` (retry allowed within `budget.max_attempts`), anything else → `verifier_error` (a crashing verifier is not a failing deliverable).
+5. **Exited ≠ verified.** A normal worker exit only writes a receipt with `status: exited`. `close` runs the verifier: exit 0 → `passed`, exit 1 → `failed` (retry allowed within `budget.max_attempts`), anything else → `verifier_error` (a crashing verifier is not a failing deliverable).
 6. **Bounded attempts.** When the budget is spent the task becomes `exhausted` and needs a human.
 
 7. **Lane policy at the dispatch edge.** If a spec lists `allowed_lanes`, the executor lane must be in it; lanes in the local config's `forbidden_lanes` are refused on that machine regardless of the spec.
@@ -42,7 +42,7 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     run a loop prompt: `claim` the oldest card → do it → `finish` → claim again (a pool adds one station per `spawn_per_queued` waiting
     cards, default 1, so small batches stay on one warm station), until `EMPTY` or
     `max_tasks_per_station`. Warm sessions are reused across cards; nothing is ever typed into a station. A card whose
-    station dies is marked `lost`. Task workdirs must live under the pool's `root` (the station's writable root).
+    station dies is marked `lost`, unless its log identifies a provider refusal (invariant 19). Task workdirs must live under the pool's `root` (the station's writable root).
 13. **The accepted spec and frozen hashes have an authoritative copy** outside the task store
     (`$YARDGOAT_HOME/frozen/`); verification reads the spec from there, and any disagreement with `spec.json` or the
     hashes in `task.json` is treated as drift.
@@ -57,6 +57,43 @@ lives in `$YARDGOAT_CONFIG` (default `~/.config/yardgoat/config.json`), never in
     work landed (`probe`); if it cannot tell, the run is `submit_unknown`, blocks further dispatch and shows in the inbox.
 18. **Environment.** Workers get the tmux server's environment plus the local config's `source` files and launcher —
     deliberately not the dispatcher's environment; `pass_env` is an explicit allowlist.
+19. **Provider refusals are not attempts.** A direct run whose final log matches a configured refusal pattern, or an
+    unfinished pool card whose exiting station logs such a refusal, becomes `provider_refused`. The receipt and
+    `run.provider_refused` event preserve the matching line. This state never spends the attempt budget and appears
+    in the inbox with a request to reword or switch lanes before resending. Reconcile does not automatically retry it.
+    Lost-wrapper recovery and receipt replay preserve the same classification.
+
+## Launch-chain health checks
+
+`yardgoat doctor --pool P` or `yardgoat doctor --host H --lane L --acct A` runs a probe through the same
+tmux/background launcher and daemon environment as real work. It reuses `runner.script_for` for direct work and
+`pool.station_argv` plus the shared station script for pools, including sources, cwd, launcher placeholders and
+`pass_env`. Only the final host command is replaced: the probe checks command lookup and `--version`; it never
+sends a prompt to a model. The launcher must return 0 and actually execute the probe. For `host: shell`, the host
+is `bash`, and the launcher is bypassed just as for real shell workers.
+
+Pool probes also create and remove a file in a mailbox under the pool root. Probes use the next station's account,
+including account rotation. `--json` returns each check and its reason; a failed check exits 1. Results with timestamps
+live in `$YARDGOAT_HOME/doctor/<pool or host-lane>.json`; probe scripts and logs live under `doctor/runs/`. Pool health
+is also stored in `pools/<pool>/state.json` and surfaced by `status` and `inbox`.
+
+Before starting a station, `pool.schedule` requires a successful result for that account newer than local
+`doctor_ttl_h` (default 12 hours). Missing, failed, malformed or expired records trigger a new probe. A failed probe
+leaves cards queued and starts no station. Probes time out after 20 seconds; rerun doctor after changing local wiring
+to refresh the cached result immediately.
+
+The local `provider_refusal_patterns` list replaces the default case-insensitive regexes: `flagged for possible`,
+`usage limit`, `You've reached your`, `rate limit exceeded`. Matching scans the last 20 KB of the log and records the
+last matching line, even if the host exits 0. An explicit source/cwd launch failure retains its infrastructure
+classification. A pool wall-time cutoff retains its timeout classification. Owners can explicitly dispatch again;
+changing the frozen card requires a new task id.
+
+## Card metadata
+
+Specs may record `scope` (a list of paths/globs relative to workdir), `risk` (`l1` documentation, `l2` ordinary work,
+the default, or `l3` migrations/releases/permissions/CI), and optional `acceptance` (a sentence describing success).
+`quick --scope PATH --scope GLOB --risk l1 --acceptance TEXT` includes these in the spec and at the end of `CARD.md`.
+M1 only validates and records these fields; they do not change scheduling or grant permissions.
 
 ## Adapters
 

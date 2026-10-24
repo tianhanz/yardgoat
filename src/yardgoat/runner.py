@@ -43,10 +43,10 @@ def prompt_text(td: TaskDir, spec: dict) -> str:
     return text
 
 
-def build_argv(td: TaskDir, spec: dict, run_dir: Path, cfg: dict) -> list[str]:
+def build_argv(td: TaskDir, spec: dict, run_dir: Path, cfg: dict, probe_argv: list[str] | None = None) -> list[str]:
     ex = spec["executor"]
     host = ex["host"]
-    prompt = prompt_text(td, spec)
+    prompt = "" if probe_argv is not None else prompt_text(td, spec)
     extra = list(cfg.get("host_args", {}).get(host, [])) + list(ex.get("args", []))
     if host == "codex":
         argv = ["codex", "exec", "-s", ex.get("sandbox", "workspace-write"), "--skip-git-repo-check",
@@ -57,6 +57,8 @@ def build_argv(td: TaskDir, spec: dict, run_dir: Path, cfg: dict) -> list[str]:
         argv = ["kimi", "--prompt", prompt, "--output-format", "stream-json", *extra]
     else:  # shell
         argv = ["bash", "-c", ex["command"]]
+    if probe_argv is not None:
+        argv = probe_argv
     launcher = cfg.get("launcher") if host != "shell" else None
     if launcher:
         fill = {"host": host, "lane": ex.get("lane", ""), "acct": ex.get("acct", "")}
@@ -67,44 +69,55 @@ def build_argv(td: TaskDir, spec: dict, run_dir: Path, cfg: dict) -> list[str]:
 LAUNCH_FAIL = "yardgoat-launch-failed:"
 
 
-def script_for(td: TaskDir, spec: dict, run_dir: Path, cfg: dict) -> str:
+def shell_script(workdir: str, cfg: dict, argv: list[str], exports: dict | None = None) -> str:
+    """The common source → cwd → launcher/host chain, also used by station probes."""
     lines = ["set -u"]
     for f in cfg.get("source", []):
         q = shlex.quote(os.path.expanduser(f))
         lines.append(f"source {q} || {{ echo {shlex.quote(LAUNCH_FAIL + ' source ' + f)}; exit 3; }}")
-    w = shlex.quote(spec["workdir"])
-    lines.append(f"cd {w} || {{ echo {shlex.quote(LAUNCH_FAIL + ' cd ' + spec['workdir'])}; exit 3; }}")
-    lines.append("exec " + shlex.join(build_argv(td, spec, run_dir, cfg)))
+    w = shlex.quote(workdir)
+    lines.append(f"cd {w} || {{ echo {shlex.quote(LAUNCH_FAIL + ' cd ' + workdir)}; exit 3; }}")
+    lines.extend(f"export {k}={shlex.quote(v)}" for k, v in (exports or {}).items())
+    lines.append("exec " + shlex.join(argv))
     return "\n".join(lines) + "\n"
+
+
+def script_for(td: TaskDir, spec: dict, run_dir: Path, cfg: dict, probe_argv: list[str] | None = None) -> str:
+    return shell_script(spec["workdir"], cfg, build_argv(td, spec, run_dir, cfg, probe_argv))
 
 
 def launch(td: TaskDir, run_id: str, cfg: dict) -> dict:
     """Start `yardgoat _run` detached: in a tmux window when configured, else as a background process."""
     me = [sys.executable, "-m", "yardgoat.cli", "_run", td.task_id, run_id]
+    return launch_daemon(me, cfg, str(td.path.parent.parent), f"yg-{td.task_id[:24]}-{run_id}", linger=180)
+
+
+def launch_daemon(me: list[str], cfg: dict, root: str, window: str, linger: int = 0) -> dict:
+    """Shared outer launch: direct runner, station wrapper and doctor get the same environment."""
     # Only the directory that holds the yardgoat package — never our whole sys.path. Leaking sys.path
     # (stdlib of *this* interpreter) into the worker breaks every other Python the worker starts
     # (2026-10-23: a 3.13 sys.path made the host's 3.10 helpers crash before the agent started).
     pypath = str(Path(__file__).resolve().parents[1])
     orig = os.environ.get("PYTHONPATH", "")
-    env_prefix = (f"YARDGOAT_HOME={shlex.quote(str(td.path.parent.parent))} PYTHONPATH={shlex.quote(pypath)} "
-                  f"YARDGOAT_ORIG_PYTHONPATH={shlex.quote(orig)} ")
+    envs = {"YARDGOAT_HOME": root, "PYTHONPATH": pypath, "YARDGOAT_ORIG_PYTHONPATH": orig}
     if os.environ.get("YARDGOAT_CONFIG"):
-        env_prefix += f"YARDGOAT_CONFIG={shlex.quote(os.environ['YARDGOAT_CONFIG'])} "
+        envs["YARDGOAT_CONFIG"] = os.environ["YARDGOAT_CONFIG"]
     # A tmux window inherits the tmux *server's* environment, not the caller's. Workers are configured by the local
     # config (source + launcher), deliberately not by whoever dispatched; pass_env is an explicit allowlist.
     for k in cfg.get("pass_env", []):
         if k in os.environ:
-            env_prefix += f"{k}={shlex.quote(os.environ[k])} "
+            envs[k] = os.environ[k]
     session = cfg.get("tmux_session")
     if session and shutil.which("tmux") and not os.environ.get("YARDGOAT_NO_TMUX"):
-        window = f"yg-{td.task_id[:24]}-{run_id}"
-        cmd = env_prefix + shlex.join(me) + "; echo '[yardgoat] run finished; window closes in 180s'; sleep 180"
+        cmd = " ".join(f"{k}={shlex.quote(v)}" for k, v in envs.items()) + " " + shlex.join(me)
+        if linger:
+            cmd += f"; echo '[yardgoat] finished; window closes in {linger}s'; sleep {linger}"
         r = subprocess.run(["tmux", "new-window", "-d", "-P", "-F", "#{pane_pid}", "-t", session, "-n", window, cmd],
                            capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError("tmux new-window failed: " + r.stderr.strip())
         return {"mode": "tmux", "window": f"{session}:{window}", "pid": int(r.stdout.strip())}
-    env = dict(os.environ, YARDGOAT_HOME=str(td.path.parent.parent), PYTHONPATH=pypath, YARDGOAT_ORIG_PYTHONPATH=orig)
+    env = dict(os.environ, **envs)
     p = subprocess.Popen(me, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=env)
     return {"mode": "process", "window": None, "pid": p.pid}
@@ -181,7 +194,26 @@ def detect_cost(log: Path) -> str:
     return "unknown"
 
 
-STATUS_OF = {"exited": "exited", "blocked": "blocked", "lost": "lost", "launch_failed": "launch_failed"}
+PROVIDER_REFUSAL_PATTERNS = [r"flagged for possible", r"usage limit", r"You've reached your", r"rate limit exceeded"]
+PROVIDER_REFUSAL_HINT = "换措辞或换通道后重发"
+
+
+def provider_refusal(log: Path, cfg: dict) -> str | None:
+    """Return the last matching line from the final 20 KB, without loading an entire station log."""
+    if not log.is_file():
+        return None
+    with log.open("rb") as f:
+        f.seek(max(0, log.stat().st_size - 20000))
+        tail = f.read().decode("utf-8", errors="replace")
+    patterns = cfg.get("provider_refusal_patterns", PROVIDER_REFUSAL_PATTERNS)
+    for line in reversed(tail.splitlines()):
+        if any(re.search(p, line, re.I) for p in patterns):
+            return line
+    return None
+
+
+STATUS_OF = {"exited": "exited", "blocked": "blocked", "lost": "lost", "launch_failed": "launch_failed",
+             "provider_refused": "provider_refused"}
 STATE_OF = {v: k for k, v in STATUS_OF.items()}
 
 
@@ -227,7 +259,7 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay
             }
             if state == "blocked":
                 receipt["question"] = outcome.get("question", "")
-            if state in ("lost", "launch_failed"):
+            if state in ("lost", "launch_failed", "provider_refused"):
                 receipt["reason"] = outcome.get("reason", "")
             write_json(rd / "receipt.json", receipt)
         run.update(state=state, exit_code=receipt.get("exit_code"), finished_at=receipt["finished_at"])
@@ -238,10 +270,16 @@ def record_outcome(td: TaskDir, run_id: str, outcome: dict | None = None, replay
             st["question"] = {"run_id": run_id, "text": receipt.get("question", ""), "at": receipt["finished_at"]}
         elif state in ("lost", "launch_failed"):
             st["status"] = "accepted"  # may be dispatched again within budget
+        elif state == "provider_refused":
+            st["status"] = state
+            st["question"] = {"run_id": run_id, "text": receipt.get("reason", "") + "\n" + PROVIDER_REFUSAL_HINT,
+                              "at": receipt["finished_at"]}
         else:
             st["status"] = "exited"
-    td.event({"exited": "run.exited", "blocked": "task.parked", "lost": "run.lost", "launch_failed": "run.launch_failed"}[state],
-             "runner", run_id=run_id, exit_code=receipt.get("exit_code"), replay=replay)
+    td.event({"exited": "run.exited", "blocked": "task.parked", "lost": "run.lost", "launch_failed": "run.launch_failed",
+              "provider_refused": "run.provider_refused"}[state],
+             "runner", run_id=run_id, exit_code=receipt.get("exit_code"), replay=replay,
+             **({"reason": receipt["reason"]} if state == "provider_refused" else {}))
     return receipt
 
 
@@ -287,8 +325,11 @@ def run_and_receipt(td: TaskDir, run_id: str) -> int:
            "cost_basis": detect_cost(rd / "log")}
     codes = cfg.get("launcher_failure_codes", [])
     head = (rd / "log").read_text(errors="replace")[:2000]
+    refusal = provider_refusal(rd / "log", cfg)
     if any(LAUNCH_FAIL in l for l in head.splitlines()[:5]):
         out.update(state="launch_failed", reason=next(l for l in head.splitlines() if LAUNCH_FAIL in l)[:500])
+    elif refusal:
+        out.update(state="provider_refused", reason=refusal)
     elif rc in codes and model_src == "none" and time.time() - started < 120:
         # the launcher refused before any agent started (bad lane, missing tool): an infrastructure
         # failure, not an attempt at the task — it must not consume the task's attempt budget

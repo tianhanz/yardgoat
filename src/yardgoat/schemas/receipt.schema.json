@@ -73,7 +73,8 @@
     "passed",
     "failed",
     "verifier_error",
-    "launch_failed"
+    "launch_failed",
+    "provider_refused"
    ]
   },
   "verifier": {

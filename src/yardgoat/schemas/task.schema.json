@@ -148,6 +148,29 @@
   "auto_close": {
    "type": "boolean",
    "description": "reconcile runs the frozen verifier on the owner's behalf once a run exits"
+  },
+  "scope": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "minLength": 1,
+    "pattern": "^(?!/|~)(?!.*(?:^|/)\\.\\.(?:/|$)).+"
+   },
+   "description": "Expected files or directories relative to workdir; globs allowed. Recorded only, not a scheduling constraint."
+  },
+  "risk": {
+   "type": "string",
+   "enum": [
+    "l1",
+    "l2",
+    "l3"
+   ],
+   "default": "l2",
+   "description": "l1 documentation; l2 ordinary work; l3 migrations, releases, permissions or CI. Recorded only."
+  },
+  "acceptance": {
+   "type": "string",
+   "description": "Optional one-sentence acceptance description."
   }
  }
 }

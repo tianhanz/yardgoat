@@ -31,7 +31,8 @@
     "task.archived",
     "run.queued",
     "run.cancelled",
-    "run.claimed"
+    "run.claimed",
+    "run.provider_refused"
    ]
   },
   "actor": {
@@ -39,6 +40,10 @@
   },
   "dedupe_key": {
    "type": "string"
+  },
+  "reason": {
+   "type": "string",
+   "description": "Matching provider refusal log line, when applicable."
   }
  }
 }

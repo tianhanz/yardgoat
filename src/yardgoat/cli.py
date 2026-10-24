@@ -32,11 +32,11 @@ import sys
 import time
 from pathlib import Path
 
-from . import adapters, contract, pool, runner
+from . import adapters, contract, doctor, pool, runner
 from .store import TaskDir, home, list_tasks, now, read_json, write_json
 
 REFUSED = 3
-COUNTED = ("exited", "failed", "verified", "lost", "verify_error")  # blocked / launch_failed don't use the budget
+COUNTED = ("exited", "failed", "verified", "lost", "verify_error")  # blocked / launch_failed / provider_refused don't count
 
 
 def refuse(msg: str) -> int:
@@ -113,8 +113,7 @@ def _alive(run: dict) -> bool:
             return True
         if not rec.exists():
             return False
-        r = read_json(rec)
-        return r.get("state") == "running" and (runner.pid_alive(r.get("pid")) or runner.pid_alive(r.get("launcher_pid")))
+        return pool.station_alive(read_json(rec))
     return True  # file-pool and plugin adapters: in flight until their poll() reports an outcome
 
 
@@ -167,6 +166,14 @@ def do_dispatch_locked(td: TaskDir, who: str, actor_note: str = "", echo: bool =
         last = (td.state()["runs"] or [None])[-1]
         if last and _receipt_waiting(td, last):      # a writer died between receipt and state: finish its commit
             runner.record_outcome(td, last["run_id"], replay=True)
+        elif last and last["state"] == "running" and not _alive(last):
+            spec = td.spec()
+            if adapter_kind(spec) == "pool":
+                outcome = pool.unfinished_outcome(last["pool"], last.get("station", ""), cfg)
+            else:
+                outcome = adapters.get(adapter_kind(spec), cfg).poll(td, last, spec, cfg)
+            if outcome:
+                runner.record_outcome(td, last["run_id"], outcome)
         with td.locked() as box:
             st = box["state"]
             if st["owner"] != who:
@@ -298,7 +305,10 @@ def _status_obj(td: TaskDir) -> dict:
         rec = td.run_dir(r["run_id"]) / "receipt.json"
         rr["receipt"] = json.loads(rec.read_text()) if rec.exists() else None
         runs.append(rr)
+    ad = td.spec().get("adapter", {})
+    health = doctor.pool_report(ad["pool"]) if ad.get("kind") == "pool" else None
     return {"task_id": td.task_id, "status": st["status"], "owner": st["owner"], "owner_history": st["owner_history"],
+            "pool_doctor": health, "pool_problem": doctor.failure_message(ad.get("pool", ""), health),
             "verdict": st["verdict"], "question": st.get("question"), "runs": runs, "drift": contract.drift(frozen_of(td, st))}
 
 
@@ -307,11 +317,20 @@ def cmd_status(a) -> int:
     out = [_status_obj(TaskDir(t)) for t in ids if TaskDir(t).exists]
     if a.task_id and not out:
         return refuse(f"unknown task {a.task_id}")
+    unlisted_pools = []
+    if not a.task_id:
+        represented = {o["pool_doctor"]["pool"] for o in out if o["pool_doctor"]}
+        for name in pool.pools(runner.config()):
+            message = doctor.failure_message(name, doctor.pool_report(name))
+            if message and name not in represented:
+                unlisted_pools.append({"pool": name, "status": "doctor_failed", "reason": message})
     if a.json:
-        print(json.dumps(out if not a.task_id else out[0], ensure_ascii=False, indent=1))
+        print(json.dumps(out + unlisted_pools if not a.task_id else out[0], ensure_ascii=False, indent=1))
         return 0
     for o in out:
         print(f"{o['task_id']}: {o['status']}  owner={o['owner']}  verdict={(o['verdict'] or {}).get('verdict')}")
+        if o["pool_problem"]:
+            print(f"  {o['pool_problem']}")
         if o["question"]:
             print(f"  QUESTION: {o['question']['text'][:200]}")
         for r in o["runs"]:
@@ -320,6 +339,8 @@ def cmd_status(a) -> int:
             print(f"  {r['run_id']}: {r['state']} alive={r['alive']} by={r['dispatched_by']}{tail}")
         if o["drift"]:
             print(f"  DRIFT: {o['drift']}")
+    for item in unlisted_pools:
+        print(item["reason"])
     return 0
 
 
@@ -440,14 +461,18 @@ def cmd_inbox(a) -> int:
     items = []
     for t in list_tasks():
         st = TaskDir(t).state()
-        if st["status"] in ("parked", "exhausted", "submit_unknown") or (st["runs"] and st["runs"][-1]["state"] == "verify_error"):
+        if st["status"] in ("parked", "exhausted", "submit_unknown", "provider_refused") or (st["runs"] and st["runs"][-1]["state"] == "verify_error"):
             items.append({"task_id": t, "status": st["status"], "owner": st["owner"],
                           "question": (st.get("question") or {}).get("text")})
+    for name in pool.pools(runner.config()):
+        message = doctor.failure_message(name, doctor.pool_report(name))
+        if message:
+            items.append({"pool": name, "task_id": None, "owner": None, "status": "doctor_failed", "question": message})
     if a.json:
         print(json.dumps(items, ensure_ascii=False, indent=1))
     else:
         for i in items:
-            print(f"{i['task_id']} [{i['status']}] owner={i['owner']}\n  {i['question'] or '(no question recorded)'}")
+            print(f"{i['task_id'] or i.get('pool')} [{i['status']}] owner={i['owner']}\n  {i['question'] or '(no question recorded)'}")
     return 0
 
 
@@ -480,9 +505,9 @@ def cmd_reconcile(a) -> int:
                 continue
             if last["state"] == "running" and adapter_kind(spec) == "pool":
                 if not _alive(last):
-                    if runner.record_outcome(td, last["run_id"], {"state": "lost", "reason": f"station {last.get('station')} is gone",
-                                                                  "worker": last.get("station")}):
-                        report.append({"task_id": t, "run_id": last["run_id"], "observed": "lost"})
+                    outcome = pool.unfinished_outcome(last["pool"], last.get("station", ""), cfg)
+                    if runner.record_outcome(td, last["run_id"], outcome):
+                        report.append({"task_id": t, "run_id": last["run_id"], "observed": outcome["state"]})
                 continue
             if last["state"] == "exited" and spec.get("auto_close") and st["status"] == "exited":
                 to_close.append((td, st["owner"]))  # verified after the schedule lock is released (review 3, F1)
@@ -570,13 +595,18 @@ def cmd_quick(a) -> int:
         a.workdir = str(wd)
     workdir = a.workdir or pool_conf.get("workdir") or str(card_dir)
     blocked = a.blocked_file or "out/BLOCKED.md"
-    (card_dir / "CARD.md").write_text(text.strip() + QUICK_FOOTER.format(blocked=blocked, verify=a.verify), encoding="utf-8")
+    metadata = f"\nScope: {', '.join(a.scope or []) or '(unspecified)'}\nRisk: {a.risk}\n"
+    if a.acceptance is not None:
+        metadata += f"Acceptance: {a.acceptance}\n"
+    (card_dir / "CARD.md").write_text(text.strip() + QUICK_FOOTER.format(blocked=blocked, verify=a.verify) + metadata, encoding="utf-8")
     (card_dir / "verify.sh").write_text("set -e\n" + a.verify + "\n", encoding="utf-8")
     spec = {"task_id": tid, "project": a.project or (a.pool or "adhoc"), "goal": a.goal or text.strip().splitlines()[0][:120],
             "card": "CARD.md", "workdir": workdir, "outputs": a.output or [], "blocked_file": blocked,
             "verifier": {"command": f"bash {card_dir / 'verify.sh'}", "cwd": workdir, "freeze": ["verify.sh"]},
-            "budget": {"max_attempts": a.attempts, "max_wall_min": a.wall},
+            "budget": {"max_attempts": a.attempts, "max_wall_min": a.wall}, "scope": a.scope or [], "risk": a.risk,
             "authority": a.authority or "Only what the card says; anything else needs a human."}
+    if a.acceptance is not None:
+        spec["acceptance"] = a.acceptance
     if yg_pool:
         pc = pool.pool_conf(cfg, a.pool)
         spec["adapter"] = {"kind": "pool", "pool": a.pool}
@@ -735,9 +765,27 @@ def cmd_events(a) -> int:
     return 0
 
 
+def cmd_doctor(a) -> int:
+    try:
+        report = doctor.run(runner.config(), name=a.pool, host=a.host or "codex", lane=a.lane or "", acct=a.acct)
+    except (RuntimeError, OSError, ValueError) as e:
+        print(f"doctor error: {e}", file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(report, ensure_ascii=False, indent=1))
+    else:
+        for c in report["checks"]:
+            print(f"{'PASS' if c['ok'] else 'FAIL'} {c['name']}: {c['reason']}")
+    return 0 if report["ok"] else 1
+
+
 def main(argv=None) -> int:
     P = argparse.ArgumentParser(prog="yardgoat", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = P.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("doctor")
+    g = s.add_mutually_exclusive_group(); g.add_argument("--pool"); g.add_argument("--host", choices=contract.HOSTS)
+    s.add_argument("--lane"); s.add_argument("--acct"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("_doctor"); s.add_argument("run_dir")
     s = sub.add_parser("submit"); s.add_argument("spec"); s.add_argument("--as", dest="as_", required=True)
     s = sub.add_parser("dispatch"); s.add_argument("task_id"); s.add_argument("--as", dest="as_", required=True)
     s = sub.add_parser("status"); s.add_argument("task_id", nargs="?"); s.add_argument("--json", action="store_true")
@@ -756,6 +804,8 @@ def main(argv=None) -> int:
     g = s.add_mutually_exclusive_group(); g.add_argument("--pool"); g.add_argument("--host", default="codex", choices=contract.HOSTS)
     s.add_argument("--lane"); s.add_argument("--acct"); s.add_argument("--workdir"); s.add_argument("--project"); s.add_argument("--goal")
     s.add_argument("--output", action="append"); s.add_argument("--blocked-file"); s.add_argument("--authority")
+    s.add_argument("--scope", action="append"); s.add_argument("--risk", choices=("l1", "l2", "l3"), default="l2")
+    s.add_argument("--acceptance")
     s.add_argument("--attempts", type=int, default=2); s.add_argument("--wall", type=int, default=60)
     s.add_argument("--no-dispatch", action="store_true")
     s = sub.add_parser("claim"); s.add_argument("--pool", required=True); s.add_argument("--station", required=True)
@@ -771,9 +821,11 @@ def main(argv=None) -> int:
         return runner.run_and_receipt(TaskDir(a.task_id), a.run_id)
     if a.cmd == "_station":
         return pool.run_station(a.pool_name, a.station)
+    if a.cmd == "_doctor":
+        return doctor.run_probe(Path(a.run_dir))
     return {"submit": cmd_submit, "dispatch": cmd_dispatch, "status": cmd_status, "takeover": cmd_takeover,
             "close": cmd_close, "park": cmd_park, "answer": cmd_answer, "inbox": cmd_inbox,
-            "reconcile": cmd_reconcile, "archive": cmd_archive, "cancel": cmd_cancel, "quick": cmd_quick, "claim": cmd_claim, "finish": cmd_finish, "events": cmd_events}[a.cmd](a)
+            "reconcile": cmd_reconcile, "archive": cmd_archive, "cancel": cmd_cancel, "quick": cmd_quick, "claim": cmd_claim, "finish": cmd_finish, "events": cmd_events, "doctor": cmd_doctor}[a.cmd](a)
 
 
 if __name__ == "__main__":
